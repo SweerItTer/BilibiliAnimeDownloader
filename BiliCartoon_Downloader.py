@@ -65,7 +65,7 @@ def get_apidata(title, cartoon_ss_num):
 		aid = ls['aid']
 		cid = ls['cid']
 		ep_id = ls['ep_id']
-		name = ls['long_title']
+		name = f"第{lis.index(ls)+1}话 - "+ls['long_title']
 		if not os.path.isfile(title + os.sep + name + ".mp4"):
 			link2 = "https://api.bilibili.com/x/player/playurl"
 			link1 = 'https://api.bilibili.com/pgc/player/web/v2/playurl'
