@@ -1,75 +1,74 @@
 import json
 import os
 import re
+from pprint import pprint
 
 import requests
 
-class BAD:
 
-	@staticmethod
-	def fileDownload(url, name, seps):
+def fileDownload(url, name, seps):
+	print("-----------Downloading------------")
 
-		print("-----------Downloading------------")
+	# 发送option请求服务器分配资源
+	session = requests.session()
 
-		# 发送option请求服务器分配资源
-		session = requests.session()
+	session.options(url=url, headers=headers, verify=False)
 
-		session.options(url=url, headers=headers, verify=False)
+	res = session.get(url=url, headers=headers, verify=False, timeout = 50, stream=True)
 
-		res = session.get(url=url, headers=headers, verify=False, timeout = 50)
+	with open(name+seps, 'wb') as fp:
+		for chunk in res.iter_content(chunk_size=1310720):  # 逐块写入，每次写入10mb
+			if chunk:
+				fp.write(chunk)
+				fp.flush()
 
+	print("---------Download Comleted----------")
 
-		with open(name+seps, 'wb') as fp:
+def merge(video_path, audio_path, output_path):
+	print("正在合并文件...")
+	try:
+		# print( "%s" %(video_path, audio_path, output_path))
+		os.system("ffmpeg -i  %s -i %s -c copy %s" %(video_path, audio_path, output_path))
 
-			fp.write(res.content)
+		os.remove(video_path)
+		os.remove(audio_path)
 
-			fp.flush()
+	except Exception as e:
+		print("合并失败",e)
 
-		print("---------Download Comleted----------")
+def get_apidata_list(cartoon_ss_num):
+	global headers
+	headers = {
+		"Accept": "application/json, text/plain, */*",
+		'cookie': "",
+		'referer': 'https://www.bilibili.com/bangumi/play/%s/' % cartoon_ss_num, 
+		'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
+	}
 
-	@staticmethod
-	def merge(video_path, audio_path, output_path):
-		print("正在合并文件...")
-		try:
-			# print( "%s" %(video_path, audio_path, output_path))
-			os.system(f"{os.getcwd()}/ffmpeg -i  {video_path} -i {audio_path} -c copy {output_path}")
+	# 23年方法:
+	'https://api.bilibili.com/pgc/player/web/v2/playurl'
+	# avid cid ep_id来源于:
+	"""https://api.bilibili.com/pgc/view/web/season?ep_id=400973"""
 
-			os.remove(video_path)
-			os.remove(audio_path)
+	ep_id = cartoon_ss_num[2:]
+	response = requests.get(url=f'https://api.bilibili.com/pgc/view/web/season?ep_id={ep_id}', headers=headers).text
+	jsondata = json.loads(response)
 
-		except Exception as e:
-			print("合并失败",e)
+	# pprint(jsondata)
 
-	@staticmethod
-	def get_apidata_list(cartoon_ss_num):
-		global headers
-		headers = {
-			'cookie': "", # 引号这里放cookie
-			'referer': 'https://www.bilibili.com/bangumi/play/%s/' % cartoon_ss_num,  # 防盗链
-			'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
-		}
+	return jsondata['result']['episodes']
 
-		# 23年方法:
-		'https://api.bilibili.com/pgc/player/web/v2/playurl'
+def get_apidata(title, cartoon_ss_num):
+	lis = get_apidata_list(cartoon_ss_num)
 
-		# avid cid ep_id来源于:
-		"""https://api.bilibili.com/pgc/view/web/season?ep_id=400973"""
-
-
-		response = requests.get(url=f'https://api.bilibili.com/pgc/view/web/season?ep_id={cartoon_ss_num.split("p")[-1]}', headers=headers).text
-		jsondata = json.loads(response)
-
-		return jsondata['result']['episodes']
-
-	def get_apidata(self, title, cartoon_ss_num):
-		lis = self.get_apidata_list(cartoon_ss_num)
-
-		for ls in lis:
-			aid = ls['aid']
-			cid = ls['cid']
-			ep_id = ls['ep_id']
-			name = ls['long_title']
-			link = 'https://api.bilibili.com/pgc/player/web/v2/playurl'
+	for ls in lis:
+		aid = ls['aid']
+		cid = ls['cid']
+		ep_id = ls['ep_id']
+		name = ls['long_title']
+		if not os.path.isfile(title + os.sep + name + ".mp4"):
+			link2 = "https://api.bilibili.com/x/player/playurl"
+			link1 = 'https://api.bilibili.com/pgc/player/web/v2/playurl'
 			data = {
 				'support_multi_audio': 'true',
 				'avid': aid,
@@ -84,34 +83,45 @@ class BAD:
 				'session': '9cdebcb2725f4b85aecf0180ad66bf7c',
 				'drm_tech_type': '2',
 			}
-			response_json = requests.get(url=link, params=data, headers=headers, timeout=10000).json()
-			# dush_date = response_json['result']['video_info']['dash'] 24年好似改为了"durl"
+			response_json = requests.get(url=link1, params=data, headers=headers, timeout=10000).json()
+
+			# pprint(response_json)
 			try :
 				dush_date = response_json['result']['video_info']['dash']
-			except KeyError:
-				dush_date = response_json['result']['video_info']['durl']
+			except:
+				response_json = requests.get(url=link2, params=data, headers=headers, timeout=10000).json()
+				dush_date = response_json['data']['durl']
+				video_url = dush_date[0]['url']
+				seps = ".mp4"
+				fileDownload(url=video_url, name=title + os.sep + name, seps=seps)
 
 			video_url = dush_date['video'][0]['baseUrl']
 			seps = ".mp4"
-			self.fileDownload(url = video_url, name = title+os.sep+name+"_", seps = seps)
+			fileDownload(url=video_url, name=title + os.sep + name + "_", seps=seps)
 
 			audio_url = dush_date['audio'][0]['baseUrl']
 			seps = ".mp3"
-			self.fileDownload(url = audio_url, name = title+os.sep+name+"_", seps = seps)
-
-			self.merge(video_path = title+os.sep+name+"_.mp4", audio_path = title+os.sep+name+"_.mp3", output_path = title+os.sep+name+".mp4")
-			# pprint(response_json)
-			break
+			fileDownload(url=audio_url, name=title + os.sep + name + "_", seps=seps)
+			merge(video_path=title + os.sep + name + "_.mp4", audio_path=title + os.sep + name + "_.mp3",
+				  output_path=title + os.sep + name + ".mp4")
+		else:
+			pass
+		# break
 
 
 if __name__ == "__main__":
-	cartoon_ss_num = "" # 引号这里放ep号
+	cartoon_ss_num = ""
+
 	headers = {
 		'referer': 'https://www.bilibili.com/bangumi/play/%s/' % cartoon_ss_num,
 		'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
 	}
-	title = re.findall('<meta property="og:title" content="(.*?)"/>', requests.get(url = "https://www.bilibili.com/bangumi/play/%s/"%cartoon_ss_num, headers=headers).text)[0].replace(' ','')
+	rsp = requests.get(url = "https://www.bilibili.com/bangumi/play/%s/"%cartoon_ss_num, headers=headers).text
+	title = re.findall('<meta property="og:title" content="(.*?)"/>', rsp)[0].replace(' ','')
+	if cartoon_ss_num[:2] == "ss":
+		cartoon_ss_num = "ep" + re.findall('//www.bilibili.com/bangumi/play/ep(.*?)"/>', rsp)[0]
+		pprint(cartoon_ss_num)
 	if not os.path.exists(title):
 		os.makedirs(title)
 
-	BAD().get_apidata(title = title, cartoon_ss_num = cartoon_ss_num)
+	get_apidata(title = title, cartoon_ss_num = cartoon_ss_num)
