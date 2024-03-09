@@ -2,7 +2,6 @@ import http.cookiejar
 import os
 import re
 import sys
-from time import sleep
 
 import requests
 from PyQt5.QtCore import QThread, pyqtSignal, QObject
@@ -29,8 +28,12 @@ class LoginWindow(QMainWindow):
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
 
-        self.data = CreatQR.get_qrurl()
-        CreatQR.make_qrcode(self.data)
+        try:
+            self.data = CreatQR.get_qrurl()
+            CreatQR.make_qrcode(self.data)
+        except requests.exceptions.SSLError:
+            print("网络连接错误")
+
         self.pixmap = QPixmap("./temp/Qr.png")
         self.ui.label_3.setPixmap(self.pixmap)
         self.ui.label_3.setScaledContents(True)
@@ -49,7 +52,13 @@ class LoginWindow(QMainWindow):
         self.show()
 
     def judgements(self):
-        code = CreatQR.judge(self.data)
+        """判断二维码是否失效"""
+        try:
+            code = CreatQR.judge(self.data)
+        except TypeError:
+            print("为获取到有效信息，网络连接错误")
+            self.timer.stop()
+            return
         if code == 0:
             self.ui.label_5.setText("    扫码成功   ")
             self.ui.pushButton_6.setEnabled(False)  # 禁用按钮
@@ -135,13 +144,18 @@ class LoginWindow(QMainWindow):
 class InterfaceWindow(QMainWindow, QObject):
     def __init__(self, is_member, sessions):
         super(InterfaceWindow, self).__init__()
+        self.episodes = None
+        self.title = None
+        self.videopath_list = None
+        self.audiopath_list = None
+        self.outputpath_list = None
         self.merge = None
         self.anime_window = None
         self.download_thread_a = None
         self.download_thread_v = None
         self.url_dict = None
         self.cartoon_ss_num = None
-        self.title = None
+        self.file_name = None
         self.sessions = sessions
         self.user_input_text = None
         self.is_member = is_member
@@ -153,7 +167,13 @@ class InterfaceWindow(QMainWindow, QObject):
         self.ui = Ui_MainWindow_inter()
         self.ui.setupUi(self)
         self.downloader = None
-
+        self.complete = [0, 0, 0, 0]
+        # 用于记录已完成的下载任务数和判断是否全部下载任务已完成
+        # [0]记录所有下载任务的数量
+        # [1]记录是否所有数据下载完成
+        # [2]记录合并完成的数量
+        # [3]记录是否全部合并完成
+        self.should_merge_number = [0]
         self.list_widget = self.ui.listWidget
         # 将 listWidget 的选择模式设置为多选模式
         self.list_widget.setSelectionMode(QAbstractItemView.MultiSelection)
@@ -163,16 +183,48 @@ class InterfaceWindow(QMainWindow, QObject):
 
         self.ui.pushButton_2.clicked.connect(self.wake_downloader)
         self.ui.pushButton.clicked.connect(self.update_picture)
+        # self.ui.pushButton_3.setEnabled(False)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.enable_push_button_3)
+        self.timer.start(1000)  # 设置间隔为1秒
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.merge_complete)
+        self.timer.start(1000)  # 设置间隔为1秒
+
+        self.ui.pushButton_3.clicked.connect(self.wake_merge)
 
         self.setWindowFlag(QtCore.Qt.FramelessWindowHint)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         self.show()
+
+    @QtCore.pyqtSlot()
+    def enable_push_button_3(self):
+        if self.complete[1] == 0:
+            self.ui.pushButton_3.setEnabled(False)
+        elif self.complete[1] == 1:
+            self.ui.pushButton_3.setEnabled(True)
+
+    def merge_complete(self):
+        if self.complete[3] == 1:
+            self.show_merge_dialog()
+            self.timer.stop()
 
     @staticmethod
     def show_info_dialog():
         msg = QMessageBox()
         msg.setIcon(QMessageBox.Information)
         msg.setText("您不是大会员用户，下载可能受阻")
+        msg.setWindowTitle("提示")
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec_()
+
+    @staticmethod
+    def show_merge_dialog():
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Information)
+        msg.setText("所有文件合并完成")
         msg.setWindowTitle("提示")
         msg.setStandardButtons(QMessageBox.Ok)
         msg.exec_()
@@ -193,6 +245,8 @@ class InterfaceWindow(QMainWindow, QObject):
         if filepath is None or self.title is None:
             self.ui.label_2.clear()
             self.ui.label_3.setText("未找到番剧")
+            self.list_widget.clear()
+            self.list_.clear()
             print(self.user_input_text)
         else:
             self.picture = QPixmap(filepath)
@@ -252,7 +306,17 @@ class InterfaceWindow(QMainWindow, QObject):
             # 将这个QListWidgetItem添加到QListWidget中
             self.list_widget.addItem(item)
 
+    def wake_merge(self):
+        if len(self.videopath_list) == len(self.list_widget.selectedItems()) and self.videopath_list is not None:
+            self.merge = MergeThread(self.videopath_list, self.audiopath_list, self.outputpath_list, self.complete,
+                                     self.should_merge_number)
+            self.merge.start()
+        else:
+            return
+
     def wake_downloader(self):
+        self.complete = [0, 0, 0, 0]
+
         if not len(self.list_widget.selectedItems()) >= 1:
             return
         selected_texts = [item.text() for item in self.list_widget.selectedItems()]
@@ -261,13 +325,13 @@ class InterfaceWindow(QMainWindow, QObject):
         episodes = []  # 新增：用于存储选中的集数名称
         urls = []  # 新增：用于存储对应集数的URL字典
 
-        videopath_list = []
-        audiopath_list = []
-        outputpath_list = []
+        self.videopath_list = []
+        self.audiopath_list = []
+        self.outputpath_list = []
 
         for selected in selected_texts:
             ids_d = self.list_[selected]
-            file_name = selected.replace(" ", "-")
+            file_name = selected.replace(" ", "-").replace("-|-", "-")
             self.url_dict = Download_files.get_apidata(
                 title=self.title,
                 file_name=file_name,
@@ -275,9 +339,9 @@ class InterfaceWindow(QMainWindow, QObject):
                 cartoon_ss_num=self.cartoon_ss_num,
                 sessions=self.sessions
             )
-            videopath_list.append(f"./{self.title}/{file_name}_.mp4")
-            audiopath_list.append(f"./{self.title}/{file_name}_.mp3")
-            outputpath_list.append(f"./{self.title}/{file_name}.mp4")
+            self.videopath_list.append(f"./{self.title}/{file_name}_.mp4")
+            self.audiopath_list.append(f"./{self.title}/{file_name}_.mp3")
+            self.outputpath_list.append(f"./{self.title}/{file_name}.mp4")
 
             episodes.append(selected)
             urls.append(self.url_dict)
@@ -289,11 +353,9 @@ class InterfaceWindow(QMainWindow, QObject):
             """
 
         self.anime_window = AnimeWindow(sessions=self.sessions, episodes=episodes, url_dict_list=urls,
-                                        title=self.title)  # 初始化 AnimeWindow 类
+                                        title=self.title, complete=self.complete)  # 初始化 AnimeWindow 类
         self.anime_window.show()
-
-        self.merge = MergeThread(videopath_list, audiopath_list, outputpath_list, self.anime_window.download_thread_v)
-        self.merge.start()
+        self.should_merge_number[0] = len(episodes)
 
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key_Return or event.key() == QtCore.Qt.Key_Enter:
@@ -333,22 +395,27 @@ class InterfaceWindow(QMainWindow, QObject):
 class DownloadThread(QThread):
     progress_signal = pyqtSignal(float)
 
-    def __init__(self, sessions, title, url, file_name, sep_):
+    def __init__(self, sessions, title, url, file_name, sep_, complete, episodes):
         super().__init__()
         self.sessions = sessions
         self.title = title
         self.url = url
         self.file_name = file_name
         self.sep_ = sep_
+        self.episodes = episodes
+        self.complete = complete
 
     def run(self):
         try:
-            # print("hello")
             self.download_f()
         except Exception as e:
+            print(f"{self.title} {self.file_name}下载失败")
             print("Error occurred during download:", e)
             # 发送进度为 -1，表示下载错误
             self.progress_signal.emit(-1)
+        if self.complete[0] == len(self.episodes) * 2:
+            print("---------All Downloaded----------")
+            self.complete[1] = 1
 
     def download_f(self):
         print("-----------Downloading------------")
@@ -362,46 +429,67 @@ class DownloadThread(QThread):
         if os.path.isfile(file_path) and os.path.getsize(file_path) == total_size:
             print("---------file exist----------")
             self.progress_signal.emit(100)
+            self.complete[0] = self.complete[0] + 1
             return
 
-        # print(total_size)
+        if os.path.isfile(file_path) and os.path.getsize(file_path) < total_size:
+            self.continue_download(os.path.getsize(file_path), total_size)
 
-        with open(self.title + os.sep + self.file_name + self.sep_, 'wb') as fp:
+            # print(total_size)
+        else:
+            with open(self.title + os.sep + self.file_name + self.sep_, 'wb') as fp:
+                for chunk in res.iter_content(chunk_size=1024 * 1000):  # 逐块写入，每次写入10mb
+                    if chunk:
+                        fp.write(chunk)
+                        downloaded_size += len(chunk)
+
+                        # 计算当前下载进度百分比
+                        if total_size > 0:
+                            progress_percent = (downloaded_size / total_size) * 100
+                        else:
+                            progress_percent = 0
+
+                        # 设置新的进度值
+                        self.progress_signal.emit(progress_percent)
+
+            print("---------Download Completed----------")
+            self.complete[0] = self.complete[0] + 1
+
+    def continue_download(self, downloaded_size, total_size):
+        headers = {
+            'Range': 'bytes={}-{}'.format(downloaded_size, total_size)}  # Requesting to download from the point where it left off
+        res = self.sessions.get(url=self.url, headers=headers, verify=False, timeout=50, stream=True)
+
+        with open(self.title + os.sep + self.file_name + self.sep_, 'ab') as fp:
             for chunk in res.iter_content(chunk_size=1024 * 1000):  # 逐块写入，每次写入10mb
                 if chunk:
                     fp.write(chunk)
                     downloaded_size += len(chunk)
-
-                    # 计算当前下载进度百分比
-                    if total_size > 0:
-                        progress_percent = (downloaded_size / total_size) * 100
-                    else:
-                        progress_percent = 0
-
-                    # 设置新的进度值
+                    progress_percent = (downloaded_size / total_size) * 100
                     self.progress_signal.emit(progress_percent)
 
         print("---------Download Completed----------")
+        self.complete[0] = self.complete[0] + 1
 
 
 class MergeThread(QThread):
-
-    def __init__(self, video_path, audio_path, output_path, isf):
+    def __init__(self, video_path, audio_path, output_path, complete, should_merge_number):
         super().__init__()
         self.video_path = video_path
         self.audio_path = audio_path
         self.output_path = output_path
-        self.isf = isf
-        self.i = 0
+        self.complete = complete
+        self.should_merge_number = should_merge_number
 
     def run(self):
-        while 1:
-            sleep(5)
-            if self.isf.isFinished():
-                break
-            continue
         print("-----------Merging------------")
+
         for path_v, path_a, path_o in zip(self.video_path, self.audio_path, self.output_path):
+            while 1:
+                print("正在检测文件是否存在...")
+                if os.path.isfile(path_a) and os.path.isfile(path_a):
+                    break
+                continue
             print("正在合并文件...")
             os.system(
                 f"ffmpeg -i  {os.path.realpath(path_v)} -i {os.path.realpath(path_a)} -c copy {os.path.realpath(path_o)}")
@@ -409,8 +497,11 @@ class MergeThread(QThread):
                 os.remove(path_a)
                 os.remove(path_v)
                 print("合并成功")
-                self.i += 1
-
+                self.complete[2] = self.complete[2] + 1
+        if self.complete[2] == self.should_merge_number[0]:
+            print("---------All Merged----------")
+            self.complete[3] = 1
+            return
 
 
 class EpisodeItem(QWidget):
@@ -437,7 +528,7 @@ class EpisodeItem(QWidget):
 
 
 class AnimeWindow(QWidget):
-    def __init__(self, sessions, title, url_dict_list, episodes):
+    def __init__(self, sessions, title, url_dict_list, episodes, complete):
         super().__init__()
 
         self.setWindowTitle("番剧下载管理器")
@@ -445,6 +536,7 @@ class AnimeWindow(QWidget):
         self.item_v = None
         self.item_a = None
         self.episodes = episodes
+        self.complete = complete
         self.title = title
         self.sessions = sessions
         self.list_widget = QListWidget()
@@ -470,10 +562,20 @@ class AnimeWindow(QWidget):
             self.list_widget.setItemWidget(listWidgetItem_a, self.item_a)
             # 创建并启动下载线程
 
-            self.download_thread_v = DownloadThread(sessions=self.sessions, title=self.title, url=video_url,
-                                                    file_name=filename.replace(" ", "-"), sep_="_.mp4")  # 创建下载器对象
-            self.download_thread_a = DownloadThread(sessions=self.sessions, title=self.title, url=audio_url,
-                                                    file_name=filename.replace(" ", "-"), sep_="_.mp3")  # 创建下载器对象
+            self.download_thread_v = DownloadThread(sessions=self.sessions,
+                                                    title=self.title,
+                                                    url=video_url,
+                                                    file_name=filename.replace(" ", "-").replace("-|-", "-"),
+                                                    sep_="_.mp4",
+                                                    complete=self.complete,
+                                                    episodes=self.episodes)  # 创建下载器对象
+            self.download_thread_a = DownloadThread(sessions=self.sessions,
+                                                    title=self.title,
+                                                    url=audio_url,
+                                                    file_name=filename.replace(" ", "-").replace("-|-", "-"),
+                                                    sep_="_.mp3",
+                                                    complete=self.complete,
+                                                    episodes=self.episodes)  # 创建下载器对象
 
             self.item_v.download_thread = self.download_thread_v
             self.item_a.download_thread = self.download_thread_a
@@ -484,7 +586,17 @@ class AnimeWindow(QWidget):
         vbox.addWidget(self.list_widget)
 
         self.setLayout(vbox)
-        self.setGeometry(100, 100, 700, 350)
+        self.setGeometry(300, 250, 350, 200)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.close_window)
+        self.timer.start(1000)  # 设置间隔为1秒
+
+    def close_window(self):
+        if self.complete[1] == 1:
+            self.timer.stop()
+            self.close()
+            return
 
 
 if __name__ == "__main__":
