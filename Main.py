@@ -432,7 +432,7 @@ class DownloadThread(QThread):
             self.complete[0] = self.complete[0] + 1
             return
 
-        if os.path.isfile(file_path) and os.path.getsize(file_path) < total_size:
+        if os.path.isfile(file_path) and os.path.getsize(file_path) <= total_size:
             self.continue_download(os.path.getsize(file_path), total_size)
 
             # print(total_size)
