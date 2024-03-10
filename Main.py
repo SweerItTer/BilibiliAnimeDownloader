@@ -95,9 +95,14 @@ class LoginWindow(QMainWindow):
                                       verify=False,
                                       headers=headers).json()
         # pprint(login_url)
-        if login_url['data']['vip']['label']['text'] == '':
+        try:
+        # pprint(login_url)
+            if login_url['data']['vip']['label']['text'] == '':
+                return False
+            return True
+        except:
+            print("当前cookie已失效")
             return False
-        return True
 
     def keyPressEvent(self, event):
         # 在这里执行调试模式下的操作
@@ -234,7 +239,7 @@ class InterfaceWindow(QMainWindow, QObject):
         self.user_input_text = self.ui.lineEdit.text()
 
         if len(self.user_input_text) > 10 and "?" in self.user_input_text:
-            self.user_input_text = re.findall("/play/(.*?)\?spm_id", self.user_input_text)[0]
+            self.user_input_text = re.findall("y/(.*?)\?", self.user_input_text)[0]
 
         if "ss" in self.user_input_text:
             self.user_input_text = Getanimelist.transmit_id("", self.user_input_text)
