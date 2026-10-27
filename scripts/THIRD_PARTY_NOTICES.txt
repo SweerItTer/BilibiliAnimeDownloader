@@ -1,0 +1,25 @@
+Third-party notices for Bilibili CLI packages
+
+Application
+-----------
+The Bilibili application is licensed under the repository's LICENSE file (MIT License with Commons Clause). That application restriction is separate from the rights governing third-party libraries; it does not replace or narrow those libraries' licenses. This package does not claim blanket patent or legal clearance.
+
+FFmpeg shared libraries
+-----------------------
+The package includes dynamically linked FFmpeg 8.0.3 libraries: libavformat, libavcodec, and libavutil (platform-specific shared-library filenames). This build is configured under LGPL-2.1-or-later, with GPL, nonfree, version-3, static-library and command-line program options disabled. The applicable license and copyright notices are included at `share/bili/native/COPYING.LGPLv2.1` and `share/bili/native/LICENSE.md` on both platforms.
+
+The matching native source archive is a separate artifact named `bili-native-source-<target>.tar.gz`; the runtime package `share/bili/native/source/FFMPEG_SOURCE.txt` records its asset name and SHA-256. The source artifact contains the exact upstream FFmpeg 8.0.3 archive, native build recipe, effective build configuration, LGPL notices, and replacement/build instructions. The upstream tar.xz SHA-256 is 6136812ea6d4e68bdba27e33c2a94382711cdf4f8602ffef056ff792bd6f9818. Upstream source: https://ffmpeg.org/releases/ffmpeg-8.0.3.tar.xz .
+
+The FFmpeg libraries are separate replaceable shared libraries, not statically incorporated into the application. Recipients may exercise the rights provided by the applicable LGPL terms, including modifying/replacing the corresponding library under those terms. Linux packages use app-relative RUNPATH; place compatible replacement shared objects in the package lib directory while preserving the required library names/ABI. Windows packages resolve native DLLs adjacent to bili.exe; replace compatible FFmpeg DLLs in that directory while preserving required names/ABI. A replacement must be compatible with the selected FFmpeg ABI and enabled features. The included source and recipe correspond to the shipped build; build instructions and configuration are provided alongside them.
+
+Other dependencies
+------------------
+The package includes full Rust and Cargo dependency license texts under `licenses/`; `DEPENDENCY_LICENSES.json` records package identities, registry checksums, SPDX declarations and text provenance. Matching SDK artifacts carry their own dependency metadata. No external media player, ffmpeg/ffprobe executable, or aria2 helper is included or required by the package.
+
+Windows Microsoft runtime
+-------------------------
+When required by the inspected import closure, the Windows package includes matching x64 Microsoft Visual C++ runtime DLLs from the active Visual Studio redistributable directory. These Microsoft components are separate from FFmpeg and from the application; the application's MIT License with Commons Clause does not apply to them.
+
+The applicable Microsoft terms are supplied separately under `licenses/windows-redist/`: the official Visual Studio 2022 Enterprise/Professional license and Visual C++ Runtime 2015–2022 EULA are preserved as DOCX files in `source/`, with full extracted text in `notices/` and source hashes, URLs and scope in `provenance.json`. The official Visual Studio 2022 third-party-notices file is included as supplementary unchanged material; it is not a claim that every listed component is shipped. The EULA alone does not grant redistribution rights. Recipients must agree to applicable protective terms and satisfy all conditions governing any redistributed Microsoft components. These files are disclosures, not legal approval or a representation that their inclusion alone satisfies every obligation.
+
+See Microsoft's official redistribution guidance: https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution . Windows system API-set imports are supplied by the supported Windows operating system and are not copied into the package.

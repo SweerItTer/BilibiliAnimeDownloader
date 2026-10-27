@@ -1,0 +1,29 @@
+{
+  "format": 1,
+  "sources": [
+    {
+      "id": "visual-studio-2022-enterprise-professional",
+      "filename": "vs2022-enterprise-professional.docx",
+      "url": "https://visualstudio.microsoft.com/wp-content/uploads/2021/11/Visual-Studio-2022-Enterprise-Professional-License-EN.docx",
+      "sha256": "9c0cd52b20db9d081854c75bd1b50c75514b8f8cb09c8cad15e89d90b97b5bf3",
+      "kind": "docx",
+      "scope": "Visual Studio 2022 Enterprise/Professional license; its redistribution provisions and applicable conditions are relevant to redistribution of qualifying Microsoft components. This is not blanket legal or patent clearance."
+    },
+    {
+      "id": "visual-c-runtime-2015-2022",
+      "filename": "vc2015-2022-runtime.docx",
+      "url": "https://visualstudio.microsoft.com/wp-content/uploads/2021/09/Visual-C-Runtime-2015-2022-License-1.docx",
+      "sha256": "f1e3d56ceb2ad68aae0711b910375009e651ac5530fa0760f0dea6e81e54fae1",
+      "kind": "docx",
+      "scope": "Visual C++ Runtime 2015–2022 EULA (EULAID Cpp_2015-2022_ENU.1033), applicable installation/use terms. It does not itself grant redistribution rights."
+    },
+    {
+      "id": "visual-studio-2022-third-party-notices",
+      "filename": "vs2022-third-party-notices.txt",
+      "url": "https://visualstudio.microsoft.com/wp-content/uploads/2025/09/VS-2022-June-21-2022-TPN.txt",
+      "sha256": "0fc2dd3dc71fddc90023c889656c867a465d1101f9a8c4ebbf7de343ee6587f2",
+      "kind": "original-bytes-only",
+      "scope": "Supplementary upstream Visual Studio 2022 suite third-party notices. The suite document is retained unchanged; inclusion does not represent that every listed component is present in this package."
+    }
+  ]
+}

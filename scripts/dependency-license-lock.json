@@ -1,0 +1,23 @@
+{
+  "format": 1,
+  "sources": [
+    {
+      "package": "ffmpeg-sys-next",
+      "version": "8.1.0",
+      "spdx": "WTFPL",
+      "url": "https://spdx.org/licenses/WTFPL.txt",
+      "sha256": "13d8825a59e5e546d41e8711405d0f335a9934362a47c04a3b4280fa7932dc4a",
+      "filename": "WTFPL.txt",
+      "provenance": "Canonical SPDX License List text for WTFPL; package ffmpeg-sys-next 8.1.0 declares SPDX identifier WTFPL but does not publish a full license file in its crate source. This pin supplies only the declared license text; it does not assert copyright ownership or other legal conclusions."
+    },
+    {
+      "package": "webpki-roots",
+      "version": "1.0.9",
+      "spdx": "CDLA-Permissive-2.0",
+      "url": "https://raw.githubusercontent.com/spdx/license-list-data/main/text/CDLA-Permissive-2.0.txt",
+      "sha256": "4531a67d443284d93ffed0803df5b10634aff21c3d77e381f2d48af01d875868",
+      "filename": "CDLA-Permissive-2.0.txt",
+      "provenance": "Canonical SPDX License List text for CDLA-Permissive-2.0; package webpki-roots 1.0.9 declares this identifier. This pin supplies the declared license text only and makes no blanket legal clearance claim."
+    }
+  ]
+}
