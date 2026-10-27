@@ -1,0 +1,13 @@
+# Rust
+target/
+
+# Native source/build/install trees and generated release artifacts stay out of Git.
+engines/
+dist/
+artifacts/
+
+# dev state
+.env
+*.rs.bak
+__pycache__/
+*.pyc
