@@ -1,0 +1,410 @@
+name: Alpha Linux candidate qualification
+
+on:
+  push:
+    tags:
+      - 'v2.*-alpha.*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-candidate:
+    name: Build tagged Linux candidate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout tagged commit and history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Validate alpha tag and merged commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin UI-version:refs/remotes/origin/UI-version
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          manifest = tomllib.loads(Path("core-cli/Cargo.toml").read_text())
+          expected_tag = "v" + manifest["package"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != expected_tag or not tag.startswith("v2.") or "-alpha." not in tag:
+              raise SystemExit(f"tag {tag!r} does not match alpha CLI version {expected_tag!r}")
+          def commit(revision):
+              return subprocess.check_output(
+                  ["git", "rev-parse", f"{revision}^{{commit}}"], text=True
+              ).strip()
+          tag_commit = commit(f"refs/tags/{tag}")
+          head = commit("HEAD")
+          event_commit = commit(os.environ["GITHUB_SHA"])
+          if tag_commit != head or head != event_commit:
+              raise SystemExit("tag, checked-out HEAD, and GITHUB_SHA must resolve to the same commit")
+          subprocess.run(["git", "merge-base", "--is-ancestor", tag_commit, "origin/UI-version"], check=True)
+          PY
+
+      - name: Install Linux native and fixture build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang libclang-dev pkg-config patchelf binutils nasm cmake ninja-build
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache pinned FFmpeg sources and libraries
+
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/native/x86_64-unknown-linux-gnu
+            target/native/sources
+          key: alpha-native-linux-x86_64-rust-1.98.1-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'Cargo.lock') }}
+
+      - name: Cache Cargo build products
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target/x86_64-unknown-linux-gnu'
+          prefix-key: v1-rust-target-subtree
+          key: alpha-x86_64-unknown-linux-gnu-rust-1.98.1-${{ hashFiles('Cargo.lock', 'scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'bili_core/build.rs') }}
+
+      - name: Build pinned FFmpeg libraries
+        run: python3 scripts/build_ffmpeg.py --target x86_64-unknown-linux-gnu --prefix target/native/x86_64-unknown-linux-gnu --source-cache target/native/sources
+
+      - name: Export native discovery paths
+        run: |
+          echo "FFMPEG_DIR=$GITHUB_WORKSPACE/target/native/x86_64-unknown-linux-gnu" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$GITHUB_WORKSPACE/target/native/x86_64-unknown-linux-gnu/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_LIBDIR=$GITHUB_WORKSPACE/target/native/x86_64-unknown-linux-gnu/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Generate offline media fixture corpus
+        run: python3 scripts/generate_media_fixtures.py --build-dir target/corpus-build --output-dir target/media-fixtures --source-cache ~/.cache/bili-native/corpus-sources
+
+      - name: Build CLI
+        run: cargo build -p core-cli --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Package runtime-only candidate
+        run: python3 scripts/package.py --target x86_64-unknown-linux-gnu --profile release --native-prefix target/native/x86_64-unknown-linux-gnu --runtime-only
+
+      - name: Build matched native probe consumer
+        run: python3 scripts/verify_core_linkage.py --mode rlib --profile release --target x86_64-unknown-linux-gnu --native-prefix target/native/x86_64-unknown-linux-gnu --output target/alpha-probe
+
+      - name: Assemble candidate verification artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/alpha-candidate/package target/alpha-candidate/native-source target/alpha-candidate/probe/bin target/alpha-candidate/probe/lib target/alpha-candidate/probe/notices target/alpha-candidate/fixtures
+          python3 - <<'PY'
+          import shutil
+          from pathlib import Path
+
+          root = Path.cwd()
+          excluded = {".git", "alpha-candidate", "alpha-probe"}
+          def locate(name):
+              matches = [p for p in root.rglob(name)
+                         if p.is_file() and not any(part in excluded for part in p.relative_to(root).parts)]
+              if len(matches) != 1:
+                  raise SystemExit(f"expected exactly one {name}, found {len(matches)}")
+              return matches[0]
+
+          package = locate("bili-x86_64-unknown-linux-gnu-release.tar.gz")
+          native = locate("bili-native-source-x86_64-unknown-linux-gnu.tar.gz")
+          shutil.copy2(package, Path("target/alpha-candidate/package") / package.name)
+          shutil.copy2(native, Path("target/alpha-candidate/native-source") / native.name)
+          fixture = Path("target/media-fixtures/h264-aac.mp4")
+          if not fixture.is_file():
+              raise SystemExit("generated h264-aac.mp4 fixture is missing")
+          shutil.copy2(fixture, "target/alpha-candidate/fixtures/h264-aac.mp4")
+          PY
+          cp target/alpha-probe/bin/bili-core-sdk-consumer target/alpha-candidate/probe/bin/
+          python3 - <<'PY'
+          import re
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          helper = Path("target/alpha-probe/bin/bili-core-sdk-consumer").resolve()
+          library_dir = Path("target/alpha-probe/lib").resolve()
+          output = subprocess.check_output(["ldd", str(helper)], text=True)
+          if "not found" in output:
+              raise SystemExit("matched probe has an unresolved runtime dependency")
+          copied = []
+          for line in output.splitlines():
+              match = re.search(r"=>\s+(/[^ ]+)", line) or re.match(r"\s*(/[^ ]+)", line)
+              if not match:
+                  continue
+              source = Path(match.group(1))
+              try:
+                  source.resolve().relative_to(library_dir)
+              except ValueError:
+                  continue
+              if source.is_file():
+                  destination = Path("target/alpha-candidate/probe/lib") / source.name
+                  shutil.copy2(source, destination)
+                  copied.append(destination.name)
+          if not any(name.startswith("libavformat.so") for name in copied):
+              raise SystemExit("matched probe runtime closure omitted packaged FFmpeg libraries")
+          PY
+          cp -a target/alpha-probe/notices/. target/alpha-candidate/probe/notices/
+          cp target/native/x86_64-unknown-linux-gnu/build-info.json target/alpha-candidate/probe/build-info.json
+          (cd target/alpha-candidate && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+          tar -C target/alpha-candidate -czf target/alpha-linux-candidate.tar.gz .
+          sha256sum target/alpha-linux-candidate.tar.gz > target/alpha-linux-candidate.tar.gz.sha256
+
+      - name: Upload fixed-name candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpha-linux-candidate
+          path: |
+            target/alpha-linux-candidate.tar.gz
+            target/alpha-linux-candidate.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  verify-candidate:
+    name: Verify candidate on independent Ubuntu VM
+    needs: build-candidate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout verifier source at tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Download candidate artifact from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: alpha-linux-candidate
+          path: target
+
+      - name: Verify and extract candidate bundle
+        run: |
+          set -euo pipefail
+          sha256sum --check target/alpha-linux-candidate.tar.gz.sha256
+          mkdir -p target/alpha-candidate
+          tar -xzf target/alpha-linux-candidate.tar.gz -C target/alpha-candidate
+          (cd target/alpha-candidate && sha256sum --check SHA256SUMS)
+
+      - name: Run offline and fixed anonymous basic qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=$(find target/alpha-candidate/package -maxdepth 1 -type f -name 'bili-x86_64-unknown-linux-gnu-release.tar.gz' -print -quit)
+          native_source=$(find target/alpha-candidate/native-source -maxdepth 1 -type f -name 'bili-native-source-x86_64-unknown-linux-gnu.tar.gz' -print -quit)
+          test -n "$package" && test -n "$native_source"
+          python3 scripts/verify_package.py "$package" \
+            --target x86_64-unknown-linux-gnu \
+            --native-source "$native_source" \
+            --offline-fixture target/alpha-candidate/fixtures/h264-aac.mp4 \
+            --probe-helper target/alpha-candidate/probe/bin/bili-core-sdk-consumer \
+            --public-media-profile basic-alpha \
+            --public-media-id BV1gD4y1o72p \
+            --live-timeout-seconds 900 \
+            --max-media-bytes 134217728 \
+            --report target/alpha-planning/alpha-basic-report.json
+
+      - name: Prepare qualified public assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          import shutil
+          import tarfile
+          import tomllib
+          import subprocess
+          from pathlib import Path
+
+          root = Path("target/alpha-candidate")
+          package = next((root / "package").glob("bili-x86_64-unknown-linux-gnu-release.tar.gz"))
+          native = next((root / "native-source").glob("bili-native-source-x86_64-unknown-linux-gnu.tar.gz"))
+          report = json.loads(Path("target/alpha-planning/alpha-basic-report.json").read_text())
+          version = tomllib.loads(Path("core-cli/Cargo.toml").read_text())["package"]["version"]
+          tag = "v" + version
+          digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+          if (report.get("status") != "passed" or report.get("package_validation") != "passed"
+                  or report.get("offline_merge_smoke") != "passed"
+                  or report.get("authentication") != "anonymous"
+                  or report.get("public_media_profile") != "basic-alpha"
+                  or report.get("public_media_id") != "BV1gD4y1o72p"
+                  or report.get("public_media_input_provided") is not True):
+              raise SystemExit("verification receipt does not satisfy the fixed Alpha gate")
+          smoke = report.get("basic_alpha_smoke")
+          if (not isinstance(smoke, dict) or smoke.get("outcome") != "passed"
+                  or smoke.get("phase") != "Completed"
+                  or not isinstance(smoke.get("size_bytes"), int) or smoke["size_bytes"] <= 0
+                  or not re.fullmatch(r"[0-9a-f]{64}", str(smoke.get("sha256", "")))
+                  or not smoke.get("selected_streams")):
+              raise SystemExit("basic Alpha live receipt is incomplete")
+          if report.get("package_sha256") != digest(package) or report.get("native_source_sha256") != digest(native):
+              raise SystemExit("verification receipt hashes do not match candidate archives")
+
+          with tarfile.open(package, "r:gz") as archive:
+              member = archive.extractfile("bili-x86_64-unknown-linux-gnu-release/BUILD_INFO.json")
+              if member is None:
+                  raise SystemExit("runtime archive omits BUILD_INFO.json")
+              build = json.load(member)
+          if (build.get("app_version") != version or build.get("target") != "x86_64-unknown-linux-gnu"
+                  or build.get("profile") != "release"
+                  or build.get("cargo_lock_sha256") != digest(Path("Cargo.lock"))):
+              raise SystemExit("runtime build tuple does not match the tagged source")
+
+          changelog = Path("CHANGELOG.md").read_text()
+          match = re.search(rf"(?m)^## \[{re.escape(version)}\] - [^\n]+\n(.*?)(?=^## |\Z)", changelog, re.S)
+          notes = match.group(1).strip() if match else ""
+          if not notes or re.search(r"(?i)YYYY|TODO|TBD|placeholder", notes):
+              raise SystemExit("tagged changelog section is missing, empty, or placeholder text")
+
+          public = Path("target/alpha-public")
+          if public.exists():
+              shutil.rmtree(public)
+          public.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(package, public / package.name)
+          shutil.copy2(native, public / native.name)
+          shutil.copy2("CHANGELOG.md", public / "CHANGELOG.md")
+          shutil.copy2("target/alpha-planning/alpha-basic-report.json", public / "alpha-verification.json")
+          (public / "release-notes.md").write_text(notes + "\n")
+          files = [public / package.name, public / native.name,
+                   public / "CHANGELOG.md", public / "alpha-verification.json"]
+          (public / "SHA256SUMS").write_text("".join(f"{digest(path)}  {path.name}\n" for path in files))
+          subprocess.run(["sha256sum", "--check", "--strict", "SHA256SUMS"], cwd=public, check=True)
+          archive_path = Path("target/alpha-linux-qualified-public.tar.gz")
+          with tarfile.open(archive_path, "w:gz") as archive:
+              for path in [*files, public / "SHA256SUMS"]:
+                  archive.add(path, arcname=path.name)
+          Path(str(archive_path) + ".sha256").write_text(f"{digest(archive_path)}  {archive_path.name}\n")
+          PY
+
+      - name: Upload qualified public asset bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpha-linux-qualified-public
+          path: |
+            target/alpha-linux-qualified-public.tar.gz
+            target/alpha-linux-qualified-public.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Publish verified Alpha release
+    needs: [build-candidate, verify-candidate]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      REPO_SLUG: ${{ github.repository }}
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Download qualified public bundle from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: alpha-linux-qualified-public
+          path: target
+
+      - name: Verify and extract public assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd target && sha256sum -c --strict alpha-linux-qualified-public.tar.gz.sha256)
+          mkdir -p target/alpha-publish
+          tar -xzf target/alpha-linux-qualified-public.tar.gz -C target/alpha-publish
+          (cd target/alpha-publish && sha256sum -c --strict SHA256SUMS)
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+          version = tomllib.loads(Path("core-cli/Cargo.toml").read_text())["package"]["version"]
+          if os.environ["TAG"] != "v" + version:
+              raise SystemExit("release tag differs from checked-out CLI version")
+          names = {
+              f"bili-x86_64-unknown-linux-gnu-release.tar.gz",
+              f"bili-native-source-x86_64-unknown-linux-gnu.tar.gz",
+              "CHANGELOG.md", "alpha-verification.json", "SHA256SUMS",
+          }
+          root = Path("target/alpha-publish")
+          if {p.name for p in root.iterdir()} != names or not all((root / n).is_file() for n in names):
+              raise SystemExit("qualified bundle does not contain the exact five-file release allowlist")
+          PY
+
+      - name: Create empty draft release, upload, read back, and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSET_DIR="$GITHUB_WORKSPACE/target/alpha-publish"
+          BODY_FILE="$RUNNER_TEMP/alpha-release-notes.md"
+          export BODY_FILE
+          if gh release view "$TAG" --repo "$REPO_SLUG" --json tagName >/dev/null 2>&1; then
+            echo "release already exists; refusing to overwrite" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          import tomllib
+          version = tomllib.loads(Path("core-cli/Cargo.toml").read_text())["package"]["version"]
+          changelog = Path("target/alpha-publish/CHANGELOG.md").read_text()
+          match = re.search(rf"(?m)^## \[{re.escape(version)}\] - [^\n]+\n(.*?)(?=^## |\Z)", changelog, re.S)
+          body = match.group(1).strip() if match else ""
+          if not body or re.search(r"(?i)YYYY|TODO|TBD|placeholder", body):
+              raise SystemExit("release notes section is missing, empty, or placeholder text")
+          Path(os.environ["BODY_FILE"]).write_text(body + "\n")
+          PY
+          files=(
+            "$ASSET_DIR/bili-x86_64-unknown-linux-gnu-release.tar.gz"
+            "$ASSET_DIR/bili-native-source-x86_64-unknown-linux-gnu.tar.gz"
+            "$ASSET_DIR/CHANGELOG.md"
+            "$ASSET_DIR/alpha-verification.json"
+            "$ASSET_DIR/SHA256SUMS"
+          )
+          for file in "${files[@]}"; do [[ -f "$file" ]] || { echo "missing release asset: $file" >&2; exit 1; }; done
+          gh release create "$TAG" --repo "$REPO_SLUG" --verify-tag --draft --prerelease --latest=false --title "$TAG" --notes-file "$BODY_FILE"
+          gh release upload "$TAG" "${files[@]}" --repo "$REPO_SLUG"
+          expected=$(printf '%s\n' "${files[@]##*/}" | sort)
+          actual=$(gh release view "$TAG" --repo "$REPO_SLUG" --json assets -q '.assets[].name' | sort)
+          [[ "$actual" == "$expected" ]] || { echo "release asset names differ from allowlist" >&2; exit 1; }
+          readback=$(mktemp -d "$RUNNER_TEMP/alpha-release-readback.XXXXXX")
+          gh release download "$TAG" --repo "$REPO_SLUG" --dir "$readback"
+          cp "$ASSET_DIR/SHA256SUMS" "$readback/SHA256SUMS"
+          (cd "$readback" && sha256sum -c --strict SHA256SUMS)
+          draft=$(gh release view "$TAG" --repo "$REPO_SLUG" --json isDraft -q '.isDraft')
+          [[ "$draft" == "true" ]] || { echo "release is not still a draft" >&2; exit 1; }
+          gh release edit "$TAG" --repo "$REPO_SLUG" --draft=false --prerelease --verify-tag
+          state=$(gh release view "$TAG" --repo "$REPO_SLUG" --json isDraft,isPrerelease -q '[.isDraft,.isPrerelease] | @tsv')
+          [[ "$state" == $'false\ttrue' ]] || { echo "published release state is unexpected" >&2; exit 1; }
+
+
+      - name: Upload safe verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpha-linux-verification-report
+          path: target/alpha-planning/alpha-basic-report.json
+          if-no-files-found: warn
+          retention-days: 14
