@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "purpose": "Isolated GPL-enabled FFmpeg encoder tool for synthetic test fixtures only; never production-linked or packaged.",
+  "ffmpeg": {
+    "name": "FFmpeg",
+    "version": "8.0.3",
+    "url": "https://ffmpeg.org/releases/ffmpeg-8.0.3.tar.xz",
+    "archive": "ffmpeg-8.0.3.tar.xz",
+    "sha256": "6136812ea6d4e68bdba27e33c2a94382711cdf4f8602ffef056ff792bd6f9818",
+    "license": "LGPL-2.1-or-later"
+  },
+  "encoder_sources": [
+    {
+      "name": "x264",
+      "version": "X264_BUILD 165 (archive SHA-256 pins exact source snapshot)",
+      "url": "https://code.videolan.org/videolan/x264/-/archive/stable/x264-stable.tar.bz2",
+      "archive": "x264-stable.tar.bz2",
+      "sha256": "740126cb48549ca4e2f09b4ae13beed592d5b54744044e38f28662fd96d0ba56",
+      "license": "GPL-2.0-or-later"
+    },
+    {
+      "name": "x265",
+      "version": "4.1+1-1d117be",
+      "url": "https://bitbucket.org/multicoreware/x265_git/downloads/x265_4.1.tar.gz",
+      "archive": "x265_4.1.tar.gz",
+      "sha256": "a31699c6a89806b74b0151e5e6a7df65de4b49050482fe5ebf8a4379d7af8f29",
+      "license": "GPL-2.0-or-later"
+    },
+    {
+      "name": "libaom",
+      "version": "3.12.1",
+      "url": "https://storage.googleapis.com/aom-releases/libaom-3.12.1.tar.gz",
+      "archive": "libaom-3.12.1.tar.gz",
+      "sha256": "9e9775180dec7dfd61a79e00bda3809d43891aee6b2e331ff7f26986207ea22e",
+      "license": "BSD-2-Clause"
+    }
+  ],
+  "tool_build": {
+    "configuration": "release, static executable, x264 and libaom encoders plus 10-bit-only x265 (HIGH_BIT_DEPTH=ON, MAIN12=OFF), no network/ffprobe/ffplay, no hardware acceleration",
+    "restriction": "test-only source build under target/corpus-build; do not link or distribute with product"
+  }
+}
