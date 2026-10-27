@@ -1,0 +1,14 @@
+[package]
+name = "gui"
+version = "0.1.0"
+edition = "2021"
+description = "egui + eframe desktop UI for the Bilibili download app"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+image = { version = "0.24", features = ["png"] }
+bili_core = { path = "../bili_core" }
+
+[dev-dependencies]
+tokio = { version = "1.46", features = ["full"] }

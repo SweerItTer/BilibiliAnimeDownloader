@@ -1,0 +1,38 @@
+[package]
+name = "bili_core"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable Bilibili discovery, durable transfer, and local remux library"
+
+[lib]
+crate-type = ["rlib", "dylib"]
+
+[dependencies]
+tokio = { version = "1.46", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"
+rand = { version = "0.8", features = ["std_rng"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+fs2 = "0.4"
+tempfile = "3"
+ffmpeg-next = { version = "=8.0.0", default-features = false, features = ["format", "codec"] }
+libc = "0.2"
+cookie = "0.18"
+md-5 = "=0.10.6"
+prost = "0.14"
+percent-encoding = "2.3"
+httpdate = "=1.0.3"
+same-file = "=1.0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
+windows-sys = { version = "=0.61.0", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Memory", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["async-secret-service", "async-io", "crypto-rust"] }

@@ -1,0 +1,1 @@
+//! QR login window.
