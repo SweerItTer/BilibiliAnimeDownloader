@@ -30,6 +30,23 @@ python3 scripts/package.py --target x86_64-unknown-linux-gnu \
 
 This local package is not a public release. Public packages are built by CI. Keep packaged `bin/` and `lib/` together; the package uses application-relative library paths and does not need the build-time `FFMPEG_DIR`.
 
+## Linux build environment image
+
+`scripts/ci/Dockerfile` describes the Linux build environment CI jobs run in: Ubuntu 22.04 (glibc 2.35, the packaging baseline), the native build tools listed above plus CMake and Ninja, a Python 3.13 built from the official source archive with its published checksum, and the Rust channel pinned in `rust-toolchain.toml` with rustfmt and clippy. The Dockerfile holds the exact Python patch version and checksum, and the build itself asserts both toolchains. The image contains only build inputs; FFmpeg, the CLI, and packages are still built in each job.
+
+The `CI image` workflow builds this image and publishes it to the GitHub Container Registry as `ghcr.io/<owner>/<repo>/ci-linux:sha-<commit>` when `scripts/ci/Dockerfile`, `rust-toolchain.toml`, or the workflow changes on a pushed branch, and when dispatched manually. It then pulls the published digest on a fresh runner and rechecks the environment; the job summary prints the `image@sha256` reference to consume.
+
+Build it locally from the repository root, sending only the Dockerfile as context:
+
+```sh
+docker build -t bili-ci-linux - < scripts/ci/Dockerfile
+docker run --rm -it -v "$PWD":/src -w /src bili-ci-linux
+```
+
+The image ships no checkout and no build output, so mount the repository to build. Check a built image with `docker run --rm bili-ci-linux rustc --version` and `docker run --rm bili-ci-linux python3 --version`.
+
+Consume the published image by the `image@sha256` reference from the workflow summary, not by a moving tag. Pulling it needs a token with `packages: read`; the publishing job uses `GITHUB_TOKEN` with `packages: write` and no stored registry password.
+
 ## Windows x86_64
 
 Use an initialized Visual Studio x64 MSVC developer environment, MSYS2 Bash/make/NASM, and the pinned Rust toolchain with the `x86_64-pc-windows-msvc` target. FFmpeg is built with MSVC, not MinGW. In PowerShell from the repository root:
