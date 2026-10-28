@@ -69,14 +69,14 @@ def make_native_source_bundle(stage_root, target, prefix, info_path, archive, lo
     shutil.copy2(ROOT / "scripts/native-lock.json", recipe / "native-lock.json")
     shutil.copy2(ROOT / "scripts/THIRD_PARTY_NOTICES.txt", stage / "THIRD_PARTY_NOTICES.txt")
     building = (
-        "This source bundle contains the exact FFmpeg source archive and build recipe for the matching package.\n"
-        "The recipe expects its normal scripts/ layout; run these commands from share/bili/native/source.\n"
-        "The SHA-256 pin is in scripts/native-lock.json and the build tuple/configuration is in ../build-info.json.\n"
-        "Linux x86_64: install a C compiler, make, pkg-config, clang/libclang-dev and patchelf; run "
+        "This bundle contains the exact FFmpeg source archive and build recipe for the matching package.\n"
+        "Run commands from share/bili/native/source; the source pin is in scripts/native-lock.json and "
+        "the build configuration is in ../build-info.json.\n"
+        "Linux x86_64 requires a C compiler, make, NASM, pkg-config, Clang/libclang and patchelf. Run "
         "`python3 scripts/build_ffmpeg.py --target x86_64-unknown-linux-gnu --prefix <prefix> --source-cache .`.\n"
-        "Windows x86_64: install MSYS2 bash/make/nasm and initialize the Visual Studio x64 MSVC "
-        "developer environment; run `python.exe scripts/build_ffmpeg.py --target x86_64-pc-windows-msvc "
-        "--prefix <prefix> --source-cache .`. It uses MSVC, not MinGW.\n"
+        "Windows x86_64 requires MSYS2 Bash/make/NASM and an initialized Visual Studio x64 MSVC "
+        "environment. Run `python.exe scripts/build_ffmpeg.py --target x86_64-pc-windows-msvc "
+        "--prefix <prefix> --source-cache .`; it uses MSVC, not MinGW.\n"
     )
     (source / "BUILDING.txt").write_text(building, encoding="utf-8")
     sums = [
@@ -229,9 +229,9 @@ def main():
     source_dir.mkdir()
     shutil.copy2(ROOT / "scripts/native-lock.json", source_dir / "native-lock.json")
     (source_dir / "BUILDING.txt").write_text(
-        f"Obtain {native_source_asset.name} beside the runtime package. Its SHA-256 is "
-        f"{sha256(native_source_asset)}. It contains the exact corresponding FFmpeg source archive, "
-        "build recipe, build configuration and license notices.\n",
+        f"Obtain {native_source_asset.name} beside the runtime package and verify it with the adjacent SHA256SUMS. "
+        "It contains the exact matching FFmpeg source, build recipe, configuration and license notices. "
+        "See FFMPEG_SOURCE.txt for the pinned source archive details.\n",
         encoding="utf-8")
     (source_dir / "FFMPEG_SOURCE.txt").write_text(
         f"source_asset={native_source_asset.name}\n"
@@ -242,9 +242,11 @@ def main():
     shutil.copy2(ROOT / "LICENSE", stage / "LICENSE")
     shutil.copy2(ROOT / "scripts/THIRD_PARTY_NOTICES.txt", stage / "THIRD_PARTY_NOTICES.txt")
     usage = (
-        "Bilibili CLI package\n\nRun bili --help for commands.\n"
-        "The application license is in LICENSE. FFmpeg is a separate replaceable LGPL library; "
-        "see THIRD_PARTY_NOTICES.txt and share/bili/native/source for corresponding source and build instructions.\n"
+        "Bilibili CLI package\n\nRun bili --help for commands. Keep Linux bin/ and lib/ together; "
+        "on Windows keep bili.exe beside its runtime DLLs.\n"
+        "The application license is in LICENSE. FFmpeg is a separate replaceable LGPL shared library, "
+        "not an executable; see THIRD_PARTY_NOTICES.txt and share/bili/native/source for source and "
+        "replacement instructions.\n"
         "Dependency license texts are under licenses/ and indexed by DEPENDENCY_LICENSES.json.\n"
     )
     if crt_payload_files:
