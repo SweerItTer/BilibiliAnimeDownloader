@@ -25,7 +25,6 @@ jobs:
       reference: ${{ steps.publish.outputs.reference }}
       rustchannel: ${{ steps.rust.outputs.channel }}
     env:
-      DOCKER_CONFIG: ${{ runner.temp }}/docker-config
       IMAGE: ghcr.io/${{ github.repository }}/ci-linux
     steps:
       - uses: actions/checkout@v4
@@ -83,6 +82,7 @@ jobs:
         shell: bash
         env:
           CR_PAT: ${{ github.token }}
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
         run: |
           set -euo pipefail
           # IMAGE is provided by the job environment.
@@ -106,13 +106,12 @@ jobs:
     permissions:
       contents: read
       packages: read
-    env:
-      DOCKER_CONFIG: ${{ runner.temp }}/docker-config
     steps:
       - name: Pull the pinned digest and check the environment
         shell: bash
         env:
           CR_PAT: ${{ github.token }}
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
           REFERENCE: ${{ needs.publish.outputs.reference }}
           EXPECTED_RUST: ${{ needs.publish.outputs.rustchannel }}
         run: |
