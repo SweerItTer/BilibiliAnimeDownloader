@@ -47,6 +47,8 @@ The image ships no checkout and no build output, so mount the repository to buil
 
 Consume the published image by the `image@sha256` reference from the workflow summary, not by a moving tag. Pulling it needs a token with `packages: read`; the publishing job uses `GITHUB_TOKEN` with `packages: write` and no stored registry password.
 
+Linux CI consumes that reference: the media-fixture job and the Linux leg of the CLI build matrix in `cli-packages.yml`, and the tagged candidate build in `release.yml`. The independent smoke and release-verification jobs still run on clean hosted VMs. The same digest is written in those three places, so after a successful publish update all three together. Rebuild and republish the image only when `scripts/ci/Dockerfile` or `rust-toolchain.toml` changes; the Rust build steps check the image toolchain against the checkout before compiling and fail instead of downloading another toolchain.
+
 ## Windows x86_64
 
 Use an initialized Visual Studio x64 MSVC developer environment, MSYS2 Bash/make/NASM, and the pinned Rust toolchain with the `x86_64-pc-windows-msvc` target. FFmpeg is built with MSVC, not MinGW. In PowerShell from the repository root:

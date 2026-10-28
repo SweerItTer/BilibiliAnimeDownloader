@@ -13,6 +13,17 @@ jobs:
     name: Build tagged Linux release candidate
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/sweeritter/bilibilianimedownloader/ci-linux@sha256:5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout tagged commit and history
         uses: actions/checkout@v4
@@ -20,10 +31,14 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      - name: Verify image toolchains match the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          test "$(rustup run "$channel" rustc --version | awk '{print $2}')" = "$channel"
+          rustup run "$channel" cargo fmt --version
+          rustup run "$channel" cargo clippy --version
 
       - name: Validate release tag and merged commit
         shell: bash
@@ -53,14 +68,6 @@ jobs:
               raise SystemExit("tag, checked-out HEAD, and GITHUB_SHA must resolve to the same commit")
           subprocess.run(["git", "merge-base", "--is-ancestor", tag_commit, "origin/UI-version"], check=True)
           PY
-
-      - name: Install Linux native and fixture build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential clang libclang-dev pkg-config patchelf binutils nasm cmake ninja-build
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.98.1
-        with:
-          targets: x86_64-unknown-linux-gnu
 
       - name: Cache pinned FFmpeg sources and libraries
 
