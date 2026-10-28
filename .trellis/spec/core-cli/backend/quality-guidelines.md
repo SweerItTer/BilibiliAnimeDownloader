@@ -90,7 +90,7 @@ Python packaging behavior checks use `python -m unittest discover -s scripts -p 
 SDK and package CI steps use the platform-default shell (Windows PowerShell/Linux Bash), preserving initialized MSVC discovery. Each SDK mode is a separate single-command step so the original nonzero exit is not masked by a later mode; do not introduce linker/PATH overrides or source-text wiring tests for this shell boundary.
 - Local-first delivery uses the existing `build_ffmpeg.py` → Cargo CLI launch/local merge → `verify_core_linkage.py` → `package.py` → `verify_package.py` entrypoints; CI supplements local evidence and is not a prerequisite for reachable local work. Keep private pkgconf/libclang resource-dir and build loader settings child-only, document their real paths, and remove them from extracted-runtime environments. The default offline receiver does not perform manual merge: record an independent fresh-extraction merge when claiming that path, including durable completion and unchanged input/output hashes.
 - Native Windows source-build proof requires an actual native Rust/MSVC/Windows SDK/libclang/MSYS toolchain; a missing prerequisite is not library incompatibility, and downloaded Windows runtime evidence is not local compilation. Install dependencies or alter global environments only with authorization. Current-host glibc 2.43 results do not qualify Ubuntu 22.04 bytes; historical symbol floors/test counts stay attached to their original artifact tuple.
-- The first Linux x86_64 CLI Alpha is qualified only by the Section 8 minimal gate: this section's full multi-platform/SDK/recovery qualification remains the complete contract and must not be claimed, and untested Windows/SDK/recovery items do not block that Alpha.
+- The current Linux x86_64 CLI releases are qualified only by the Section 8 minimal gate: this section's full multi-platform/SDK/recovery qualification remains the complete contract and must not be claimed, and untested Windows/SDK/recovery items do not block those releases.
 
 ## 7. Wrong vs Correct
 
@@ -98,12 +98,14 @@ Wrong: shell sorts `quality_id` and silently chooses a different stream; sets `F
 
 Correct: shell forwards constraints to `Core::plan`, prints its exact keys, validates real loader imports and app-relative paths, packages corresponding native source/notices and an explicit allowlist of source/config files, and reports only exercised checks.
 
-## 8. Alpha candidate and publication workflow
+## 8. Release candidate and publication workflow
 
 - Tags must equal `v` + `core-cli/Cargo.toml` version; tag commit, checked-out `HEAD`, and `GITHUB_SHA` must resolve identically and be an ancestor of `origin/UI-version`.
-- Linux Alpha qualification runs on Ubuntu 22.04: build/package and matched native probe, then independent-VM offline fixture plus fixed `BV1gD4y1o72p` anonymous `basic-alpha` verification. No network challenge bypass or credential fallback.
+- Every `v*` tag runs the same build, independent-VM verification, and publication path. The only tag-derived difference is the GitHub prerelease/latest metadata, computed once as `"-" in version.partition("+")[0]`; `2.0.0+build-meta` stays a stable release and all `alpha`/`beta`/`rc` prereleases share the path.
+- Current Linux CLI release qualification runs on Ubuntu 22.04: build/package and matched native probe, then independent-VM offline fixture plus fixed `BV1gD4y1o72p` anonymous `basic` verification. No network challenge bypass or credential fallback. A stable tag does not add extra platform/SDK/recovery gates.
 - Publish requires both qualification jobs to succeed and validates the receipt status/profile/media ID/completion, package and native-source SHA-256 values, runtime `BUILD_INFO.json` tuple and non-placeholder versioned changelog notes.
-- Public assets are a strict five-file allowlist: runtime archive, matching native-source archive, `CHANGELOG.md`, `alpha-verification.json`, `SHA256SUMS`. Probe, fixture and SDK artifacts are never release assets.
-- Create an empty draft prerelease, upload without clobber/skip-existing, compare exact asset names, download and verify `SHA256SUMS`, then publish. Existing releases fail closed; never create tags, overwrite or auto-delete drafts.
-- Required workflow evidence: YAML parses with three jobs and least-privilege write only on publisher; shell syntax parses; synthetic invalid receipt/hash cases fail. Do not claim hosted qualification until tagged workflow actually succeeds.
+- Public assets are a strict five-file allowlist: runtime archive, matching native-source archive, `CHANGELOG.md`, `verification.json`, `SHA256SUMS`. Probe, fixture and SDK artifacts are never release assets.
+- Create an empty draft with the derived prerelease metadata, upload without clobber/skip-existing, compare exact asset names, byte-compare the downloaded `SHA256SUMS` with the expected manifest, verify the four assets it lists, then publish with the same derived metadata. Existing releases fail closed; never create tags, overwrite or auto-delete drafts.
+- `cli-packages.yml` is pull-request and manual checking only: it keeps the Linux/Windows runtime, SDK and opt-in manual live checks and never publishes. Pull requests never contact Bilibili.
+- Required workflow evidence: YAML parses with three release jobs and least-privilege write only on publisher; shell syntax parses; synthetic invalid receipt/hash cases fail. Do not claim hosted qualification until tagged workflow actually succeeds.
 - Wrong: create a public release before readback or include probe/test fixtures; correct: preserve the same verified runtime/source bytes and publish only after strict draft asset readback.

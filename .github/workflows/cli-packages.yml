@@ -1,8 +1,6 @@
-name: CLI packages
+name: CLI package checks
 
 on:
-  push:
-    branches: ['ci/core-cli-candidate-*']
   pull_request:
   workflow_dispatch:
     inputs:
