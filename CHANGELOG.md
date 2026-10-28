@@ -10,7 +10,7 @@
 
 - Run every `v*` tag through the same build, test, and publish steps. The tag decides whether the release is a prerelease and the latest release; pull-request checks never publish.
 - Add `scripts/ci/Dockerfile`, a pinned Ubuntu 22.04 build image with the Linux native tools, Python 3.13 built from source, and the Rust channel from `rust-toolchain.toml`, so Linux jobs share one prepared environment.
-- Publish that image to the GitHub Container Registry from pushes that change its inputs, then pull the published digest on a fresh runner and recheck the environment. No workflow consumes the image yet, and the first publication happens when the workflow is pushed. Registry credentials are scoped to the login steps, because job-level env cannot read `runner` context.
+- Publish that image to the GitHub Container Registry from pushes that change its inputs, then pull the published digest on a fresh runner and recheck the environment. No workflow consumes the image yet, and the first publication happens when the workflow is pushed. Fix the image workflow so GitHub can start its jobs.
 
 ## [2.0.0-alpha.1] - 2026-10-27
 
