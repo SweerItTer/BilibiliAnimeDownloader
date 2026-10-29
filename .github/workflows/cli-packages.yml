@@ -104,10 +104,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
+            product_artifact: linux-cli
             cache_identity: ci-linux-d0a49ac4973ad80ba287c4043585fe09a418c9605ecaa6c12ce5f7a71e31f62e
             container_image: ghcr.io/sweeritter/bilibilianimedownloader/ci-linux@sha256:d0a49ac4973ad80ba287c4043585fe09a418c9605ecaa6c12ce5f7a71e31f62e
           - target: x86_64-pc-windows-msvc
             os: windows-2022
+            product_artifact: windows-cli
             cache_identity: windows-2022-vs2022
             container_image: ''
     runs-on: ${{ matrix.os }}
@@ -292,28 +294,24 @@ jobs:
         run: python scripts/verify_core_linkage.py --mode dylib --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}"
       - name: Generate packages
         if: needs.scope.outputs.run_cli == 'true'
-        run: python scripts/package.py --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}"
-      - name: Upload exact candidate artifacts
+        run: python scripts/package.py --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}" --runtime-only
+      - name: Stage product and internal SDK separately
+        if: needs.scope.outputs.run_cli == 'true'
+        run: python scripts/stage_ci_artifacts.py --target "${{ matrix.target }}"
+      - name: Upload CLI product download
         if: needs.scope.outputs.run_cli == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: cli-candidate-${{ matrix.target }}
-          path: |
-            target/packages/${{ matrix.target }}/bili-*.zip
-            target/packages/${{ matrix.target }}/bili-*.tar.gz
-            target/packages/${{ matrix.target }}/SHA256SUMS
+          name: ${{ matrix.product_artifact }}
+          path: target/ci-products/${{ matrix.target }}
           if-no-files-found: error
           retention-days: 30
-      - name: Upload lightweight CLI runtime assets
+      - name: Upload internal dylib SDK input
         if: needs.scope.outputs.run_cli == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: cli-runtime-${{ matrix.target }}
-          path: |
-            target/packages/${{ matrix.target }}/bili-${{ matrix.target }}-release.zip
-            target/packages/${{ matrix.target }}/bili-${{ matrix.target }}-release.tar.gz
-            target/packages/${{ matrix.target }}/bili-native-source-${{ matrix.target }}.tar.gz
-            target/packages/${{ matrix.target }}/SHA256SUMS
+          name: cli-sdk-dylib-${{ matrix.target }}
+          path: target/ci-inputs/${{ matrix.target }}/bili-sdk-dylib-${{ matrix.target }}.tar.gz
           if-no-files-found: error
           retention-days: 30
       - name: Upload replacement-library smoke input
@@ -335,10 +333,13 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
+            product_artifact: linux-cli
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
+            product_artifact: linux-cli
           - target: x86_64-pc-windows-msvc
             os: windows-2022
+            product_artifact: windows-cli
     runs-on: ${{ matrix.os }}
     env:
       PUBLIC_MEDIA_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.public_media_id || '' }}
@@ -349,7 +350,11 @@ jobs:
           python-version: '3.13'
       - uses: actions/download-artifact@v4
         with:
-          name: cli-candidate-${{ matrix.target }}
+          name: ${{ matrix.product_artifact }}
+          path: candidate
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-sdk-dylib-${{ matrix.target }}
           path: candidate
       - uses: actions/download-artifact@v4
         with:
