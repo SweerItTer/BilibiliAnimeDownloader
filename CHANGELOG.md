@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### 📝 Documentation
+
+- Add community conduct, contribution, security and accessibility guidance, plus issue forms and a pull request template.
+
 ## [2.0.0-alpha.6] - 2026-10-29
 
 ### ✨ Features
