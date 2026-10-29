@@ -105,7 +105,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             cache_identity: ci-linux-d0a49ac4973ad80ba287c4043585fe09a418c9605ecaa6c12ce5f7a71e31f62e
-            container_image: ghcr.io/sweeritter/bilibilianimedownloader/ci-linux@sha256:d0a49ac4973ad80ba287c4043585fe09a418c9605ecaa6c12ce5f7a71e
+            container_image: ghcr.io/sweeritter/bilibilianimedownloader/ci-linux@sha256:d0a49ac4973ad80ba287c4043585fe09a418c9605ecaa6c12ce5f7a71e31f62e
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             cache_identity: windows-2022-vs2022

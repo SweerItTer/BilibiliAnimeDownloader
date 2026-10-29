@@ -14,6 +14,7 @@
 
 - Route pull requests through Docs, CLI (`core-cli` and `bili_core`), GUI, or full-workspace checks with a stable `CI result` gate; keep tag releases on the full offline qualification path.
 - Reuse validated native FFmpeg, synthetic-corpus/tool, and Rust build caches without skipping current Rust builds or checks.
+- Fix the truncated Linux build-container digest so the matrix job can pull the published CI image.
 
 ## [2.0.0-alpha.6] - 2026-10-29
 
