@@ -141,6 +141,7 @@ jobs:
           if not fixture.is_file():
               raise SystemExit("generated h264-aac.mp4 fixture is missing")
           shutil.copy2(fixture, "target/release-candidate/fixtures/h264-aac.mp4")
+          shutil.copy2(fixture.parent / "manifest.json", "target/release-candidate/fixtures/manifest.json")
           PY
           cp target/release-probe/bin/bili-core-sdk-consumer target/release-candidate/probe/bin/
           python3 - <<'PY'

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## [2.0.0-alpha.2] - 2026-10-29
+## [2.0.0-alpha.3] - 2026-10-29
 
 ### ✨ Features
 
@@ -14,6 +14,7 @@
 - Apply URL safety checks to QR challenges and stream backups; preserve managed output integrity.
 - Fix option validation and download-size checks in the basic package test.
 - Trust only the checked-out repository inside the release container so Git can validate the tag and branch.
+- Include the synthetic test video's checksum manifest in the bundle sent to the independent package checker.
 
 ### 📦 Build/Packaging
 
@@ -40,6 +41,10 @@
 ### 💥 Breaking Changes
 
 - Replace the legacy Python/Qt application with a Rust CLI-first workspace. The GUI is not delivered in this Alpha.
+
+## [2.0.0-alpha.2] - 2026-10-29
+
+The CLI package built successfully, but the independent offline check stopped because its test video's manifest was missing. No application files were published. Its tag is retained; alpha.3 includes the manifest.
 
 ## [2.0.0-alpha.1] - 2026-10-29
 
