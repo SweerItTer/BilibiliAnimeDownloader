@@ -249,7 +249,7 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check CLI Rust formatting
         if: needs.scope.outputs.scope == 'cli'
-        run: cargo fmt -p core-cli -- --check
+        run: cargo fmt -p core-cli -p core-bootstrap -- --check
       - name: Check GUI Rust formatting
         if: needs.scope.outputs.scope == 'gui'
         run: cargo fmt -p gui -- --check
@@ -258,7 +258,7 @@ jobs:
         run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
       - name: Check locked CLI package
         if: needs.scope.outputs.scope == 'cli'
-        run: cargo check -p core-cli -p bili_core --all-targets --locked --target ${{ matrix.target }}
+        run: cargo check -p core-cli -p bili_core -p core-bootstrap --all-targets --locked --target ${{ matrix.target }}
       - name: Check locked GUI package
         if: needs.scope.outputs.scope == 'gui'
         run: cargo check -p gui --all-targets --locked --target ${{ matrix.target }}
@@ -267,7 +267,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked --target ${{ matrix.target }} -- -D warnings
       - name: Lint locked CLI package
         if: needs.scope.outputs.scope == 'cli'
-        run: cargo clippy -p core-cli -p bili_core --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy -p core-cli -p bili_core -p core-bootstrap --all-targets --locked --target ${{ matrix.target }} -- -D warnings
       - name: Lint locked GUI package
         if: needs.scope.outputs.scope == 'gui'
         run: cargo clippy -p gui --all-targets --locked --target ${{ matrix.target }} -- -D warnings
@@ -276,7 +276,7 @@ jobs:
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.target }}
       - name: Run locked CLI package tests
         if: needs.scope.outputs.scope == 'cli'
-        run: cargo test -p core-cli -p bili_core --all-targets --locked --target ${{ matrix.target }}
+        run: cargo test -p core-cli -p bili_core -p core-bootstrap --all-targets --locked --target ${{ matrix.target }}
       - name: Run locked GUI package tests
         if: needs.scope.outputs.scope == 'gui'
         run: cargo test -p gui --all-targets --locked --target ${{ matrix.target }}
@@ -286,6 +286,12 @@ jobs:
       - name: Build CLI
         if: needs.scope.outputs.run_cli == 'true'
         run: cargo build -p core-cli --release --locked --target ${{ matrix.target }}
+      - name: Build Linux installation bootstrap
+        if: needs.scope.outputs.run_cli == 'true' && runner.os == 'Linux'
+        run: cargo build -p core-bootstrap --bin bili-bootstrap --release --locked --target ${{ matrix.target }}
+      - name: Build Windows installation bootstrap with static CRT
+        if: needs.scope.outputs.run_cli == 'true' && runner.os == 'Windows'
+        run: cargo rustc -p core-bootstrap --bin bili-bootstrap --release --locked --target ${{ matrix.target }} -- -C target-feature=+crt-static
       - name: Produce reusable rlib SDK
         if: needs.scope.outputs.run_cli == 'true'
         run: python scripts/verify_core_linkage.py --mode rlib --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}"
