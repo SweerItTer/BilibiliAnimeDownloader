@@ -32,7 +32,7 @@ This local package is not a public release. Public packages are built by CI. Kee
 
 ## Linux build environment image
 
-`scripts/ci/Dockerfile` describes the Linux build environment CI jobs run in: Ubuntu 22.04 (glibc 2.35, the packaging baseline), the native build tools listed above plus CMake and Ninja, a Python 3.13 built from the official source archive with its published checksum, and the Rust channel pinned in `rust-toolchain.toml` with rustfmt and clippy. The Dockerfile holds the exact Python patch version and checksum, and the build itself asserts both toolchains. The image contains only build inputs; FFmpeg, the CLI, and packages are still built in each job.
+`scripts/ci/Dockerfile` describes the Linux build environment CI jobs run in: Ubuntu 22.04 (glibc 2.35, the packaging baseline), the native build tools listed above plus CMake and Ninja, a Python 3.13 built from the official source archive with its published checksum, and the Rust channel pinned in `rust-toolchain.toml` with rustfmt and clippy. The Dockerfile holds the exact Python patch version and checksum, and the build itself asserts both toolchains. The image contains only build inputs; CI reuses the pinned FFmpeg install and synthetic-corpus tool/output caches only when their fingerprints and contents validate, and rebuilds them on a miss or invalidation. The CLI and packages are built in the current job; a cache hit never skips its Rust build or checks.
 
 The `CI image` workflow builds this image and publishes it to the GitHub Container Registry as `ghcr.io/<owner>/<repo>/ci-linux:sha-<commit>` when `scripts/ci/Dockerfile`, `rust-toolchain.toml`, or the workflow changes on a pushed branch, and when dispatched manually. It then pulls the published digest on a fresh runner and rechecks the environment; the job summary prints the `image@sha256` reference to consume.
 
@@ -47,7 +47,33 @@ The image ships no checkout and no build output, so mount the repository to buil
 
 Consume the published image by the `image@sha256` reference from the workflow summary, not by a moving tag. Pulling it needs a token with `packages: read`; the publishing job uses `GITHUB_TOKEN` with `packages: write` and no stored registry password.
 
-Linux CI consumes that reference: the media-fixture job and the Linux leg of the CLI build matrix in `cli-packages.yml`, and the tagged candidate build in `release.yml`. The independent smoke and release-verification jobs still run on clean hosted VMs. The same digest is written in those three places, so after a successful publish update all three together. Rebuild and republish the image only when `scripts/ci/Dockerfile` or `rust-toolchain.toml` changes; the Rust build steps check the image toolchain against the checkout before compiling and fail instead of downloading another toolchain.
+Linux CI consumes that reference in the media-fixture job, the Linux build-matrix leg in `cli-packages.yml`, and the tagged candidate build in `release.yml`. After publishing a new image, update all three image references and their matching cache identities together. The independent smoke and release-verification jobs still run on clean hosted VMs. Rebuild the image only when `scripts/ci/Dockerfile` or `rust-toolchain.toml` changes; Rust build steps reject a toolchain mismatch instead of downloading another toolchain.
+
+## CI routing and cache behavior
+
+`cli-packages.yml` uses `scripts/ci/classify_paths.py` to choose a route. Its Docs whitelist is exactly `README.md`, `README.zh-CN.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `ACCESSIBILITY.md`, `BUILDING.md`, `.github/pull_request_template.md`, Markdown files under `.trellis/spec/`, and direct-child `.md`, `.yml`, or `.yaml` files under `.github/ISSUE_TEMPLATE/`. Docs-only changes take the Docs route. If code also changes, Docs validation runs alongside the code route selected from the non-documentation paths.
+
+The Docs route runs routing and issue-form checks without Rust compilation, native builds, or corpus generation. The GUI route skips CLI packaging and package smoke checks.
+
+When all non-documentation paths are under `core-cli/`, the CLI route runs locked checks, Clippy, and tests for `core-cli` and `bili_core`. Changes confined to `gui/` take the GUI route and run GUI checks. Any other code path or a mix of code areas falls back to the full-workspace route. When configuring branch protection, require `CI result`: it runs even when route-specific jobs are skipped and rejects failed or unexpectedly skipped checks. Tag releases do not use scoped PR routes; every release follows the full offline qualification and publication path. Online media acceptance is separate and does not replace or gate the offline release checks.
+
+The native cache owns `target/native/<TRIPLE>` and the pinned source archives in `target/native/sources`. It reuses an installed prefix only when the source pin, recipe, target/configure inputs, compiler and tool identities, and build environment match, and the installed-file manifest verifies. The fingerprint includes `PATH`, compiler/build flags, `PKG_CONFIG*` settings and `LD_LIBRARY_PATH`. A mismatch or damaged installed file invalidates the prefix; a bad cached source checksum is discarded. On a native cache miss, the checksum-verified archive is fully materialized with the existing safe extraction filter before building.
+
+The corpus cache owns `target/corpus-build`, `target/media-fixtures`, and `~/.cache/bili-native/corpus-sources`. It fingerprints the corpus lock and recipe, tools and relevant build environment, and validates the encoder and fixture manifests against their recorded hashes. Damaged fixtures are regenerated when the validated encoder remains usable; a missing, damaged, or mismatched encoder/toolchain is rebuilt. These caches accelerate inputs only: the current Rust build, checks, lint, and tests still run.
+
+Rust/Cargo caches own `target/<TRIPLE>`, `target/debug`, `target/release`, `target/sdk-build/<TRIPLE>/rlib`, and `target/sdk-build/<TRIPLE>/sourceconsumer/rlib`; they never own `target/native` or native build trees. Stable target directories preserve reusable third-party compilation. SDK verification still copies core source and native inputs into the staged SDK and independently proves the copied source/native consumer; cache hits do not replace that proof, and changed source or staged native paths can require rebuilds.
+
+The source recipe clears only `ffmpeg-sys-next` release artifacts before building: that dependency caches absolute native-library search paths without watching `FFMPEG_DIR`. Reusing those paths after the previous SDK stage is removed would break linking. Other third-party artifacts remain cached; the copied source still builds against its own copied native inputs.
+
+Local WSL/Linux measurements (not hosted CI timings or estimates):
+
+| Cached build | First measured run | Warm reuse | Corruption repair |
+| --- | ---: | ---: | ---: |
+| Native FFmpeg install | 61.51 s | 0.12 s | Corrupt installed header: 60.87 s |
+| Synthetic media corpus | 139.23 s | 0.14 s | Corrupt fixture, existing encoder: 0.65 s |
+| Independent rlib SDK verification | 133.99 s | 22.43 s | Not applicable |
+
+The first SDK run used a new copied-source cache and an existing producer cache. The warm run rebuilt only the FFmpeg bindings/wrapper, copied core, and consumer; it still completed the independent SDK checks. These measurements exclude hosted cache transfer costs. Windows execution and hosted end-to-end timing have not been measured for these changes.
 
 ## Windows x86_64
 

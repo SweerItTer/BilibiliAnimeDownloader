@@ -6,6 +6,15 @@
 
 - Add community conduct, contribution, security and accessibility guidance, plus issue forms and a pull request template.
 
+### 📦 Build/Packaging
+
+- Narrow Tokio features while keeping `rt-multi-thread` enabled for the `bili_core` SDK consumer; move only test-only `net` to dev-dependencies. Remove unused GUI `image` and Tokio dependencies while retaining JPEG, PNG, WebP, GIF, and eframe backends. This removes 21 lockfile packages with no dependency upgrades.
+
+### 👷 CI/CD
+
+- Route pull requests through Docs, CLI (`core-cli` and `bili_core`), GUI, or full-workspace checks with a stable `CI result` gate; keep tag releases on the full offline qualification path.
+- Reuse validated native FFmpeg, synthetic-corpus/tool, and Rust build caches without skipping current Rust builds or checks.
+
 ## [2.0.0-alpha.6] - 2026-10-29
 
 ### ✨ Features
