@@ -73,7 +73,27 @@ Local WSL/Linux measurements (not hosted CI timings or estimates):
 | Synthetic media corpus | 139.23 s | 0.14 s | Corrupt fixture, existing encoder: 0.65 s |
 | Independent rlib SDK verification | 133.99 s | 22.43 s | Not applicable |
 
-The first SDK run used a new copied-source cache and an existing producer cache. The warm run rebuilt only the FFmpeg bindings/wrapper, copied core, and consumer; it still completed the independent SDK checks. These measurements exclude hosted cache transfer costs. Windows execution and hosted end-to-end timing have not been measured for these changes.
+The first SDK run used a new copied-source cache and an existing producer cache. The warm run rebuilt only the FFmpeg bindings/wrapper, copied core, and consumer; it still completed the independent SDK checks. These are local measurements, not hosted end-to-end benchmarks, and exclude cache transfer costs.
+
+## Product downloads and durable CI inputs
+
+The final product names are:
+
+| Actions artifact | Product | Status |
+|---|---|---|
+| `linux-cli` | Linux x86_64 CLI | Produced and verified |
+| `windows-cli` | Windows x86_64 CLI | Produced and verified |
+| `windows-gui` | Windows x86_64 GUI | Reserved; developed separately, no empty package uploaded |
+
+Each CLI artifact contains its executable archive, the matching `bili-native-source-<target>.tar.gz`, and `SHA256SUMS` covering exactly those two archives. The source sidecar contains the pinned FFmpeg source, build recipe, and notices; keep it with the binary when redistributing. SDK hashes never enter the product checksum file.
+
+SDK verification still runs in both modes. Only the dylib SDK is needed by downstream smoke jobs, so CI no longer creates or uploads the unused rlib SDK archive. CLI/source bundles and the SDK handoff are staged separately. Native replacements, the synthetic fixture, and verification receipts remain short-lived job handoffs while checks run.
+
+After a successful run, **Archive CI assets** stores every non-product Actions artifact as an opaque ZIP in `ghcr.io/sweeritter/bilibilianimedownloader/ci-artifacts`. It records the source run, revision, and artifact name; resolves the published manifest digest; pulls by that digest; and compares the ZIP SHA-256 before deleting the Actions copy. Product downloads stay in Actions with their existing retention. A failed publication/readback does not delete its input, and failed CI runs keep their inputs for debugging and retries.
+
+The archiver runs trusted code from the default branch with package/action write access. It never checks out the source PR or extracts its ZIPs, and PR checks do not receive these write permissions. **The new archive workflow activates only after this change reaches the default branch.** Until then, PR runs still show their temporary handoffs. Its manual `run_id` input can archive successful runs using the new product names; legacy layouts without a recognized product are rejected rather than deleting their downloads. This does not change the current Linux-only Alpha release policy or publish an application release.
+
+Archive references and digests appear in that workflow's step summary. Use the exact recorded reference with `oras pull` to retrieve the original Actions ZIP; package read permission may be required. Once handoffs have been archived, rerun the whole successful workflow rather than an individual smoke job that expects the deleted Actions inputs. Failed runs are not cleaned up.
 
 ## Windows x86_64
 

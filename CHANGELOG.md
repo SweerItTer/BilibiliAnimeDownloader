@@ -9,6 +9,7 @@
 ### 📦 Build/Packaging
 
 - Narrow Tokio features while keeping `rt-multi-thread` enabled for the `bili_core` SDK consumer; move only test-only `net` to dev-dependencies. Remove unused GUI `image` and Tokio dependencies while retaining JPEG, PNG, WebP, GIF, and eframe backends. This removes 21 lockfile packages with no dependency upgrades.
+- Stage Linux and Windows CLI downloads with their matching FFmpeg source and product-only checksums; leave the separately developed Windows GUI unmodified and unpublished.
 
 ### 👷 CI/CD
 
@@ -16,6 +17,7 @@
 - Reuse validated native FFmpeg, synthetic-corpus/tool, and Rust build caches without skipping current Rust builds or checks.
 - Fix the truncated Linux build-container digest so the matrix job can pull the published CI image.
 - Retry the pinned FFmpeg source download on transient connection failures; the SHA-256 pin still rejects any bad bytes.
+- Archive successful CI runs' non-product handoffs in GHCR with digest-pinned readback before deleting Actions copies. Use a trusted default-branch workflow; preserve failed-run inputs and both SDK verification modes without uploading the unused rlib SDK archive.
 
 ## [2.0.0-alpha.6] - 2026-10-29
 
