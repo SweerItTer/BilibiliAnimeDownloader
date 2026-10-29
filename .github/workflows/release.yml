@@ -79,20 +79,37 @@ jobs:
           PY
 
       - name: Cache pinned FFmpeg sources and libraries
-
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             target/native/x86_64-unknown-linux-gnu
             target/native/sources
-          key: release-native-linux-x86_64-rust-1.98.1-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'Cargo.lock') }}
+          key: native-${{ runner.os }}-x86_64-unknown-linux-gnu-ci-linux-5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py') }}
+      - name: Cache test-only corpus and provenance
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            target/corpus-build
+            target/media-fixtures
+            ~/.cache/bili-native/corpus-sources
+          key: corpus-linux-x86_64-ci-linux-5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9-${{ hashFiles('scripts/corpus-lock.json', 'scripts/generate_media_fixtures.py') }}
+
+      - name: Generate offline media fixture corpus
+        run: python3 scripts/generate_media_fixtures.py --build-dir target/corpus-build --output-dir target/media-fixtures --source-cache ~/.cache/bili-native/corpus-sources
 
       - name: Cache Cargo build products
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target/x86_64-unknown-linux-gnu'
-          prefix-key: v1-rust-target-subtree
-          key: release-x86_64-unknown-linux-gnu-rust-1.98.1-${{ hashFiles('Cargo.lock', 'scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'bili_core/build.rs') }}
+          cache-directories: |
+            target/debug
+            target/release
+            target/sdk-build/x86_64-unknown-linux-gnu/rlib
+            target/sdk-build/x86_64-unknown-linux-gnu/sourceconsumer/rlib
+          prefix-key: v2-rust-target-subtree
+          shared-key: rust-x86_64-unknown-linux-gnu-ci-linux-5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'bili_core/build.rs', 'scripts/verify_core_linkage.py', 'scripts/sdk_consumer/Cargo.toml') }}
+          env-vars: "CARGO CC CFLAGS CXX CMAKE RUST VCToolsVersion WindowsSDKVersion"
+          save-if: false
 
       - name: Build pinned FFmpeg libraries
         run: python3 scripts/build_ffmpeg.py --target x86_64-unknown-linux-gnu --prefix target/native/x86_64-unknown-linux-gnu --source-cache target/native/sources
@@ -102,9 +119,6 @@ jobs:
           echo "FFMPEG_DIR=$GITHUB_WORKSPACE/target/native/x86_64-unknown-linux-gnu" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_PATH=$GITHUB_WORKSPACE/target/native/x86_64-unknown-linux-gnu/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_LIBDIR=$GITHUB_WORKSPACE/target/native/x86_64-unknown-linux-gnu/lib/pkgconfig" >> "$GITHUB_ENV"
-
-      - name: Generate offline media fixture corpus
-        run: python3 scripts/generate_media_fixtures.py --build-dir target/corpus-build --output-dir target/media-fixtures --source-cache ~/.cache/bili-native/corpus-sources
 
       - name: Build CLI
         run: cargo build -p core-cli --release --locked --target x86_64-unknown-linux-gnu

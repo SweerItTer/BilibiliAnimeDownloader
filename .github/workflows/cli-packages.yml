@@ -1,6 +1,8 @@
 name: CLI package checks
 
 on:
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -14,8 +16,49 @@ permissions:
   contents: read
 
 jobs:
+  scope:
+    name: Determine CI scope
+    runs-on: ubuntu-latest
+    outputs:
+      scope: ${{ steps.classify.outputs.scope }}
+      docs_changed: ${{ steps.classify.outputs.docs_changed }}
+      run_cli: ${{ steps.classify.outputs.run_cli }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test path routing
+        run: python3 -m unittest discover -s scripts/ci -p "test_*.py"
+      - id: classify
+        name: Classify changed paths
+        run: python3 scripts/ci/classify_paths.py --event-name "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH" --github-output "$GITHUB_OUTPUT"
+  docs:
+    name: Validate documentation forms
+    needs: scope
+    if: ${{ needs.scope.outputs.docs_changed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse GitHub issue form YAML
+        run: |
+          mapfile -t forms < <(find .github/ISSUE_TEMPLATE -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) -print)
+          if ((${#forms[@]})); then
+            ruby -ryaml -e '
+              ARGV.each do |path|
+                form = YAML.safe_load_file(path, aliases: false)
+                abort "#{path}: expected a YAML mapping" unless form.is_a?(Hash)
+                if %w[config.yml config.yaml].include?(File.basename(path))
+                  abort "#{path}: blank_issues_enabled must be boolean" unless !form.key?("blank_issues_enabled") || [true, false].include?(form["blank_issues_enabled"])
+                else
+                  abort "#{path}: issue form needs name, description, and body" unless form["name"].is_a?(String) && form["description"].is_a?(String) && form["body"].is_a?(Array)
+                end
+              end
+            ' "${forms[@]}"
+          fi
   media-fixtures:
     name: Build isolated synthetic media corpus
+    needs: scope
+    if: ${{ needs.scope.outputs.run_cli == 'true' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -35,8 +78,9 @@ jobs:
         with:
           path: |
             target/corpus-build
+            target/media-fixtures
             ~/.cache/bili-native/corpus-sources
-          key: corpus-linux-x86_64-rust-1.98.1-${{ hashFiles('scripts/corpus-lock.json', 'scripts/generate_media_fixtures.py') }}
+          key: corpus-linux-x86_64-ci-linux-5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9-${{ hashFiles('scripts/corpus-lock.json', 'scripts/generate_media_fixtures.py') }}
       - name: Generate pinned fixtures with isolated test-only GPL tool
         run: python3 scripts/generate_media_fixtures.py --build-dir target/corpus-build --output-dir target/media-fixtures --source-cache ~/.cache/bili-native/corpus-sources
       - name: Upload platform-neutral fixtures and provenance
@@ -49,7 +93,8 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    needs: media-fixtures
+    needs: [scope, media-fixtures]
+    if: ${{ always() && needs.scope.result == 'success' && ((needs.scope.outputs.run_cli == 'true' && needs.media-fixtures.result == 'success') || needs.scope.outputs.scope == 'gui') }}
     permissions:
       contents: read
       packages: read
@@ -59,9 +104,11 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
+            cache_identity: ci-linux-5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9
             container_image: ghcr.io/sweeritter/bilibilianimedownloader/ci-linux@sha256:5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9
           - target: x86_64-pc-windows-msvc
             os: windows-2022
+            cache_identity: windows-2022-vs2022
             container_image: ''
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container_image != '' && fromJSON(format('{{"image":"{0}","credentials":{{"username":"{1}","password":"{2}"}}}}', matrix.container_image, github.actor, github.token)) || '' }}
@@ -75,6 +122,7 @@ jobs:
           python-version: '3.13'
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
+        if: needs.scope.outputs.run_cli == 'true'
         with:
           name: media-fixtures
           path: target/media-fixtures
@@ -89,10 +137,10 @@ jobs:
           rustup run "$channel" cargo clippy --version
           test -e /usr/local/bin/python || ln -s /usr/local/bin/python3 /usr/local/bin/python
       - name: Set corpus fixture directory (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.scope.outputs.run_cli == 'true'
         run: echo "BILI_MEDIA_FIXTURES=$GITHUB_WORKSPACE/target/media-fixtures" >> "$GITHUB_ENV"
       - name: Set corpus fixture directory (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && needs.scope.outputs.run_cli == 'true'
         shell: pwsh
         run: |
           $env:BILI_MEDIA_FIXTURES = Join-Path $env:GITHUB_WORKSPACE "target/media-fixtures"
@@ -148,13 +196,20 @@ jobs:
           path: |
             target/native/${{ matrix.target }}
             target/native/sources
-          key: native-${{ runner.os }}-${{ matrix.target }}-rust-1.98.1-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'Cargo.lock') }}
+          key: native-${{ runner.os }}-${{ matrix.target }}-${{ matrix.cache_identity }}-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py') }}
       - name: Cache Cargo build products
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target/${{ matrix.target }}"
-          prefix-key: v1-rust-target-subtree
-          key: ${{ matrix.target }}-rust-1.98.1-${{ hashFiles('Cargo.lock', 'scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'scripts/corpus-lock.json', 'scripts/generate_media_fixtures.py', 'bili_core/build.rs') }}
+          cache-directories: |
+            target/debug
+            target/release
+            target/sdk-build/${{ matrix.target }}/rlib
+            target/sdk-build/${{ matrix.target }}/sourceconsumer/rlib
+          prefix-key: v2-rust-target-subtree
+          shared-key: rust-${{ matrix.target }}-${{ matrix.cache_identity }}-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'bili_core/build.rs', 'scripts/verify_core_linkage.py', 'scripts/sdk_consumer/Cargo.toml') }}
+          env-vars: "CARGO CC CFLAGS CXX CMAKE RUST VCToolsVersion WindowsSDKVersion"
+          save-if: ${{ github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch }}
       - name: Build pinned native libraries (Linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -166,11 +221,11 @@ jobs:
           & $env:BILI_NATIVE_PYTHON scripts/build_ffmpeg.py --target "${{ matrix.target }}" --prefix "target/native/${{ matrix.target }}" --source-cache target/native/sources
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build compatible source-built replacement libraries (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.scope.outputs.run_cli == 'true'
         shell: bash
         run: python scripts/build_ffmpeg.py --target "${{ matrix.target }}" --prefix "target/native-replacement/${{ matrix.target }}" --source-cache target/native/sources --extra-version bili-replacement-smoke
       - name: Build compatible source-built replacement libraries (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && needs.scope.outputs.run_cli == 'true'
         shell: pwsh
         run: |
           & $env:BILI_NATIVE_PYTHON scripts/build_ffmpeg.py --target "${{ matrix.target }}" --prefix "target/native-replacement/${{ matrix.target }}" --source-cache target/native/sources --extra-version bili-replacement-smoke
@@ -187,25 +242,59 @@ jobs:
           $env:FFMPEG_DIR = Join-Path $env:GITHUB_WORKSPACE "target/native/${{ matrix.target }}"
           Add-Content -Path $env:GITHUB_ENV -Value "FFMPEG_DIR=$env:FFMPEG_DIR"
           Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:FFMPEG_DIR "bin")
-      - name: Check Rust formatting
+      - name: Check Rust formatting for workspace
+        if: needs.scope.outputs.scope == 'full'
         run: cargo fmt --all -- --check
+      - name: Check CLI Rust formatting
+        if: needs.scope.outputs.scope == 'cli'
+        run: cargo fmt -p core-cli -- --check
+      - name: Check GUI Rust formatting
+        if: needs.scope.outputs.scope == 'gui'
+        run: cargo fmt -p gui -- --check
       - name: Check locked workspace
+        if: needs.scope.outputs.scope == 'full'
         run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
+      - name: Check locked CLI package
+        if: needs.scope.outputs.scope == 'cli'
+        run: cargo check -p core-cli -p bili_core --all-targets --locked --target ${{ matrix.target }}
+      - name: Check locked GUI package
+        if: needs.scope.outputs.scope == 'gui'
+        run: cargo check -p gui --all-targets --locked --target ${{ matrix.target }}
       - name: Lint locked workspace
+        if: needs.scope.outputs.scope == 'full'
         run: cargo clippy --workspace --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+      - name: Lint locked CLI package
+        if: needs.scope.outputs.scope == 'cli'
+        run: cargo clippy -p core-cli -p bili_core --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+      - name: Lint locked GUI package
+        if: needs.scope.outputs.scope == 'gui'
+        run: cargo clippy -p gui --all-targets --locked --target ${{ matrix.target }} -- -D warnings
       - name: Run locked workspace tests with required media corpus
+        if: needs.scope.outputs.scope == 'full'
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.target }}
+      - name: Run locked CLI package tests
+        if: needs.scope.outputs.scope == 'cli'
+        run: cargo test -p core-cli -p bili_core --all-targets --locked --target ${{ matrix.target }}
+      - name: Run locked GUI package tests
+        if: needs.scope.outputs.scope == 'gui'
+        run: cargo test -p gui --all-targets --locked --target ${{ matrix.target }}
       - name: Verify packaging policies
+        if: needs.scope.outputs.run_cli == 'true'
         run: python -m unittest discover -s scripts -p "test_*.py"
       - name: Build CLI
+        if: needs.scope.outputs.run_cli == 'true'
         run: cargo build -p core-cli --release --locked --target ${{ matrix.target }}
       - name: Produce reusable rlib SDK
+        if: needs.scope.outputs.run_cli == 'true'
         run: python scripts/verify_core_linkage.py --mode rlib --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}"
       - name: Produce reusable dylib SDK
+        if: needs.scope.outputs.run_cli == 'true'
         run: python scripts/verify_core_linkage.py --mode dylib --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}"
       - name: Generate packages
+        if: needs.scope.outputs.run_cli == 'true'
         run: python scripts/package.py --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}"
       - name: Upload exact candidate artifacts
+        if: needs.scope.outputs.run_cli == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: cli-candidate-${{ matrix.target }}
@@ -216,6 +305,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Upload lightweight CLI runtime assets
+        if: needs.scope.outputs.run_cli == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: cli-runtime-${{ matrix.target }}
@@ -227,6 +317,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Upload replacement-library smoke input
+        if: needs.scope.outputs.run_cli == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: native-replacement-${{ matrix.target }}
@@ -236,8 +327,8 @@ jobs:
 
   smoke:
     name: Extract and inspect ${{ matrix.target }} on ${{ matrix.os }}
-    needs: build
-    if: ${{ !cancelled() }}
+    needs: [scope, build]
+    if: ${{ needs.scope.outputs.run_cli == 'true' && needs.build.result == 'success' && !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -299,3 +390,47 @@ jobs:
           path: candidate/public-smoke-report.json
           if-no-files-found: warn
           retention-days: 30
+  ci-result:
+    name: CI result
+    if: ${{ always() }}
+    needs: [scope, docs, media-fixtures, build, smoke]
+    runs-on: ubuntu-latest
+    env:
+      SCOPE: ${{ needs.scope.outputs.scope }}
+      SCOPE_RESULT: ${{ needs.scope.result }}
+      DOCS_CHANGED: ${{ needs.scope.outputs.docs_changed }}
+      DOCS_RESULT: ${{ needs.docs.result }}
+      FIXTURES_RESULT: ${{ needs.media-fixtures.result }}
+      BUILD_RESULT: ${{ needs.build.result }}
+      SMOKE_RESULT: ${{ needs.smoke.result }}
+    steps:
+      - name: Require expected checks for the selected route
+        run: |
+          set -euo pipefail
+          test "$SCOPE_RESULT" = success
+          if [[ "$DOCS_CHANGED" == true ]]; then
+            test "$DOCS_RESULT" = success
+          else
+            test "$DOCS_RESULT" = skipped
+          fi
+          case "$SCOPE" in
+            full|cli)
+              test "$FIXTURES_RESULT" = success
+              test "$BUILD_RESULT" = success
+              test "$SMOKE_RESULT" = success
+              ;;
+            gui)
+              test "$FIXTURES_RESULT" = skipped
+              test "$BUILD_RESULT" = success
+              test "$SMOKE_RESULT" = skipped
+              ;;
+            docs)
+              test "$FIXTURES_RESULT" = skipped
+              test "$BUILD_RESULT" = skipped
+              test "$SMOKE_RESULT" = skipped
+              ;;
+            *)
+              echo "unknown CI scope: $SCOPE" >&2
+              exit 1
+              ;;
+          esac
