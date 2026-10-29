@@ -623,31 +623,36 @@ async fn get_json_with<T: DeserializeOwned>(
     if let Some(cookie) = cookie {
         req = req.header(header::COOKIE, cookie);
     }
-    let mut response = req
-        .send()
-        .await
-        .map_err(|_| transport("request Bilibili API"))?;
+    let mut response = req.send().await.map_err(|error| request_failure(&error))?;
+    let status = response.status().as_u16();
     if !response.status().is_success() {
-        return Err(transport("request Bilibili API"));
+        return Err(http_response_failure(status));
     }
     if response
         .content_length()
         .is_some_and(|n| n > MAX_JSON as u64)
     {
-        return Err(invalid("API response exceeds size limit"));
+        return Err(with_http_status(
+            invalid("API response exceeds size limit"),
+            status,
+        ));
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| transport("read Bilibili API response"))?
+        .map_err(|_| with_http_status(transport("read Bilibili API response"), status))?
     {
         if bytes.len().saturating_add(chunk.len()) > MAX_JSON {
-            return Err(invalid("API response exceeds size limit"));
+            return Err(with_http_status(
+                invalid("API response exceeds size limit"),
+                status,
+            ));
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes).map_err(|_| invalid("Bilibili API response is malformed"))
+    serde_json::from_slice(&bytes)
+        .map_err(|_| with_http_status(invalid("Bilibili API response is malformed"), status))
 }
 
 fn parse_search_page(category: SearchCategory, page: u32, value: &Value) -> Result<CategoryPage> {
@@ -1966,6 +1971,23 @@ fn invalid(label: &'static str) -> CoreError {
 fn transport(label: &'static str) -> CoreError {
     CoreError::new(ErrorCode::Transport, label)
 }
+fn request_failure(error: &reqwest::Error) -> CoreError {
+    let operation = if error.is_timeout() {
+        "request Bilibili API timed out"
+    } else if error.is_connect() {
+        "connect to Bilibili API"
+    } else {
+        "request Bilibili API"
+    };
+    transport(operation)
+}
+fn http_response_failure(status: u16) -> CoreError {
+    with_http_status(transport("request Bilibili API"), status)
+}
+fn with_http_status(mut error: CoreError, status: u16) -> CoreError {
+    error.http_status = Some(status);
+    error
+}
 
 #[cfg(test)]
 #[path = "api/discovery_contract.rs"]
@@ -1973,3 +1995,6 @@ mod discovery_contract;
 #[cfg(test)]
 #[path = "api/quality_contract.rs"]
 mod quality_contract;
+#[cfg(test)]
+#[path = "api/transport_diagnostics.rs"]
+mod transport_diagnostics;

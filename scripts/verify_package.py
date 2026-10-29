@@ -815,6 +815,9 @@ def interruptible_download(command, env, cwd, state_dir, timeout=180):
             elif isinstance(value, (bool, int)) or value is None:
                 if value is not None:
                     fields[key] = value
+        status = error.get("http_status")
+        if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+            fields["http_status"] = status
         return fields
 
     def job_fields(job):
