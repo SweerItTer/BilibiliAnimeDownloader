@@ -6,7 +6,7 @@
 
 ## 下载与当前状态
 
-`2.0.0-alpha.5` 是面向 Linux x86_64 的命令行试用版。通过必要的离线发布检查后，软件包和校验文件才会出现在[该版本的发布页面](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.5)。发布 CI 只验证离线软件包；在线检查是单独的人工验收，外部服务可能无法访问。更早的版本是旧 Python 程序。本次不提供 Windows 包；macOS 不在范围内。
+`2.0.0-alpha.6` 是面向 Linux x86_64 的命令行试用版。通过必要的离线发布检查后，软件包和校验文件才会出现在[该版本的发布页面](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.6)。发布 CI 只验证离线软件包；在线检查是单独的人工验收，外部服务可能无法访问。更早的版本是旧 Python 程序。本次不提供 Windows 包；macOS 不在范围内。
 
 从该页面下载 Linux 软件包，并用提供的校验文件核对下载是否完整。解压后保持 `bin/` 与 `lib/` 目录在一起，在解压目录中运行 `./bin/bili --help`。
 

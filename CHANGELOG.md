@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## [2.0.0-alpha.5] - 2026-10-29
+## [2.0.0-alpha.6] - 2026-10-29
 
 ### ✨ Features
 
@@ -25,6 +25,7 @@
 
 - Use the same build, offline qualification, and publish workflow for every version tag; the tag controls only GitHub prerelease/latest metadata.
 - Require offline package, dependency, native-library, license, isolated CLI, and synthetic managed-remux checks before publication. Online media checks are separate manual acceptance and do not gate publication; external-service access is not guaranteed.
+- Configure Python 3.13 explicitly in the publisher because its receipt verifier requires `tomllib`; do not rely on the Ubuntu runner's default Python.
 - Reuse a pinned Ubuntu 22.04 image containing Python, Rust, and build tools for Linux builds. Rebuild the image when its inputs change and check it on a fresh runner before use.
 - Check packages on separate machines without the build environment. Rust builds reject a toolchain version that differs from the checked-out source.
 - Check the repository's current default branch before publishing, so renaming it does not break releases.
@@ -36,8 +37,8 @@
 
 ### Verified / Known Limitations
 
-- The diagnostics changes passed Rust formatting, workspace all-target Clippy with warnings denied, and 105 Rust tests (1 ignored). The packaging scripts passed 12 Python tests.
-- The alpha.5 CLI was built and packaged locally; extracted-package validation and offline merge passed. Workflow validation and executed receipt-gate checks passed, including rejection of failed checks, online-labeled receipts and mismatched package hashes.
+- Local alpha.6 package validation and offline merge passed. The actual offline gate and publisher verification/metadata scripts passed locally; hosted CI repeats the required checks before publication.
+- The diagnostics changes passed Rust formatting, workspace all-target Clippy, and 105 Rust tests (1 ignored). Packaging scripts passed 12 Python tests.
 - Recovery stability and performance have not been fully tested.
 - GUI, Aria2, verification WebView, search sorting, and corrupted-segment repair are not delivered.
 - The application uses the MIT License with Commons Clause. FFmpeg is separately licensed LGPL-2.1-or-later; preserve its source, replacement rights, and notices. The application's restriction does not apply to FFmpeg.
@@ -45,6 +46,10 @@
 ### 💥 Breaking Changes
 
 - Replace the legacy Python/Qt application with a Rust CLI-first workspace. The GUI is not delivered in this Alpha.
+
+## [2.0.0-alpha.5] - 2026-10-29
+
+This attempt was canceled during build after local preflight reproduced the publisher's missing `tomllib` under Ubuntu 22.04's default Python 3.10. No draft or public files were created. The tag is retained.
 
 ## [2.0.0-alpha.4] - 2026-10-29
 
