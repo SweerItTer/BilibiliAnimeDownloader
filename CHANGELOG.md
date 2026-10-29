@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## [2.0.0-alpha.1] - 2026-10-29
+## [2.0.0-alpha.2] - 2026-10-29
 
 ### ✨ Features
 
@@ -13,6 +13,7 @@
 - Validate search and video responses, and preserve explicit access, verification, and subtitle/comment file failures.
 - Apply URL safety checks to QR challenges and stream backups; preserve managed output integrity.
 - Fix option validation and download-size checks in the basic package test.
+- Trust only the checked-out repository inside the release container so Git can validate the tag and branch.
 
 ### 📦 Build/Packaging
 
@@ -39,3 +40,7 @@
 ### 💥 Breaking Changes
 
 - Replace the legacy Python/Qt application with a Rust CLI-first workspace. The GUI is not delivered in this Alpha.
+
+## [2.0.0-alpha.1] - 2026-10-29
+
+The first release attempt stopped at Git's repository-ownership check before building a package. No application files were published. Its tag is retained; alpha.2 contains the fix.

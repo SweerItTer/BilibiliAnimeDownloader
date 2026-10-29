@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "core-cli"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 dependencies = [
  "bili_core",
  "clap",
