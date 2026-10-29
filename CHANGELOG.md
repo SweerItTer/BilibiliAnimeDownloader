@@ -2,18 +2,29 @@
 
 ## Unreleased
 
+### ✨ Features
+
+- Add a shared update protocol in `bili_core` and the `bili update [--check] [--pre-release[=true|false]]` command on top of it: per-product release descriptors, SemVer-precedence selection across stable and pre-release channels, verified archive download, a versioned install layout with an atomic `CURRENT` pointer, and a throttled reminder that announces each available version at most once per channel.
+- Local Linux package-entry verification and a real PTY reminder smoke passed: three local merges succeeded, the second same-cache run left `last_checked_unix` unchanged, and a fresh-cache JSON TTY merge emitted valid envelopes without writing the reminder cache. No compatible higher descriptor was available, so no visible new-version announcement or notification deduplication was tested. End-to-end update installation (download, staged-payload validation, `CURRENT` switch) remains unexecuted; four protocol blockers remain. `2.0.0-alpha.6` has no installation marker or descriptor and cannot update itself.
+
+### 💥 Breaking Changes
+
+- The stable package entry remains unchanged, but the CLI and native runtime now live under `versions/<id>/`, selected by `CURRENT`. `2.0.0-alpha.6` cannot update to this layout; manually extract the first compatible package into a new directory rather than overwriting an Alpha 6 installation. No automatic migration is provided.
+
 ### 📝 Documentation
 
 - Add community conduct, contribution, security and accessibility guidance, plus issue forms and a pull request template.
+- Document the shared update protocol, the GUI validation boundary and the open installation blockers.
 
 ### 📦 Build/Packaging
 
 - Narrow Tokio features while keeping `rt-multi-thread` enabled for the `bili_core` SDK consumer; move only test-only `net` to dev-dependencies. Remove unused GUI `image` and Tokio dependencies while retaining JPEG, PNG, WebP, GIF, and eframe backends. This removes 21 lockfile packages with no dependency upgrades.
 - Stage Linux and Windows CLI downloads with their matching FFmpeg source and product-only checksums; leave the separately developed Windows GUI unmodified and unpublished.
+- Emit a `bili-update-cli-<target>.json` descriptor beside each CLI package, check it against the packaged CLI's own `--json doctor` identity, and cover it in the product checksums.
 
 ### 👷 CI/CD
 
-- Route pull requests through Docs, CLI (`core-cli` and `bili_core`), GUI, or full-workspace checks with a stable `CI result` gate; keep tag releases on the full offline qualification path.
+- Route pull requests through Docs, CLI (`core-cli`, `bili_core`, and `core-bootstrap`), GUI, or full-workspace checks with a stable `CI result` gate; keep tag releases on the full offline qualification path.
 - Reuse validated native FFmpeg, synthetic-corpus/tool, and Rust build caches without skipping current Rust builds or checks.
 - Fix the truncated Linux build-container digest so the matrix job can pull the published CI image.
 - Retry the pinned FFmpeg source download on transient connection failures; the SHA-256 pin still rejects any bad bytes.

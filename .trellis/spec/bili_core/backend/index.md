@@ -13,6 +13,7 @@
 | [Error handling](./error-handling.md) | Typed safe failures, strict selection, cancellation and explicit partial component results |
 | [Quality guidelines](./quality-guidelines.md) | Behavioral tests, source-built shared FFmpeg, stream preservation and no competing implementations |
 | [Logging guidelines](./logging-guidelines.md) | Credential-free diagnostics, bounded events and truthful progress |
+| [Update protocol](./update-protocol.md) | Shared release descriptor, identity checks, install layout and the open blockers; shells must not reimplement either |
 
 ## Read before changing code
 

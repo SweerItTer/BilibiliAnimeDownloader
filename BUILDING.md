@@ -10,6 +10,7 @@ Install a C compiler, `make`, NASM, `pkg-config`, Clang/libclang (for bindings),
 export FFMPEG_DIR="$PWD/target/native/x86_64-unknown-linux-gnu"
 python3 scripts/build_ffmpeg.py --target x86_64-unknown-linux-gnu
 cargo build -p core-cli --release --locked --target x86_64-unknown-linux-gnu
+cargo build -p core-bootstrap --bin bili-bootstrap --release --locked --target x86_64-unknown-linux-gnu
 ```
 
 `FFMPEG_DIR` is used only to find native libraries at build time. To run this unpackaged developer build, set the loader path:
@@ -28,7 +29,9 @@ python3 scripts/package.py --target x86_64-unknown-linux-gnu \
   --profile release --native-prefix "$FFMPEG_DIR" --runtime-only
 ```
 
-This local package is not a public release. Public packages are built by CI. Keep packaged `bin/` and `lib/` together; the package uses application-relative library paths and does not need the build-time `FFMPEG_DIR`.
+The runtime package keeps the stable entry at `bin/bili` and the CLI plus native libraries under `versions/<id>/`; the `CURRENT` pointer selects the payload. The package has independent inner-payload and outer-installation SHA256SUMS files and needs no build-time `FFMPEG_DIR`.
+
+The release also publishes `bili-update-cli-<target>.json` beside the package archive; it is a separate Release asset, not a file inside the package, and it is covered by the same checksum file. The updater reads it to find the package. From a packaged build, `./bin/bili update --check` only reports a newer release; `./bin/bili update` installs one. An unpackaged developer build refuses to install, because it has no installation marker. Installing an update has **not** passed acceptance and must not be used on a real installation yet; the protocol and the exact open blockers are in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). The same applies to the Windows path, which has no published package and no MSVC verification.
 
 ## Linux build environment image
 
@@ -55,7 +58,7 @@ Linux CI consumes that reference in the media-fixture job, the Linux build-matri
 
 The Docs route runs routing and issue-form checks without Rust compilation, native builds, or corpus generation. The GUI route skips CLI packaging and package smoke checks.
 
-When all non-documentation paths are under `core-cli/`, the CLI route runs locked checks, Clippy, and tests for `core-cli` and `bili_core`. Changes confined to `gui/` take the GUI route and run GUI checks. Any other code path or a mix of code areas falls back to the full-workspace route. When configuring branch protection, require `CI result`: it runs even when route-specific jobs are skipped and rejects failed or unexpectedly skipped checks. Tag releases do not use scoped PR routes; every release follows the full offline qualification and publication path. Online media acceptance is separate and does not replace or gate the offline release checks.
+When all non-documentation paths are under `core-cli/` or `core-bootstrap/`, the CLI route runs locked checks, Clippy, and tests for `core-cli`, `bili_core`, and `core-bootstrap`, plus the target-specific bootstrap build. Changes confined to `gui/` take the GUI route and run GUI checks. Any other code path or a mix of code areas falls back to the full-workspace route. When configuring branch protection, require `CI result`: it runs even when route-specific jobs are skipped and rejects failed or unexpectedly skipped checks. Tag releases do not use scoped PR routes; every release follows the full offline qualification and publication path. Online media acceptance is separate and does not replace or gate the offline release checks.
 
 The native cache owns `target/native/<TRIPLE>` and the pinned source archives in `target/native/sources`. It reuses an installed prefix only when the source pin, recipe, target/configure inputs, compiler and tool identities, and build environment match, and the installed-file manifest verifies. The fingerprint includes `PATH`, compiler/build flags, `PKG_CONFIG*` settings and `LD_LIBRARY_PATH`. A mismatch or damaged installed file invalidates the prefix; a bad cached source checksum is discarded. On a native cache miss, the checksum-verified archive is fully materialized with the existing safe extraction filter before building.
 
@@ -85,7 +88,7 @@ The final product names are:
 | `windows-cli` | Windows x86_64 CLI | Produced and verified |
 | `windows-gui` | Windows x86_64 GUI | Reserved; developed separately, no empty package uploaded |
 
-Each CLI artifact contains its executable archive, the matching `bili-native-source-<target>.tar.gz`, and `SHA256SUMS` covering exactly those two archives. The source sidecar contains the pinned FFmpeg source, build recipe, and notices; keep it with the binary when redistributing. SDK hashes never enter the product checksum file.
+Each CLI artifact contains its executable package (stable bootstrap and versioned CLI payload), the matching `bili-native-source-<target>.tar.gz`, `bili-update-cli-<target>.json`, and `SHA256SUMS` covering exactly those three assets. The source sidecar contains the pinned FFmpeg source, build recipe, and notices; keep it with the binary when redistributing. SDK hashes never enter the product checksum file.
 
 SDK verification still runs in both modes. Only the dylib SDK is needed by downstream smoke jobs, so CI no longer creates or uploads the unused rlib SDK archive. CLI/source bundles and the SDK handoff are staged separately. Native replacements, the synthetic fixture, and verification receipts remain short-lived job handoffs while checks run.
 
@@ -103,9 +106,10 @@ Use an initialized Visual Studio x64 MSVC developer environment, MSYS2 Bash/make
 $env:FFMPEG_DIR = "$PWD\target\native\x86_64-pc-windows-msvc"
 python scripts/build_ffmpeg.py --target x86_64-pc-windows-msvc
 cargo build -p core-cli --release --locked --target x86_64-pc-windows-msvc
+cargo rustc -p core-bootstrap --bin bili-bootstrap --release --locked --target x86_64-pc-windows-msvc -- -C target-feature=+crt-static
 ```
 
-No Windows CLI package has been published. Keep `bili.exe` and its runtime DLLs together when producing a local package.
+No Windows CLI package has been published. The installer entry is statically linked to the C runtime; runtime DLLs remain inside the selected `versions/<id>/` payload.
 
 ## Local checks
 
