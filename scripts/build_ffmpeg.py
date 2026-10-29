@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -141,10 +142,22 @@ def main():
         archive.unlink()
     if not archive.exists():
         pending = archive.with_suffix(archive.suffix + ".partial")
-        with urllib.request.urlopen(lock["url"], timeout=120) as source, pending.open("wb") as output:
-            shutil.copyfileobj(source, output)
+        # Transient egress failures (connect timeout, reset) are common on CI
+        # runners; bounded retries keep the checksum-verified pin authoritative.
+        for attempt in range(1, 4):
+            try:
+                with urllib.request.urlopen(lock["url"], timeout=120) as source, pending.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+            except OSError as error:
+                pending.unlink(missing_ok=True)
+                if attempt == 3:
+                    raise SystemExit(f"FFmpeg source download failed after {attempt} attempts: {error}") from error
+                print(f"FFmpeg source download attempt {attempt} failed ({error}); retrying")
+                time.sleep(10 * attempt)
+            else:
+                break
         if digest(pending) != lock["sha256"]:
-            pending.unlink()
+            pending.unlink(missing_ok=True)
             raise SystemExit("FFmpeg source checksum mismatch")
         pending.replace(archive)
     if digest(archive) != lock["sha256"]:
