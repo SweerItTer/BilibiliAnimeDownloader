@@ -1364,7 +1364,7 @@ def main():
         "schema_version": 1,
         "status": "incomplete",
         "target": args.target,
-        "public_media_profile": args.public_media_profile,
+        "public_media_profile": args.public_media_profile if args.public_media_id else None,
         "public_media_id": public_id,
         "media_path": f"https://www.bilibili.com/video/{public_id}" if public_id else None,
         "public_media_input_provided": bool(args.public_media_id),

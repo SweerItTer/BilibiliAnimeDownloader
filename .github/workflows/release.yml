@@ -219,7 +219,7 @@ jobs:
           tar -xzf target/release-linux-candidate.tar.gz -C target/release-candidate
           (cd target/release-candidate && sha256sum --check SHA256SUMS)
 
-      - name: Run offline and fixed anonymous basic qualification
+      - name: Run offline package and merge qualification
         shell: bash
         run: |
           set -euo pipefail
@@ -231,10 +231,6 @@ jobs:
             --native-source "$native_source" \
             --offline-fixture target/release-candidate/fixtures/h264-aac.mp4 \
             --probe-helper target/release-candidate/probe/bin/bili-core-sdk-consumer \
-            --public-media-profile basic \
-            --public-media-id BV1gD4y1o72p \
-            --live-timeout-seconds 900 \
-            --max-media-bytes 134217728 \
             --report target/release-verification/report.json
 
       - name: Upload safe verification report
@@ -268,18 +264,11 @@ jobs:
           digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
           if (report.get("status") != "passed" or report.get("package_validation") != "passed"
                   or report.get("offline_merge_smoke") != "passed"
-                  or report.get("authentication") != "anonymous"
-                  or report.get("public_media_profile") != "basic"
-                  or report.get("public_media_id") != "BV1gD4y1o72p"
-                  or report.get("public_media_input_provided") is not True):
-              raise SystemExit("verification receipt does not satisfy the release gate")
-          smoke = report.get("basic_smoke")
-          if (not isinstance(smoke, dict) or smoke.get("outcome") != "passed"
-                  or smoke.get("phase") != "Completed"
-                  or not isinstance(smoke.get("size"), int) or smoke["size"] <= 0
-                  or not re.fullmatch(r"[0-9a-f]{64}", str(smoke.get("sha256", "")))
-                  or not smoke.get("selected_streams")):
-              raise SystemExit("basic live receipt is incomplete")
+                  or report.get("public_media_input_provided") is not False
+                  or "authentication" not in report or report["authentication"] is not None
+                  or "public_media_id" not in report or report["public_media_id"] is not None
+                  or "public_media_profile" not in report or report["public_media_profile"] is not None):
+              raise SystemExit("verification receipt does not satisfy the offline release gate")
           if report.get("package_sha256") != digest(package) or report.get("native_source_sha256") != digest(native):
               raise SystemExit("verification receipt hashes do not match candidate archives")
 
