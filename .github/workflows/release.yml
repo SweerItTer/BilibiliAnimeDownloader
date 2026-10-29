@@ -42,9 +42,11 @@ jobs:
 
       - name: Validate release tag and merged commit
         shell: bash
+        env:
+          RELEASE_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          git fetch origin UI-version:refs/remotes/origin/UI-version
+          git fetch origin "refs/heads/$RELEASE_BRANCH:refs/remotes/origin/$RELEASE_BRANCH"
           python3 - <<'PY'
           import os
           import subprocess
@@ -66,7 +68,11 @@ jobs:
           event_commit = commit(os.environ["GITHUB_SHA"])
           if tag_commit != head or head != event_commit:
               raise SystemExit("tag, checked-out HEAD, and GITHUB_SHA must resolve to the same commit")
-          subprocess.run(["git", "merge-base", "--is-ancestor", tag_commit, "origin/UI-version"], check=True)
+          subprocess.run(
+              ["git", "merge-base", "--is-ancestor", tag_commit,
+               "refs/remotes/origin/" + os.environ["RELEASE_BRANCH"]],
+              check=True,
+          )
           PY
 
       - name: Cache pinned FFmpeg sources and libraries

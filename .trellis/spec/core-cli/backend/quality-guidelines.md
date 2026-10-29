@@ -100,7 +100,7 @@ Correct: shell forwards constraints to `Core::plan`, prints its exact keys, vali
 
 ## 8. Release candidate and publication workflow
 
-- Tags must equal `v` + `core-cli/Cargo.toml` version; tag commit, checked-out `HEAD`, and `GITHUB_SHA` must resolve identically and be an ancestor of `origin/UI-version`.
+- Tags must equal `v` + `core-cli/Cargo.toml` version; tag commit, checked-out `HEAD`, and `GITHUB_SHA` must resolve identically and belong to the repository's current default branch. Read that branch from `github.event.repository.default_branch`, not a hardcoded branch name.
 - Every `v*` tag runs the same build, independent-VM verification, and publication path. The only tag-derived difference is the GitHub prerelease/latest metadata, computed once as `"-" in version.partition("+")[0]`; `2.0.0+build-meta` stays a stable release and all `alpha`/`beta`/`rc` prereleases share the path.
 - Current Linux CLI release qualification runs on Ubuntu 22.04: build/package and matched native probe, then independent-VM offline fixture plus fixed `BV1gD4y1o72p` anonymous `basic` verification. No network challenge bypass or credential fallback. A stable tag does not add extra platform/SDK/recovery gates.
 - Publish requires both qualification jobs to succeed and validates the receipt status/profile/media ID/completion, package and native-source SHA-256 values, runtime `BUILD_INFO.json` tuple and non-placeholder versioned changelog notes.
