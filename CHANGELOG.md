@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## [2.0.0-alpha.4] - 2026-10-29
+## [2.0.0-alpha.5] - 2026-10-29
 
 ### ✨ Features
 
@@ -23,11 +23,12 @@
 
 ### 👷 CI/CD
 
-- Use the same build, check, and publish steps for every version tag; the tag determines whether GitHub marks it as a prerelease.
+- Use the same build, offline qualification, and publish workflow for every version tag; the tag controls only GitHub prerelease/latest metadata.
+- Require offline package, dependency, native-library, license, isolated CLI, and synthetic managed-remux checks before publication. Online media checks are separate manual acceptance and do not gate publication; external-service access is not guaranteed.
 - Reuse a pinned Ubuntu 22.04 image containing Python, Rust, and build tools for Linux builds. Rebuild the image when its inputs change and check it on a fresh runner before use.
 - Check packages on separate machines without the build environment. Rust builds reject a toolchain version that differs from the checked-out source.
 - Check the repository's current default branch before publishing, so renaming it does not break releases.
-- Upload verification reports from the VM that creates them, including failed checks; failed checks still block publication.
+- Upload verification reports from the VM that creates them, including failed checks; failed offline checks still block publication.
 
 ### 📝 Documentation
 
@@ -35,9 +36,8 @@
 
 ### Verified / Known Limitations
 
-- Local checks passed: Rust formatting, workspace all-target Clippy with warnings denied, 105 Rust tests passed (1 ignored), 12 Python script tests, and actionlint for the release and CLI package workflows.
-- The source-built CLI, independent `rlib` consumer, and extracted-package offline and anonymous basic download/merge checks passed locally.
-- Hosted release checks run independently and must pass before files are published; local checks do not replace that gate.
+- The diagnostics changes passed Rust formatting, workspace all-target Clippy with warnings denied, and 105 Rust tests (1 ignored). The packaging scripts passed 12 Python tests.
+- The alpha.5 CLI was built and packaged locally; extracted-package validation and offline merge passed. Workflow validation and executed receipt-gate checks passed, including rejection of failed checks, online-labeled receipts and mismatched package hashes.
 - Recovery stability and performance have not been fully tested.
 - GUI, Aria2, verification WebView, search sorting, and corrupted-segment repair are not delivered.
 - The application uses the MIT License with Commons Clause. FFmpeg is separately licensed LGPL-2.1-or-later; preserve its source, replacement rights, and notices. The application's restriction does not apply to FFmpeg.
@@ -45,6 +45,10 @@
 ### 💥 Breaking Changes
 
 - Replace the legacy Python/Qt application with a Rust CLI-first workspace. The GUI is not delivered in this Alpha.
+
+## [2.0.0-alpha.4] - 2026-10-29
+
+The package built and passed offline checks, but anonymous API access from the GitHub-hosted verifier returned HTTP 412 and blocked publication. The identical candidate passed anonymous discovery, download and merge locally. The tag is retained; no public files were published.
 
 ## [2.0.0-alpha.3] - 2026-10-29
 

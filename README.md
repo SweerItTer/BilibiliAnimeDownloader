@@ -6,7 +6,7 @@ A Rust CLI for searching and downloading Bilibili videos. It can combine downloa
 
 ## Download and status
 
-Version `2.0.0-alpha.4` is a Linux x86_64 CLI prerelease. Its package and checksums will be listed on the [version's release page](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.4) after release checks pass. Older releases contain the former Python application. Windows packages are not included in this Alpha; macOS is out of scope.
+Version `2.0.0-alpha.5` is a Linux x86_64 CLI prerelease. Its package and checksums will be listed on the [version's release page](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.5) after the required offline release checks pass. Release CI validates packages offline; online checks are separate, manual acceptance, and access to external services is not guaranteed. Older releases contain the former Python application. Windows packages are not included in this Alpha; macOS is out of scope.
 
 Download the Linux package from that page, verify it using the published checksums, extract it, and keep its `bin/` and `lib/` directories together. Then run `./bin/bili --help` from the extracted package directory.
 
