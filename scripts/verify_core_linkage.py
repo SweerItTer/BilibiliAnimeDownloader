@@ -24,6 +24,10 @@ SOURCE_BUILD_ROOT = Path("..") / "bili-sdk-build"
 SYSTEM_LIBS = {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "libutil.so.1", "libresolv.so.2", "ld-linux-x86-64.so.2"}
 
 
+def source_build_target_dir(target, mode):
+    return ROOT / "target" / "sdk-build" / target / "sourceconsumer" / mode
+
+
 def run(args, **kwargs):
     return subprocess.run([str(arg) for arg in args], check=True, text=True, **kwargs)
 
@@ -363,7 +367,6 @@ def prepare_sdk_consumer(output, target):
 
 def write_source_build_recipe(consumer, target, env, mode):
     relative_build_dir = SOURCE_BUILD_ROOT / target / mode
-    build = f"cargo build --locked --release --target {target} --manifest-path consumer/Cargo.toml --target-dir {relative_build_dir}"
     values = {
         "FFMPEG_DIR": "native",
         "PKG_CONFIG_PATH": "native/lib/pkgconfig",
@@ -380,21 +383,37 @@ def write_source_build_recipe(consumer, target, env, mode):
         "CARGO_TARGET_DIR": str(relative_build_dir),
     }
     native_paths = {"FFMPEG_DIR", "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR"}
+    # ffmpeg-sys-next does not watch FFMPEG_DIR; cached native link-search output
+    # can otherwise retain a removed staging path.
     if target.endswith("windows-msvc"):
+        values.pop("CARGO_TARGET_DIR")
+        clean = f'cargo clean --locked -p ffmpeg-sys-next --release --target {target} --manifest-path consumer/Cargo.toml --target-dir "%~fI"'
         build = f'cargo build --locked --release --target {target} --manifest-path consumer/Cargo.toml --target-dir "%~fI"'
-        values["CARGO_TARGET_DIR"] = "%~fI"
         prefix = " && ".join(
             f'set "{key}={"%CD%/" if key in native_paths else ""}{value}"'
             for key, value in values.items()
         )
+
+        def build_step(target_dir):
+            return f'for %I in ("{target_dir}") do (set "CARGO_TARGET_DIR=%~fI" && {prefix} && {clean} && {build})'
+
+        recipe = (
+            f'if defined CARGO_TARGET_DIR ({build_step("%CARGO_TARGET_DIR%")}) '
+            f'else ({build_step(relative_build_dir)})\n'
+        )
     else:
         prefix = " ".join(
-            f'{key}="$PWD/{value}"' if key in native_paths else f"{key}={shlex.quote(value)}"
+            f'{key}="${{CARGO_TARGET_DIR:-{value}}}"' if key == "CARGO_TARGET_DIR"
+            else f'{key}="$PWD/{value}"' if key in native_paths
+            else f"{key}={shlex.quote(value)}"
             for key, value in values.items()
         )
+        target_dir_arg = f'"${{CARGO_TARGET_DIR:-{relative_build_dir}}}"'
+        clean = f'cargo clean --locked -p ffmpeg-sys-next --release --target {target} --manifest-path consumer/Cargo.toml --target-dir {target_dir_arg}'
+        build = f'cargo build --locked --release --target {target} --manifest-path consumer/Cargo.toml --target-dir {target_dir_arg}'
+        recipe = f"{prefix} {clean} && {prefix} {build}\n"
     (consumer / "source-build-command.txt").write_text(
-        f'for %I in ("{relative_build_dir}") do ({prefix} && {build})\n'
-        if target.endswith("windows-msvc") else f"{prefix} {build}\n",
+        recipe,
         encoding="utf-8",
     )
 
@@ -674,6 +693,7 @@ def verify_source_cargo(output, prefix, target, env):
     build_env = env.copy()
     for key in ("FFMPEG_DIR", "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "RUST_TARGET_LIBDIR", "RUSTFLAGS"):
         build_env.pop(key, None)
+    build_env["CARGO_TARGET_DIR"] = str(source_build_target_dir(target, "rlib"))
     if sys.platform != "win32":
         producer_lib = str(prefix / "lib")
         build_env["LD_LIBRARY_PATH"] = os.pathsep.join(
@@ -687,7 +707,7 @@ def verify_source_cargo(output, prefix, target, env):
         build = subprocess.run(command, executable=str(cmd), check=True, cwd=output, env=build_env)
     else:
         build = run(["bash", "-c", recipe], cwd=output, env=build_env)
-    release = (output / SOURCE_BUILD_ROOT / target / "rlib" / target / "release").resolve()
+    release = source_build_target_dir(target, "rlib") / target / "release"
     executable = release / ("bili-core-sdk-consumer.exe" if sys.platform == "win32" else "bili-core-sdk-consumer")
     runtime = isolated_runtime_env(build_env)
     for key in ("LIBCLANG_PATH", "BINDGEN_EXTRA_CLANG_ARGS", "PKG_CONFIG", "RUSTFLAGS", "CARGO_TARGET_DIR"):

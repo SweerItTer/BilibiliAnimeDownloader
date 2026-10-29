@@ -90,6 +90,15 @@ def make_native_source_bundle(stage_root, target, prefix, info_path, archive, lo
     return result
 
 
+def make_sdk_archive(sdk, target, mode, output_dir):
+    if not sdk.is_dir() or not (sdk / "build-info.json").is_file():
+        raise SystemExit(f"missing {mode} SDK output or build metadata: {sdk}")
+    archive = output_dir / f"bili-sdk-{mode}-{target}.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(sdk, arcname=f"bili-sdk-{mode}-{target}", recursive=True)
+    return archive
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", choices=TARGETS, required=True)
@@ -299,13 +308,7 @@ def main():
         if not sdk_root.is_dir():
             raise SystemExit(f"missing matched SDK output: {sdk_root}")
         for mode in ("rlib", "dylib"):
-            sdk = sdk_root / mode
-            if not sdk.is_dir() or not (sdk / "build-info.json").is_file():
-                raise SystemExit(f"missing {mode} SDK output or build metadata: {sdk}")
-            sdk_archive = work / f"bili-sdk-{mode}-{args.target}.tar.gz"
-            with tarfile.open(sdk_archive, "w:gz") as tar:
-                tar.add(sdk, arcname=f"bili-sdk-{mode}-{args.target}", recursive=True)
-            sdk_archives.append(sdk_archive)
+            sdk_archives.append(make_sdk_archive(sdk_root / mode, args.target, mode, work))
     external_sums = [f"{sha256(package)}  {package.name}", f"{sha256(native_source_asset)}  {native_source_asset.name}"] + [
         f"{sha256(path)}  {path.name}" for path in sdk_archives
     ]

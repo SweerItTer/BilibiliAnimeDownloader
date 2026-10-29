@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,6 +22,166 @@ def sha256(path):
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+CORPUS_BUILD_ENV = (
+    "PATH", "CC", "CFLAGS", "CPPFLAGS", "LDFLAGS", "CXX", "CXXFLAGS", "AR", "AS", "LD", "NM",
+    "RANLIB", "STRIP", "PKG_CONFIG", "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR",
+    "PKG_CONFIG_SYSTEM_INCLUDE_PATH", "PKG_CONFIG_SYSTEM_LIBRARY_PATH", "CONFIG_SITE", "MAKE", "MAKEFLAGS",
+    "MFLAGS", "CMAKE_PREFIX_PATH", "CMAKE_TOOLCHAIN_FILE", "CMAKE_GENERATOR", "CMAKE_MAKE_PROGRAM",
+    "CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER", "CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER",
+    "CMAKE_C_FLAGS", "CMAKE_CXX_FLAGS", "CMAKE_BUILD_TYPE", "CPATH", "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH", "LIBRARY_PATH", "LD_LIBRARY_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET",
+)
+
+
+def hash_text(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def tool_identity(command, version_args=("--version",)):
+    if not command:
+        return None
+    parts = [command] if Path(command).is_file() else shlex.split(command, posix=os.name != "nt")
+    if not parts:
+        return None
+    tool_files = []
+    for part in parts:
+        executable = shutil.which(part)
+        if executable:
+            path = Path(executable).resolve()
+            tool_files.append({
+                "path_sha256": hash_text(str(path)),
+                "binary_sha256": sha256(path) if path.is_file() else None,
+            })
+    if not tool_files:
+        return None
+    try:
+        version = subprocess.run([*parts, *version_args], capture_output=True, text=True)
+        version_sha256 = hash_text(version.stdout + version.stderr)
+    except (OSError, subprocess.SubprocessError):
+        version_sha256 = None
+    return {"command_tools": tool_files, "version_sha256": version_sha256}
+
+
+def corpus_fingerprint(lock, environment):
+    tools = {
+        "cc": tool_identity(environment.get("CC", "cc")),
+        "cxx": tool_identity(environment.get("CXX", "c++")),
+        "cmake": tool_identity("cmake"),
+        "ninja": tool_identity("ninja", ("--version",)),
+        "make": tool_identity("make"),
+        "pkg_config": tool_identity(shutil.which("pkg-config") or shutil.which("pkgconf") or ""),
+    }
+    inputs = {
+        "lock_sha256": hash_text(json.dumps(lock, sort_keys=True, separators=(",", ":"))),
+        "recipe_sha256": sha256(Path(__file__).resolve()),
+        "environment_sha256": {
+            name: hash_text(environment[name]) if name in environment else None
+            for name in CORPUS_BUILD_ENV
+        },
+        "tools": tools,
+    }
+    encoded = json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def corpus_outputs(output, names):
+    files = {}
+    for name in names:
+        if not isinstance(name, str) or not name or Path(name).name != name or name in (".", ".."):
+            raise ValueError("fixture artifact path is not a generated filename")
+        path = output / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"fixture artifact is missing or unsafe: {name}")
+        files[name] = sha256(path)
+    return files
+
+
+def fixture_artifact_names(manifest):
+    names = {item["path"] for item in manifest["fixtures"]}
+    sequence = manifest["sequential_flv"]
+    names.add(sequence["concat_list"])
+    for segment in sequence["segments"]:
+        name = segment["path"]
+        names.update((name, name.replace(".flv", ".video.framemd5"),
+                      name.replace(".flv", ".audio.framemd5")))
+    return sorted(names)
+
+
+def corpus_tool_manifest(output, fingerprint, ffmpeg):
+    try:
+        manifest_path = output / "manifest.json"
+        if (manifest_path.is_symlink() or not manifest_path.is_file()
+                or ffmpeg.is_symlink() or not ffmpeg.is_file()):
+            return None
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (manifest.get("schema_version") != 1 or manifest.get("synthetic_only") is not True
+                or manifest.get("provenance") != {
+                    "fingerprint": fingerprint, "ffmpeg_sha256": sha256(ffmpeg)
+                }):
+            return None
+        return manifest
+    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        return None
+
+
+def corpus_cache_valid(output, fingerprint, ffmpeg):
+    manifest = corpus_tool_manifest(output, fingerprint, ffmpeg)
+    if manifest is None:
+        return False
+    try:
+        recorded = manifest.get("artifacts")
+        if not isinstance(recorded, dict) or not recorded or recorded != corpus_outputs(output, recorded):
+            return False
+        fixtures = manifest.get("fixtures")
+        if not isinstance(fixtures, list) or not fixtures:
+            return False
+        for item in fixtures:
+            path = item.get("path")
+            if recorded.get(path) != item.get("sha256"):
+                return False
+            if (output / path).stat().st_size != item.get("bytes"):
+                return False
+        sequence = manifest.get("sequential_flv")
+        segments = sequence.get("segments") if isinstance(sequence, dict) else None
+        if (not isinstance(segments, list) or len(segments) != 2
+                or sequence.get("concat_list") not in recorded):
+            return False
+        for segment in segments:
+            if (recorded.get(segment.get("path")) != segment.get("sha256")
+                    or recorded.get(segment["path"].replace(".flv", ".video.framemd5"))
+                    != segment.get("decoded_video_oracle_sha256")
+                    or recorded.get(segment["path"].replace(".flv", ".audio.framemd5"))
+                    != segment.get("decoded_audio_oracle_sha256")):
+                return False
+        return True
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def validate_generated_paths(work, output, cache):
+    home = Path.home()
+    for path in (work, output, cache):
+        if path == ROOT or path in ROOT.parents or path == home or path in home.parents:
+            raise SystemExit(f"refusing unsafe generated-data path: {path}")
+        if path.is_relative_to(ROOT) and not path.is_relative_to(ROOT / "target"):
+            raise SystemExit(f"generated data inside the repository must stay under target/: {path}")
+    paths = (work, output, cache)
+    for index, left in enumerate(paths):
+        if any(left == right or left in right.parents or right in left.parents
+               for right in paths[index + 1:]):
+            raise SystemExit("--build-dir, --output-dir, and --source-cache must not overlap")
+
+
+def clear_corpus_build(work):
+    work.mkdir(parents=True, exist_ok=True)
+    for name in ("deps", "sources", "build", "prefix"):
+        path = work / name
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
 
 
 def run(command, cwd=None, env=None):
@@ -29,6 +190,8 @@ def run(command, cwd=None, env=None):
 
 def fetch(source, cache):
     archive = cache / source["archive"]
+    if archive.exists() and sha256(archive) != source["sha256"]:
+        archive.unlink()
     if not archive.exists():
         partial = archive.with_suffix(archive.suffix + ".partial")
         urllib.request.urlretrieve(source["url"], partial)
@@ -98,12 +261,20 @@ def build_ffmpeg(lock, work, cache, jobs, dep_prefix):
     return binary
 
 
-def generate(ffmpeg, output):
+def prepare_output(path):
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists() and not path.is_file():
+        raise SystemExit(f"fixture output path is not a regular file: {path}")
+    return path
+
+
+def generate(ffmpeg, output, fingerprint):
     output.mkdir(parents=True, exist_ok=True)
     base = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
 
     def encode(name, input_args, codec_args):
-        run([*base, *input_args, *codec_args, str(output / name)])
+        run([*base, *input_args, *codec_args, str(prepare_output(output / name))])
 
     testsrc = ["-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=0.5"]
     tone = ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.5"]
@@ -118,11 +289,14 @@ def generate(ffmpeg, output):
     for name, color, frequency, duration in segments:
         inputs = ["-f", "lavfi", "-i", f"color=c={color}:size=64x64:rate=12:duration={duration}", "-f", "lavfi", "-i", f"sine=frequency={frequency}:sample_rate=48000:duration={duration}"]
         encode(name, inputs, ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-threads", "1", "-c:a", "aac", "-b:a", "32k", "-shortest", "-f", "flv"])
-    (output / "segments.ffconcat").write_text("ffconcat version 1.0\nfile 'segment-01.flv'\nfile 'segment-02.flv'\n", encoding="utf-8")
-    run([*base, "-safe", "0", "-f", "concat", "-i", str(output / "segments.ffconcat"), "-map", "0", "-c", "copy", "-f", "mp4", str(output / "sequential-flv-remux.mp4")])
+    concat_list = prepare_output(output / "segments.ffconcat")
+    concat_list.write_text("ffconcat version 1.0\nfile 'segment-01.flv'\nfile 'segment-02.flv'\n", encoding="utf-8")
+    remux_output = prepare_output(output / "sequential-flv-remux.mp4")
+    run([*base, "-safe", "0", "-f", "concat", "-i", str(concat_list), "-map", "0", "-c", "copy", "-f", "mp4", str(remux_output)])
     for name in ("segment-01.flv", "segment-02.flv"):
         for stream, selector in (("video", "v:0"), ("audio", "a:0")):
-            run([*base, "-i", str(output / name), "-map", f"0:{selector}", "-f", "framemd5", str(output / name.replace(".flv", f".{stream}.framemd5"))])
+            oracle = output / name.replace(".flv", f".{stream}.framemd5")
+            run([*base, "-i", str(output / name), "-map", f"0:{selector}", "-f", "framemd5", str(prepare_output(oracle))])
     encode("audio-flac.flac", tone, ["-vn", "-c:a", "flac"])
     encode("audio-ac3.ac3", tone, ["-vn", "-c:a", "ac3", "-b:a", "96k"])
     encode("audio-eac3.eac3", tone, ["-vn", "-c:a", "eac3", "-b:a", "96k"])
@@ -151,8 +325,9 @@ def generate(ffmpeg, output):
         audio = any(codec in codecs for codec in ("aac", "flac", "ac3", "eac3"))
         manifest["fixtures"].append({"path": name, "sha256": sha256(path), "bytes": path.stat().st_size, "container": container, "expected_streams": codecs, "purpose": purpose, "timing": {"expected_duration_seconds": durations.get(name, 0.5), "video_frame_rate": "12/1" if video else None, "audio_sample_rate_hz": 48000 if audio else None, "audio_channels": 1 if audio else None}})
     manifest["sequential_flv"] = {"concat_list": "segments.ffconcat", "expected_order": [segment[0] for segment in segments], "expected_stream_count": 2, "expected_streams": [{"type": "video", "codec": "h264"}, {"type": "audio", "codec": "aac"}], "expected_duration_seconds": 1.1, "segments": [{"path": name, "sha256": sha256(output / name), "duration_seconds": duration, "video_content": color, "audio_tone_hz": frequency, "decoded_video_oracle_sha256": sha256(output / name.replace(".flv", ".video.framemd5")), "decoded_audio_oracle_sha256": sha256(output / name.replace(".flv", ".audio.framemd5"))} for name, color, frequency, duration in segments]}
-
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    manifest["provenance"] = {"fingerprint": fingerprint, "ffmpeg_sha256": sha256(ffmpeg)}
+    manifest["artifacts"] = corpus_outputs(output, fixture_artifact_names(manifest))
+    prepare_output(output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
 
 
@@ -166,12 +341,22 @@ def main():
     if args.jobs < 1:
         parser.error("--jobs must be positive")
     lock = json.loads(LOCK.read_text(encoding="utf-8"))
-    work, cache = args.build_dir.resolve(), args.source_cache.resolve()
-    cache.mkdir(parents=True, exist_ok=True)
-    dep_prefix = build_encoder_sources(lock, work, cache, args.jobs)
-    ffmpeg = build_ffmpeg(lock, work, cache, args.jobs, dep_prefix)
-    manifest = generate(ffmpeg, args.output_dir.resolve())
-    print(json.dumps({"ffmpeg": str(ffmpeg), "manifest": str(args.output_dir.resolve() / "manifest.json"), "fixtures": [str(args.output_dir.resolve() / item["path"]) for item in manifest["fixtures"]]}, indent=2))
+    work, cache, output = args.build_dir.resolve(), args.source_cache.resolve(), args.output_dir.resolve()
+    validate_generated_paths(work, output, cache)
+    ffmpeg = work / "prefix/bin/ffmpeg"
+    fingerprint = corpus_fingerprint(lock, os.environ)
+    tool_manifest = corpus_tool_manifest(output, fingerprint, ffmpeg)
+    if tool_manifest is not None and corpus_cache_valid(output, fingerprint, ffmpeg):
+        manifest = tool_manifest
+    elif tool_manifest is not None:
+        manifest = generate(ffmpeg, output, fingerprint)
+    else:
+        clear_corpus_build(work)
+        cache.mkdir(parents=True, exist_ok=True)
+        dep_prefix = build_encoder_sources(lock, work, cache, args.jobs)
+        ffmpeg = build_ffmpeg(lock, work, cache, args.jobs, dep_prefix)
+        manifest = generate(ffmpeg, output, fingerprint)
+    print(json.dumps({"ffmpeg": str(ffmpeg), "manifest": str(output / "manifest.json"), "fixtures": [str(output / item["path"]) for item in manifest["fixtures"]]}, indent=2))
 
 
 if __name__ == "__main__":

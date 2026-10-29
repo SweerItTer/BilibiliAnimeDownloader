@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,101 @@ def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
+BUILD_ENV = (
+    "PATH", "CC", "CFLAGS", "CPPFLAGS", "LDFLAGS", "CXX", "CXXFLAGS", "AR", "AS", "LD", "NM",
+    "RANLIB", "STRIP", "PKG_CONFIG", "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR",
+    "PKG_CONFIG_SYSTEM_INCLUDE_PATH", "PKG_CONFIG_SYSTEM_LIBRARY_PATH", "CONFIG_SITE", "MAKE", "MAKEFLAGS",
+    "MFLAGS", "NASM", "CROSS_PREFIX", "SYSROOT", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "CPATH",
+    "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "LIBRARY_PATH", "LD_LIBRARY_PATH", "INCLUDE", "LIB",
+    "VCToolsInstallDir", "VCToolsVersion", "WindowsSDKVersion", "WindowsSdkDir",
+    "WindowsSDKLibVersion", "UniversalCRTSdkDir", "UCRTVersion", "VCINSTALLDIR", "VisualStudioVersion",
+    "VSCMD_VER", "VSCMD_ARG_TGT_ARCH", "MSYSTEM", "MSYS2_PATH_TYPE",
+)
+
+
+def hash_text(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def build_fingerprint(lock, archive_sha256, target, extra_version, prefix, configure,
+                      recipe_sha256, compiler_identity, environment):
+    controlled_environment = {
+        name: hash_text(environment[name]) if name in environment else None
+        for name in BUILD_ENV
+    }
+    inputs = {
+        "source": lock,
+        "source_archive_sha256": archive_sha256,
+        "target": target,
+        "extra_version": extra_version,
+        "prefix_sha256": hash_text(str(prefix)),
+        "configure": configure,
+        "recipe_sha256": recipe_sha256,
+        "compiler": compiler_identity,
+        "environment_sha256": controlled_environment,
+    }
+    encoded = json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def installed_files(prefix):
+    inventory = []
+    root = prefix.resolve()
+    for path in sorted(prefix.rglob("*")):
+        if path == prefix / "build-info.json":
+            continue
+        if path.is_symlink():
+            if path.is_dir():
+                raise ValueError("native install contains a directory symlink")
+            target = path.resolve(strict=True)
+            if not target.is_relative_to(root):
+                raise ValueError("native install symlink escapes its prefix")
+            record = {"path": path.relative_to(prefix).as_posix(), "sha256": digest(path),
+                      "symlink_target": os.readlink(path)}
+        elif path.is_file():
+            record = {"path": path.relative_to(prefix).as_posix(), "sha256": digest(path)}
+        elif not path.is_dir():
+            raise ValueError("native install contains a non-file output")
+        else:
+            continue
+        inventory.append(record)
+    return inventory
+
+
+def native_cache_valid(prefix, expected):
+    try:
+        info_path = prefix / "build-info.json"
+        if info_path.is_symlink() or not info_path.is_file():
+            return False
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        if any(info.get(key) != value for key, value in expected.items()):
+            return False
+        records = info.get("installed_files")
+        if not isinstance(records, list) or not records or records != installed_files(prefix):
+            return False
+        files = {record["path"]: record["sha256"] for record in records}
+        common = ("config.h", "config_components.h", "config.mak", "COPYING.LGPLv2.1", "LICENSE.md")
+        if not all(name in files for name in common):
+            return False
+        libraries = ("avformat", "avcodec", "avutil")
+        if expected["target"].endswith("windows-msvc"):
+            if not all(any(path.startswith("bin/") and Path(path).name.startswith(name + "-")
+                           and Path(path).suffix.lower() == ".dll" for path in files) for name in libraries):
+                return False
+            imports = info.get("import_libraries")
+            if not isinstance(imports, list) or {item.get("installed") for item in imports} != {
+                    f"lib/{name}.lib" for name in libraries}:
+                return False
+            for item in imports:
+                if files.get(item.get("source")) != item.get("source_sha256") or \
+                        files.get(item.get("installed")) != item.get("installed_sha256"):
+                    return False
+        elif not all(any(path.startswith("lib/") and Path(path).name.startswith("lib" + name + ".so")
+                         for path in files) for name in libraries):
+            return False
+        return True
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError):
+        return False
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -42,24 +138,30 @@ def main():
     cache = args.source_cache.resolve()
     cache.mkdir(parents=True, exist_ok=True)
     archive = cache / lock["archive"]
+    if archive.exists() and digest(archive) != lock["sha256"]:
+        archive.unlink()
     if not archive.exists():
         pending = archive.with_suffix(archive.suffix + ".partial")
-        with urllib.request.urlopen(lock["url"], timeout=120) as source, pending.open("wb") as output:
-            shutil.copyfileobj(source, output)
+        # Transient egress failures (connect timeout, reset) are common on CI
+        # runners; bounded retries keep the checksum-verified pin authoritative.
+        for attempt in range(1, 4):
+            try:
+                with urllib.request.urlopen(lock["url"], timeout=120) as source, pending.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+            except OSError as error:
+                pending.unlink(missing_ok=True)
+                if attempt == 3:
+                    raise SystemExit(f"FFmpeg source download failed after {attempt} attempts: {error}") from error
+                print(f"FFmpeg source download attempt {attempt} failed ({error}); retrying")
+                time.sleep(10 * attempt)
+            else:
+                break
         if digest(pending) != lock["sha256"]:
-            pending.unlink()
+            pending.unlink(missing_ok=True)
             raise SystemExit("FFmpeg source checksum mismatch")
         pending.replace(archive)
     if digest(archive) != lock["sha256"]:
         raise SystemExit("cached FFmpeg source checksum mismatch")
-    work = prefix.parent / (prefix.name + "-build")
-    source = work / ("ffmpeg-" + lock["version"])
-    work.mkdir(parents=True, exist_ok=True)
-    # Cargo cache cleanup may leave directory skeletons; restore every pinned member.
-    with tarfile.open(archive) as bundle:
-        bundle.extractall(work, filter="data")
-    build = work / "objects"
-    build.mkdir(exist_ok=True)
     flags = list(lock["configure"])
     if args.extra_version:
         flags.append("--extra-version=" + args.extra_version)
@@ -69,6 +171,83 @@ def main():
         flags += ["--toolchain=msvc", "--arch=x86_64", "--target-os=win64", "--extra-cflags=-MD"]
     compiler = "cl" if windows else "cc"
     compiler_info = subprocess.run([compiler] if windows else [compiler, "--version"], capture_output=True, text=True)
+    compiler_path = shutil.which(compiler)
+    configured_tools = []
+    for command_part in shlex.split(os.environ.get("CC", compiler), posix=os.name != "nt"):
+        configured_path = shutil.which(command_part)
+        if configured_path:
+            configured_path = Path(configured_path).resolve()
+            configured_tools.append({
+                "path_sha256": hash_text(str(configured_path)),
+                "binary_sha256": digest(configured_path) if configured_path.is_file() else None,
+            })
+    build_tools = {}
+    build_tool_names = ("make", "nasm", "pkg-config", "pkgconf")
+    if windows:
+        build_tool_names += ("bash", "cygpath", "link", "lib")
+    for name in build_tool_names:
+        tool_path = shutil.which(name)
+        if tool_path:
+            tool_path = Path(tool_path).resolve()
+            build_tools[name] = {
+                "path_sha256": hash_text(str(tool_path)),
+                "binary_sha256": digest(tool_path) if tool_path.is_file() else None,
+            }
+    compiler_identity = {
+        "path_sha256": hash_text(str(Path(compiler_path).resolve())) if compiler_path else None,
+        "binary_sha256": digest(Path(compiler_path).resolve()) if compiler_path and Path(compiler_path).is_file() else None,
+        "version_sha256": hash_text(compiler_info.stdout + compiler_info.stderr),
+        "configured_tools": configured_tools,
+        "build_tools": build_tools,
+    }
+    recipe_sha256 = digest(Path(__file__).resolve())
+    configure = ["--prefix=" + str(prefix), *flags]
+    fingerprint = build_fingerprint(
+        lock, digest(archive), args.target, args.extra_version, prefix, configure,
+        recipe_sha256, compiler_identity, os.environ,
+    )
+    expected = {
+        "schema_version": 1,
+        "target": args.target,
+        "source": lock,
+        "source_archive": str(archive),
+        "prefix": str(prefix),
+        "configure": configure,
+        "compiler": (compiler_info.stdout + compiler_info.stderr).strip(),
+        "recipe_sha256": recipe_sha256,
+        "license": lock["license"],
+        "patches": [],
+        "qualification": "candidate capability closure; release requires native corpus and loader verification",
+        "build_fingerprint": fingerprint,
+    }
+    if native_cache_valid(prefix, expected):
+        print("Native install reused: " + str(prefix))
+        print("Build discovery: FFMPEG_DIR=" + str(prefix))
+        print("Runtime loader paths are package-relative; FFMPEG_DIR is not a runtime setting.")
+        return
+
+    work = prefix.parent / (prefix.name + "-build")
+    if work.is_symlink():
+        raise SystemExit(f"native build workspace must not be a symlink: {work}")
+    source = work / ("ffmpeg-" + lock["version"])
+    build = work / "objects"
+    if any(path == archive or path in archive.parents or archive in path.parents
+           for path in (source, build)):
+        raise SystemExit("--source-cache must not overlap native build inputs")
+    if any(path == prefix or path in prefix.parents or prefix in path.parents
+           for path in (source, build)):
+        raise SystemExit("--prefix must not overlap native build inputs")
+    for path in (source, build):
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    work.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive) as bundle:
+        bundle.extractall(work, filter="data")
+    build.mkdir(exist_ok=True)
     if windows:
         # MSYS paths for configure; toolchain remains inherited MSVC, not MinGW.
         bash = shutil.which("bash")
@@ -113,13 +292,15 @@ def main():
         "source": lock,
         "source_archive": str(archive),
         "prefix": str(prefix),
-        "configure": ["--prefix=" + str(prefix), *flags],
-        "compiler": (compiler_info.stdout + compiler_info.stderr).strip(),
-        "recipe_sha256": digest(Path(__file__).resolve()),
+        "configure": configure,
+        "compiler": expected["compiler"],
+        "recipe_sha256": recipe_sha256,
         "license": lock["license"],
         "patches": [],
         "import_libraries": import_libraries,
-        "qualification": "candidate capability closure; release requires native corpus and loader verification"
+        "qualification": "candidate capability closure; release requires native corpus and loader verification",
+        "build_fingerprint": fingerprint,
+        "installed_files": installed_files(prefix),
     }
     (prefix / "build-info.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print("Native install: " + str(prefix))
