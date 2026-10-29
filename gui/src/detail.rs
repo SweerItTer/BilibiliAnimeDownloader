@@ -1,0 +1,1 @@
+//! Anime detail + episode selection.

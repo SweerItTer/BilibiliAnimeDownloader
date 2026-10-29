@@ -1,56 +1,34 @@
-# UI 版本
+# Bilibili Anime Downloader
 
-本项目基于 **PyQt5** 进行 UI 设计，在原始版本的基础上增加了界面交互，提供更便捷的使用方式。
+English | [简体中文](README.zh-CN.md)
 
-## 运行内核
+A Rust CLI for searching and downloading Bilibili videos. It can combine downloaded audio and video into a playable file and save subtitle and danmaku files. `bili_core` is reusable by Rust applications; `bili` is the command-line client.
 
-> **⚠️ 说明**：本项目为 UI 版本，如需运行内核，请参考原始版本。
+## Download and status
 
-## 功能列表
+Version `2.0.0-alpha.1` is planned for Linux x86_64, but no Rust CLI package has been published yet. Check the [Releases page](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases) for a future package. Older releases may contain the former Python application, not this Rust CLI. Windows is not an Alpha target; macOS is out of scope.
 
-- **二维码扫描登录**
-  - **开发者快捷键**：`Shift + Ctrl + D`（快捷登录，详见下文）
-- **搜索栏检测**（支持 `Enter` 绑定快捷搜索）
-- **选集下载**（暂不支持清晰度选择）
-- **下载恢复**（当前存在已下载文件仍会重新下载的问题，可能是文件大小对比存在误差）
-- **音视频合并**
-  - 目前支持 **手动合并**（曾尝试自动合成，但因技术问题改为手动合并按钮）
+When a Linux package is available, download it from the release assets, verify it using that release's published checksums, extract it, and keep its `bin/` and `lib/` directories together. Then run `./bin/bili --help` from the extracted package directory.
 
-## 开发者模式
+## Quick start
 
-### **快捷登录方式**
-1. 在浏览器登录 **大会员** 账号。
-2. 按 `F12` 打开 **开发者工具**，随意选择一个网络请求包。
-3. 复制 **Cookie** 值，并粘贴到 `Creatcookietext.py` 文件的 `cookies` 变量下。
-4. 运行 `Creatcookietext.py`，会在 `main.py` 所在目录生成 `cookies.txt`。
-5. 运行主程序，按 `Shift + Ctrl + D` 直接跳过扫码登录。
+Replace `KEYWORD` with a search term and `VIDEO_ID` with an ID from the results (for example, `BV...` or `av` followed by its numeric ID). Search does not start a download automatically. These examples use anonymous access and do not read a saved login:
 
-📌 **说明**：
-- 这样可以避免每次扫码都会在已登录账号上弹出登录通知。
-- **码农没有大会员 😭，只能靠朋友账号测试。**
+```sh
+./bin/bili search "KEYWORD" --type video --page 1 --auth anonymous
+./bin/bili download VIDEO_ID --parts all --output "$HOME/Videos/Bilibili" --auth anonymous
+```
 
-### **另一种方式**
-1. 至少运行一次程序，系统会在 `temp` 文件夹内生成 `cookies.txt`。
-2. 复制该 `cookies.txt` 到 `main.py` 所在目录，即可跳过扫码登录。
+The CLI prints completed file paths. It does not install or launch a video player. Use `./bin/bili --help` for other commands and options.
 
-## **其他说明**
-- 目前似乎**没有功能会自动删除 `temp` 文件夹**，可能会存在信息泄露的风险。
-- 该 UI 版本本质上是在 **原本的脚本上加了一层壳**，以提供更直观的交互界面。
-- **可以下载电影**，但仍然存在以下问题：
-  - 如果电影有多个分 P，界面可能**只能显示其中一个**。
+## Login and privacy
 
----
+Login is not saved by default. For a one-command QR login, use `--auth qr` on the command that needs it, such as `download`; the login ends when that command ends. To use a QR login in later commands, explicitly save it with `./bin/bili login qr --remember`, then use `--auth stored`. Secure OS storage is preferred; if unavailable, the CLI warns that saved login may be stored as plaintext in the local user configuration directory. Never save test-only credentials or put cookies in command text, logs, or reports.
 
-📌 **改进建议 & 未来计划**
-- [x] 修复下载恢复逻辑，避免重复下载已完成文件。
-- [ ] 增加对 **清晰度选择** 的支持。
-- [ ] 进一步优化 **音视频自动合成** 逻辑。
-- [ ] 增加 `temp` 文件夹的定期清理机制，防止信息泄露。
+Only download content you are authorized to save. The application does not bypass login, entitlements, regional restrictions, or DRM. If the website asks for additional verification, stop; the CLI reports an error.
 
----
+## Limits and build
 
-> **📢 免责声明**：本项目仅供学习交流，请勿用于商业用途或违反相关法律法规。
->
->  **📢 重要声明**：请勿使用本项目进行任何侵犯版权的行为，开发者不对用户的使用方式承担任何责任。
+This Alpha does not include the GUI, Aria2, verification WebView, search sorting, or corrupted-segment repair. Stability, performance, and recovery have not been fully tested. FFmpeg is supplied as replaceable shared libraries; no FFmpeg executable or player is shipped or launched. The application is under the [MIT License with Commons Clause](LICENSE); FFmpeg and other third-party components have separate terms in the package notices.
 
-
+See [BUILDING.md](BUILDING.md) for developer build requirements and commands.

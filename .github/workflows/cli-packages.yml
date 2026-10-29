@@ -1,0 +1,301 @@
+name: CLI package checks
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      public_media_id:
+        description: Optional public Bilibili ID/URL for anonymous live smoke; suggested BV1gD4y1o72p is Blender Big Buck Bunny (CC BY 3.0)
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  media-fixtures:
+    name: Build isolated synthetic media corpus
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/sweeritter/bilibilianimedownloader/ci-linux@sha256:5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache pinned test-only corpus toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/corpus-build
+            ~/.cache/bili-native/corpus-sources
+          key: corpus-linux-x86_64-rust-1.98.1-${{ hashFiles('scripts/corpus-lock.json', 'scripts/generate_media_fixtures.py') }}
+      - name: Generate pinned fixtures with isolated test-only GPL tool
+        run: python3 scripts/generate_media_fixtures.py --build-dir target/corpus-build --output-dir target/media-fixtures --source-cache ~/.cache/bili-native/corpus-sources
+      - name: Upload platform-neutral fixtures and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-fixtures
+          path: target/media-fixtures
+          if-no-files-found: error
+          retention-days: 30
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: media-fixtures
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            container_image: ghcr.io/sweeritter/bilibilianimedownloader/ci-linux@sha256:5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            container_image: ''
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container_image != '' && fromJSON(format('{{"image":"{0}","credentials":{{"username":"{1}","password":"{2}"}}}}', matrix.container_image, github.actor, github.token)) || '' }}
+    defaults:
+      run:
+        shell: ${{ matrix.os == 'ubuntu-22.04' && 'bash' || 'pwsh' }}
+    steps:
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Windows'
+        with:
+          python-version: '3.13'
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: media-fixtures
+          path: target/media-fixtures
+      - name: Verify image toolchains match the checkout
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          test "$(rustup run "$channel" rustc --version | awk '{print $2}')" = "$channel"
+          rustup run "$channel" cargo fmt --version
+          rustup run "$channel" cargo clippy --version
+          test -e /usr/local/bin/python || ln -s /usr/local/bin/python3 /usr/local/bin/python
+      - name: Set corpus fixture directory (Linux)
+        if: runner.os == 'Linux'
+        run: echo "BILI_MEDIA_FIXTURES=$GITHUB_WORKSPACE/target/media-fixtures" >> "$GITHUB_ENV"
+      - name: Set corpus fixture directory (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:BILI_MEDIA_FIXTURES = Join-Path $env:GITHUB_WORKSPACE "target/media-fixtures"
+          Add-Content -Path $env:GITHUB_ENV -Value "BILI_MEDIA_FIXTURES=$env:BILI_MEDIA_FIXTURES"
+      - uses: dtolnay/rust-toolchain@1.98.1
+        if: runner.os == 'Windows'
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - name: Initialize MSVC toolchain
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          vsversion: '2022'
+      - name: Verify licensed VS2022 Enterprise toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $enterprise = & $vswhere -products Microsoft.VisualStudio.Product.Enterprise -latest -property installationPath
+          if ($LASTEXITCODE -ne 0 -or !$enterprise) { throw "GitHub-hosted VS2022 Enterprise installation is required" }
+          $version = [version](& $vswhere -products Microsoft.VisualStudio.Product.Enterprise -latest -property installationVersion)
+          if ($version.Major -ne 17) { throw "Expected Visual Studio 2022 (major 17), found $version" }
+          $enterprise = (Resolve-Path $enterprise).Path
+          $toolset = (Resolve-Path $env:VCToolsInstallDir).Path
+          if (!$toolset.StartsWith($enterprise + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw "Active MSVC toolset is outside the selected Enterprise installation" }
+          Write-Host "Visual Studio Enterprise $version, MSVC toolset $env:VCToolsVersion, Windows SDK $env:WindowsSDKVersion"
+      - name: Install MSYS2 configure tools
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: MSYS
+          update: true
+          install: make nasm diffutils
+      - name: Prepare native MSYS2 and MSVC tools
+        if: runner.os == 'Windows'
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        shell: pwsh
+        run: |
+          $msysBin = Join-Path $env:MSYS2_LOCATION "usr\bin"
+          $msvcBin = Join-Path $env:VCToolsInstallDir "bin\Hostx64\x64"
+          if (!(Test-Path (Join-Path $msysBin "bash.exe")) -or !(Test-Path (Join-Path $msvcBin "link.exe"))) { throw "MSYS2 bash or active MSVC x64 linker is missing" }
+          $python = (Get-Command python.exe).Source
+          $env:PATH = "$msvcBin;$msysBin;$env:PATH"
+          Add-Content -Path $env:GITHUB_ENV -Value "PATH=$env:PATH"
+          Add-Content -Path $env:GITHUB_ENV -Value "BILI_NATIVE_PYTHON=$python"
+      - name: Cache pinned native source and libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/native/${{ matrix.target }}
+            target/native/sources
+          key: native-${{ runner.os }}-${{ matrix.target }}-rust-1.98.1-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'Cargo.lock') }}
+      - name: Cache Cargo build products
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/${{ matrix.target }}"
+          prefix-key: v1-rust-target-subtree
+          key: ${{ matrix.target }}-rust-1.98.1-${{ hashFiles('Cargo.lock', 'scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'scripts/corpus-lock.json', 'scripts/generate_media_fixtures.py', 'bili_core/build.rs') }}
+      - name: Build pinned native libraries (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python scripts/build_ffmpeg.py --target "${{ matrix.target }}" --prefix "target/native/${{ matrix.target }}" --source-cache target/native/sources
+      - name: Build pinned native libraries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & $env:BILI_NATIVE_PYTHON scripts/build_ffmpeg.py --target "${{ matrix.target }}" --prefix "target/native/${{ matrix.target }}" --source-cache target/native/sources
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build compatible source-built replacement libraries (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python scripts/build_ffmpeg.py --target "${{ matrix.target }}" --prefix "target/native-replacement/${{ matrix.target }}" --source-cache target/native/sources --extra-version bili-replacement-smoke
+      - name: Build compatible source-built replacement libraries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & $env:BILI_NATIVE_PYTHON scripts/build_ffmpeg.py --target "${{ matrix.target }}" --prefix "target/native-replacement/${{ matrix.target }}" --source-cache target/native/sources --extra-version bili-replacement-smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Set native discovery prefix (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "FFMPEG_DIR=$GITHUB_WORKSPACE/target/native/${{ matrix.target }}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/target/native/${{ matrix.target }}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+      - name: Set native discovery prefix (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:FFMPEG_DIR = Join-Path $env:GITHUB_WORKSPACE "target/native/${{ matrix.target }}"
+          Add-Content -Path $env:GITHUB_ENV -Value "FFMPEG_DIR=$env:FFMPEG_DIR"
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:FFMPEG_DIR "bin")
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Check locked workspace
+        run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
+      - name: Lint locked workspace
+        run: cargo clippy --workspace --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+      - name: Run locked workspace tests with required media corpus
+        run: cargo test --workspace --all-targets --locked --target ${{ matrix.target }}
+      - name: Verify packaging policies
+        run: python -m unittest discover -s scripts -p "test_*.py"
+      - name: Build CLI
+        run: cargo build -p core-cli --release --locked --target ${{ matrix.target }}
+      - name: Produce reusable rlib SDK
+        run: python scripts/verify_core_linkage.py --mode rlib --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}"
+      - name: Produce reusable dylib SDK
+        run: python scripts/verify_core_linkage.py --mode dylib --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}"
+      - name: Generate packages
+        run: python scripts/package.py --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}"
+      - name: Upload exact candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-candidate-${{ matrix.target }}
+          path: |
+            target/packages/${{ matrix.target }}/bili-*.zip
+            target/packages/${{ matrix.target }}/bili-*.tar.gz
+            target/packages/${{ matrix.target }}/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload lightweight CLI runtime assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-runtime-${{ matrix.target }}
+          path: |
+            target/packages/${{ matrix.target }}/bili-${{ matrix.target }}-release.zip
+            target/packages/${{ matrix.target }}/bili-${{ matrix.target }}-release.tar.gz
+            target/packages/${{ matrix.target }}/bili-native-source-${{ matrix.target }}.tar.gz
+            target/packages/${{ matrix.target }}/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload replacement-library smoke input
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-replacement-${{ matrix.target }}
+          path: target/native-replacement/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 30
+
+  smoke:
+    name: Extract and inspect ${{ matrix.target }} on ${{ matrix.os }}
+    needs: build
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    env:
+      PUBLIC_MEDIA_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.public_media_id || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-candidate-${{ matrix.target }}
+          path: candidate
+      - uses: actions/download-artifact@v4
+        with:
+          name: media-fixtures
+          path: candidate/fixtures
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-replacement-${{ matrix.target }}
+          path: candidate/replacement
+      - name: Install Linux package inspection tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y binutils patchelf
+      - name: Initialize MSVC inspection tools
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Verify downloaded Linux artifact
+        if: runner.os == 'Linux'
+        run: |
+          cd candidate
+          sha256sum -c SHA256SUMS
+          package=$(find . -maxdepth 1 -name 'bili-x86_64-unknown-linux-gnu-release.tar.gz' -type f -print -quit)
+          python3 "$GITHUB_WORKSPACE/scripts/verify_package.py" "$package" --target "${{ matrix.target }}" --native-source "bili-native-source-${{ matrix.target }}.tar.gz" --sdk-artifact "bili-sdk-dylib-${{ matrix.target }}.tar.gz" --replacement-prefix replacement --replacement-fixture fixtures/h264-aac.mp4 --public-media-id "$PUBLIC_MEDIA_ID" --report public-smoke-report.json
+      - name: Verify downloaded Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Location candidate
+          Get-Content SHA256SUMS | ForEach-Object { $parts = $_ -split '  ', 2; if ((Get-FileHash $parts[1] -Algorithm SHA256).Hash.ToLower() -ne $parts[0]) { throw "Checksum mismatch: $($parts[1])" } }
+          $package = Get-Item bili-x86_64-pc-windows-msvc-release.zip
+          python "$env:GITHUB_WORKSPACE/scripts/verify_package.py" $package.FullName --target "${{ matrix.target }}" --native-source "bili-native-source-${{ matrix.target }}.tar.gz" --sdk-artifact "bili-sdk-dylib-${{ matrix.target }}.tar.gz" --replacement-prefix replacement --replacement-fixture fixtures/h264-aac.mp4 --public-media-id "$env:PUBLIC_MEDIA_ID" --report public-smoke-report.json
+      - name: Upload package verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-verification-${{ matrix.target }}-${{ matrix.os }}
+          path: candidate/public-smoke-report.json
+          if-no-files-found: warn
+          retention-days: 30

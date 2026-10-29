@@ -1,3 +1,9 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:da82a15e13b7163aef0def74f6e4e6fc5d1531269562e557084403ff032e62fb
-size 39
+# Trellis: append-only developer journals should merge cleanly across
+# parallel sessions/worktrees — each session only appends a new block, so
+# there is nothing to actually conflict on.
+#
+# Do NOT add a rule for workspace/*/index.md here — it is fully regenerated
+# every session, so a real conflict there is expected and safe to resolve by
+# picking either side (task state lives in task.json, not index.md). See
+# .trellis/spec/cli/backend/directory-structure.md for details.
+.trellis/workspace/*/journal-*.md merge=union

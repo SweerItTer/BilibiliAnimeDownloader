@@ -1,0 +1,11 @@
+[package]
+name = "bili-core-sdk-consumer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bili_core = { path = "../source/bili_core" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[workspace]
