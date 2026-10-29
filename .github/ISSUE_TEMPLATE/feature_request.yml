@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest a change and explain the need it would address.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem or use case should this address?
+      description: Describe who needs this and what they are trying to do.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What would you like the application to do?
+      description: Describe the desired outcome without prescribing implementation details unless they matter.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Optional examples, constraints, or alternatives you considered.

@@ -6,7 +6,7 @@ A Rust CLI for searching and downloading Bilibili videos. It can combine downloa
 
 ## Download and status
 
-Version `2.0.0-alpha.6` is a Linux x86_64 CLI prerelease. Its package and checksums will be listed on the [version's release page](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.6) after the required offline release checks pass. Release CI validates packages offline; online checks are separate, manual acceptance, and access to external services is not guaranteed. Older releases contain the former Python application. Windows packages are not included in this Alpha; macOS is out of scope.
+Version `2.0.0-alpha.6` is a Linux x86_64 CLI prerelease. Its package and checksums are available on the [version's release page](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.6). Release CI validates packages offline; online checks are separate, explicitly authorized manual acceptance, and access to external services is not guaranteed. Older releases contain the former Python application. Windows packages are not included in this Alpha; macOS is out of scope.
 
 Download the Linux package from that page, verify it using the published checksums, extract it, and keep its `bin/` and `lib/` directories together. Then run `./bin/bili --help` from the extracted package directory.
 
@@ -32,3 +32,7 @@ Only download content you are authorized to save. The application does not bypas
 This Alpha does not include the GUI, Aria2, verification WebView, search sorting, or corrupted-segment repair. Stability, performance, and recovery have not been fully tested. FFmpeg is supplied as replaceable shared libraries; no FFmpeg executable or player is shipped or launched. The application is under the [MIT License with Commons Clause](LICENSE); FFmpeg and other third-party components have separate terms in the package notices.
 
 See [BUILDING.md](BUILDING.md) for developer build requirements and commands.
+
+## Community
+
+See [Contributing](CONTRIBUTING.md) to report bugs, suggest features, or contribute changes. Please read the [Code of Conduct](CODE_OF_CONDUCT.md), [Security Policy](SECURITY.md), and [Accessibility statement](ACCESSIBILITY.md).
