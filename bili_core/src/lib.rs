@@ -9,6 +9,7 @@ pub mod auth;
 pub mod cookie;
 mod domain;
 mod download;
+pub mod install;
 pub mod remux;
 mod service;
 pub mod sidecar;
