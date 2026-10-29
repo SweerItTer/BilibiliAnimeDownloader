@@ -2,17 +2,7 @@
 
 ## Unreleased
 
-### 🐞 Fixes
-
-- Check basic package-test options before use and read its recorded download size correctly.
-
-### 👷 CI/CD
-
-- Run every `v*` tag through the same build, test, and publish steps. The tag decides whether the release is a prerelease and the latest release; pull-request checks never publish.
-- Add `scripts/ci/Dockerfile`, a pinned Ubuntu 22.04 build image with the Linux native tools, Python 3.13 built from source, and the Rust channel from `rust-toolchain.toml`, so Linux jobs share one prepared environment.
-- Publish that image to the GitHub Container Registry from pushes that change its inputs, then pull the published digest on a fresh runner and recheck the environment. The Linux media-fixture job, the Linux leg of the CLI build matrix, and the tagged release candidate now build inside that digest-pinned image, so Linux jobs no longer install Python or Rust; the independent smoke and release-verification jobs still run on clean hosted VMs. Each Rust build step fails before compiling if the image toolchain no longer matches `rust-toolchain.toml`.
-
-## [2.0.0-alpha.1] - 2026-10-27
+## [2.0.0-alpha.1] - 2026-10-29
 
 ### ✨ Features
 
@@ -22,6 +12,7 @@
 
 - Validate search and video responses, and preserve explicit access, verification, and subtitle/comment file failures.
 - Apply URL safety checks to QR challenges and stream backups; preserve managed output integrity.
+- Fix option validation and download-size checks in the basic package test.
 
 ### 📦 Build/Packaging
 
@@ -29,7 +20,10 @@
 
 ### 👷 CI/CD
 
-- Prepare the Linux CLI release pipeline; no Rust CLI package has been published as of this changelog entry.
+- Use the same build, check, and publish steps for every version tag; the tag determines whether GitHub marks it as a prerelease.
+- Reuse a pinned Ubuntu 22.04 image containing Python, Rust, and build tools for Linux builds. Rebuild the image when its inputs change and check it on a fresh runner before use.
+- Check packages on separate machines without the build environment. Rust builds reject a toolchain version that differs from the checked-out source.
+- Check the repository's current default branch before publishing, so renaming it does not break releases.
 
 ### 📝 Documentation
 
@@ -37,7 +31,7 @@
 
 ### Verified / Known Limitations
 
-- Local WSL results have not been tested on the Ubuntu release system.
+- Linux and Windows PR builds and extracted-package checks passed on Ubuntu 22.04, Ubuntu 24.04, and Windows 2022. This release ships only the Linux x86_64 CLI; its separate release checks must pass before files become public.
 - Recovery stability and performance have not been fully tested.
 - GUI, Aria2, verification WebView, search sorting, and corrupted-segment repair are not delivered.
 - The application uses the MIT License with Commons Clause. FFmpeg is separately licensed LGPL-2.1-or-later; preserve its source, replacement rights, and notices. The application's restriction does not apply to FFmpeg.
