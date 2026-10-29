@@ -17,7 +17,7 @@ jobs:
       contents: read
       packages: read
     container:
-      image: ghcr.io/sweeritter/bilibilianimedownloader/ci-linux@sha256:5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9
+      image: ghcr.io/sweeritter/bilibilianimedownloader/ci-linux@sha256:d0a49ac4973ad80ba287c4043585fe09a418c9605ecaa6c12ce5f7a71e31f62e
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -84,7 +84,7 @@ jobs:
           path: |
             target/native/x86_64-unknown-linux-gnu
             target/native/sources
-          key: native-${{ runner.os }}-x86_64-unknown-linux-gnu-ci-linux-5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py') }}
+          key: native-${{ runner.os }}-x86_64-unknown-linux-gnu-ci-linux-d0a49ac4973ad80ba287c4043585fe09a418c9605ecaa6c12ce5f7a71e31f62e-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py') }}
       - name: Cache test-only corpus and provenance
         uses: actions/cache/restore@v4
         with:
@@ -92,7 +92,7 @@ jobs:
             target/corpus-build
             target/media-fixtures
             ~/.cache/bili-native/corpus-sources
-          key: corpus-linux-x86_64-ci-linux-5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9-${{ hashFiles('scripts/corpus-lock.json', 'scripts/generate_media_fixtures.py') }}
+          key: corpus-linux-x86_64-ci-linux-d0a49ac4973ad80ba287c4043585fe09a418c9605ecaa6c12ce5f7a71e31f62e-${{ hashFiles('scripts/corpus-lock.json', 'scripts/generate_media_fixtures.py') }}
 
       - name: Generate offline media fixture corpus
         run: python3 scripts/generate_media_fixtures.py --build-dir target/corpus-build --output-dir target/media-fixtures --source-cache ~/.cache/bili-native/corpus-sources
@@ -107,7 +107,7 @@ jobs:
             target/sdk-build/x86_64-unknown-linux-gnu/rlib
             target/sdk-build/x86_64-unknown-linux-gnu/sourceconsumer/rlib
           prefix-key: v2-rust-target-subtree
-          shared-key: rust-x86_64-unknown-linux-gnu-ci-linux-5e1c769afe3d1557b77dd89236cb507fa07aaf2c35aef4e3dff07e956bd8a4b9-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'bili_core/build.rs', 'scripts/verify_core_linkage.py', 'scripts/sdk_consumer/Cargo.toml') }}
+          shared-key: rust-x86_64-unknown-linux-gnu-ci-linux-d0a49ac4973ad80ba287c4043585fe09a418c9605ecaa6c12ce5f7a71e31f62e-${{ hashFiles('scripts/native-lock.json', 'scripts/build_ffmpeg.py', 'bili_core/build.rs', 'scripts/verify_core_linkage.py', 'scripts/sdk_consumer/Cargo.toml') }}
           env-vars: "CARGO CC CFLAGS CXX CMAKE RUST VCToolsVersion WindowsSDKVersion"
           save-if: false
 
