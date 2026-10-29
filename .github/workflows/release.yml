@@ -237,6 +237,15 @@ jobs:
             --max-media-bytes 134217728 \
             --report target/release-verification/report.json
 
+      - name: Upload safe verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-verification-report
+          path: target/release-verification/report.json
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Prepare qualified public assets
         shell: bash
         run: |
@@ -422,12 +431,3 @@ jobs:
           gh release edit "$TAG" --repo "$REPO_SLUG" --draft=false --prerelease="$PRERELEASE" --latest="$LATEST" --verify-tag
           state=$(gh release view "$TAG" --repo "$REPO_SLUG" --json isDraft,isPrerelease -q '[.isDraft,.isPrerelease] | @tsv')
           [[ "$state" == "$(printf 'false\t%s' "$PRERELEASE")" ]] || { echo "published release state is unexpected" >&2; exit 1; }
-
-      - name: Upload safe verification report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-linux-verification-report
-          path: target/release-verification/report.json
-          if-no-files-found: warn
-          retention-days: 14
