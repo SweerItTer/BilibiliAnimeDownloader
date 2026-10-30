@@ -1,6 +1,88 @@
 use super::*;
 use serde_json::json;
 
+#[test]
+fn catalog_keeps_requirements_descriptions_and_url_evidence_independent() {
+    let raw = json!({"code":0,"data":{
+        "accept_quality":[116,80,32,16,64],"accept_description":["1080P60","1080P","480P","360P","720P 准高清"],
+        "support_formats":[
+            {"quality":116,"new_description":"1080P 高码率","need_login":true,"need_vip":true},
+            {"quality":80,"description":"1080P 高清","need_login":1,"need_vip":0},
+            {"quality":32,"new_description":"480P 标清","need_login":false,"need_vip":false},
+            {"quality":16,"new_description":"360P 流畅","codecs":["av01",null]}
+        ],"dash":{"video":[
+            {"id":80,"codecs":"hev1","width":1920,"height":1080},
+            {"id":32,"codecs":"avc1","width":852,"height":480,"baseUrl":"https://v.bilivideo.com/video?token=synthetic-canary"}
+        ]}
+    }});
+    let catalog = parse_catalog(part(), &raw).unwrap();
+    assert_eq!(
+        catalog
+            .advertised
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "1080P 高码率",
+            "1080P 高清",
+            "480P 标清",
+            "360P 流畅",
+            "720P 准高清"
+        ]
+    );
+    assert_eq!(
+        (
+            catalog.advertised[0].requires_login,
+            catalog.advertised[0].requires_vip
+        ),
+        (Some(true), Some(true))
+    );
+    assert_eq!(
+        (
+            catalog.advertised[1].requires_login,
+            catalog.advertised[1].requires_vip
+        ),
+        (Some(true), Some(false))
+    );
+    assert!(!catalog.advertised[0].has_video_url);
+    assert!(!catalog.advertised[1].has_video_url);
+    assert!(catalog.advertised[2].has_video_url);
+    assert_eq!(catalog.advertised[3].requires_login, None);
+    assert_eq!(catalog.advertised[3].advertised_codecs, ["av01"]);
+    assert_eq!(
+        catalog
+            .representations
+            .iter()
+            .find(|r| r.quality == 80)
+            .unwrap()
+            .width,
+        Some(1920)
+    );
+    assert_eq!(
+        catalog
+            .representations
+            .iter()
+            .find(|r| r.quality == 32)
+            .unwrap()
+            .fps,
+        None
+    );
+    assert!(!serde_json::to_string(&catalog)
+        .unwrap()
+        .contains("synthetic-canary"));
+}
+
+#[test]
+fn returned_lower_quality_address_is_not_evidence_for_the_requested_higher_quality() {
+    let raw = json!({"code":0,"data":{"quality":32,
+        "support_formats":[{"quality":116,"new_description":"1080P60"},{"quality":32,"new_description":"480P"}],
+        "dash":{"video":[{"id":32,"baseUrl":"https://v.bilivideo.com/video"},{"id":116,"width":1920,"baseUrl":"https://evil.invalid/video"}]}
+    }});
+    let catalog = parse_catalog(part(), &raw).unwrap();
+    assert!(!catalog.advertised[0].has_video_url);
+    assert!(catalog.advertised[1].has_video_url);
+}
+
 fn part() -> PartRef {
     let aid = Aid::new(7).unwrap();
     PartRef {

@@ -364,6 +364,22 @@ impl Api {
                 Ok(raw) => {
                     let mut variant = parse_catalog(part.clone(), &raw)?;
                     allow_explicit_trailer(&mut variant, trailer);
+                    for offered in &variant.advertised {
+                        if let Some(entry) = catalog
+                            .advertised
+                            .iter_mut()
+                            .find(|entry| entry.id == offered.id)
+                        {
+                            entry.requires_login = entry.requires_login.or(offered.requires_login);
+                            entry.requires_vip = entry.requires_vip.or(offered.requires_vip);
+                            entry.has_video_url |= offered.has_video_url;
+                            if entry.advertised_codecs.is_empty() {
+                                entry
+                                    .advertised_codecs
+                                    .clone_from(&offered.advertised_codecs);
+                            }
+                        }
+                    }
                     if variant.preview {
                         if let Some(entry) = catalog
                             .advertised
@@ -974,6 +990,7 @@ fn parse_catalog(part: PartRef, value: &Value) -> Result<QualityCatalog> {
             continue;
         }
         let label = text(f.get("new_description"))
+            .or_else(|| text(f.get("description")))
             .or_else(|| text(f.get("display_desc")))
             .unwrap_or_else(|| format!("Quality {id}"));
         if !advertised.iter().any(|e| e.id == id) {
@@ -982,7 +999,49 @@ fn parse_catalog(part: PartRef, value: &Value) -> Result<QualityCatalog> {
                 label,
                 rank: f.get("quality").and_then(Value::as_u64).unwrap_or(0) as u32,
                 availability: Availability::Unknown,
+                requires_login: explicit_bool(f.get("need_login")),
+                requires_vip: explicit_bool(f.get("need_vip")),
+                has_video_url: false,
+                advertised_codecs: f
+                    .get("codecs")
+                    .and_then(Value::as_array)
+                    .map(|codecs| {
+                        codecs
+                            .iter()
+                            .filter_map(|codec| text(Some(codec)))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
+        }
+    }
+    if let Some(qualities) = video_info.get("accept_quality").and_then(Value::as_array) {
+        for (index, quality) in qualities.iter().enumerate() {
+            let Some(id) = quality
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|id| *id > 0)
+            else {
+                continue;
+            };
+            if !advertised.iter().any(|entry| entry.id == id) {
+                let label = video_info
+                    .get("accept_description")
+                    .and_then(Value::as_array)
+                    .and_then(|descriptions| descriptions.get(index))
+                    .and_then(|value| text(Some(value)))
+                    .unwrap_or_else(|| format!("Quality {id}"));
+                advertised.push(QualityEntry {
+                    id,
+                    label,
+                    rank: id,
+                    availability: Availability::Unknown,
+                    requires_login: None,
+                    requires_vip: None,
+                    has_video_url: false,
+                    advertised_codecs: Vec::new(),
+                });
+            }
         }
     }
     let dash = video_info.get("dash");
@@ -1042,7 +1101,9 @@ fn parse_catalog(part: PartRef, value: &Value) -> Result<QualityCatalog> {
     unique.sort_by_key(|r| (r.audio, r.quality, r.id));
     let reps = unique;
     let preview = is_trial_play(play, video_info);
+    let returned = returned_video_qualities(video_info);
     for entry in &mut advertised {
+        entry.has_video_url = returned.contains(&entry.id);
         entry.availability = if preview {
             Availability::PreviewOnly
         } else if reps.iter().any(|r| !r.audio && r.quality == entry.id) {
@@ -1062,6 +1123,10 @@ fn parse_catalog(part: PartRef, value: &Value) -> Result<QualityCatalog> {
                 } else {
                     Availability::Obtainable
                 },
+                requires_login: None,
+                requires_vip: None,
+                has_video_url: returned.contains(&r.quality),
+                advertised_codecs: Vec::new(),
             });
         }
     }
@@ -1089,6 +1154,55 @@ fn is_trial_play(play: &Value, video: &Value) -> bool {
             .any(|field| play.get(*field).and_then(Value::as_str) == Some("PLAY_PREVIEW"))
         || play.get("play_video_type").and_then(Value::as_str) == Some("preview")
 }
+fn explicit_bool(value: Option<&Value>) -> Option<bool> {
+    match value {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(value) if value.as_u64() == Some(0) => Some(false),
+        Some(value) if value.as_u64() == Some(1) => Some(true),
+        _ => None,
+    }
+}
+
+// Only keep quality IDs, never URLs, in the public catalog. Metadata alone
+// does not demonstrate that this account was given a usable stream address.
+fn returned_video_qualities(info: &Value) -> std::collections::BTreeSet<u32> {
+    let mut returned = std::collections::BTreeSet::new();
+    if let Some(video) = info
+        .get("dash")
+        .and_then(|dash| dash.get("video"))
+        .and_then(Value::as_array)
+    {
+        for stream in video {
+            if stream_url(stream).ok().flatten().is_some() {
+                if let Some(id) = stream
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                {
+                    returned.insert(id);
+                }
+            }
+        }
+    }
+    if let Some(stream) = info
+        .get("durl")
+        .and_then(Value::as_array)
+        .and_then(|streams| streams.first())
+    {
+        if stream_url(stream).ok().flatten().is_some() {
+            if let Some(id) = info
+                .get("quality")
+                .or_else(|| stream.get("quality"))
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+            {
+                returned.insert(id);
+            }
+        }
+    }
+    returned
+}
+
 fn allow_explicit_trailer(catalog: &mut QualityCatalog, trailer: bool) {
     if !trailer || !catalog.preview {
         return;

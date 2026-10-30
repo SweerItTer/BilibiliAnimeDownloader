@@ -2,6 +2,8 @@
 
 ## 1. Scope / trigger
 
+Catalog presentation evidence is independent of selection policy: QualityEntry retains optional requires_login/requires_vip from explicit support_formats flags, advertised_codecs, and has_video_url based on valid same-quality video locators (URLs stay private). A downgraded playurl response is evidence only for its returned quality; missing FPS or mere advertised/representation metadata must not alter this evidence. Preserve full Chinese descriptions and accept_quality/accept_description entries. Do not change authentication/entitlement enforcement to repair a display mapping.
+
 These rules apply to the typed service cutover and all consumer-visible selection, durability and native media changes. Correctness/data retention precede convenience; no stub or best-effort success can satisfy a requested component.
 
 ## 2. Signatures
