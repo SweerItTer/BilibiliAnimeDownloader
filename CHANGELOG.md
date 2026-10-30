@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### ✨ Features
+
+- Add `download --list-resolutions` and readable `qualities` output: one table per part retains descriptions, dimensions, frame rate and codecs, with separate login/VIP requirements and returned-address evidence. Queries create no download jobs and keep machine-readable JSON output.
+
 ### 📝 Documentation
 
 - Add community conduct, contribution, security and accessibility guidance, plus issue forms and a pull request template.
@@ -18,6 +22,7 @@
 - Fix the truncated Linux build-container digest so the matrix job can pull the published CI image.
 - Retry the pinned FFmpeg source download on transient connection failures; the SHA-256 pin still rejects any bad bytes.
 - Archive successful CI runs' non-product handoffs in GHCR with digest-pinned readback before deleting Actions copies. Use a trusted default-branch workflow; preserve failed-run inputs and both SDK verification modes without uploading the unused rlib SDK archive.
+
 
 ## [2.0.0-alpha.6] - 2026-10-29
 

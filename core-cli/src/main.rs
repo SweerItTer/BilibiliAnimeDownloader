@@ -1,5 +1,8 @@
 mod args;
 mod output;
+#[cfg(test)]
+mod resolution_tests;
+mod resolutions;
 mod secret_input;
 
 use args::{AuthMode, AuthOptions, Category, Cli, Command, Danmaku, Login, MergeMode};
@@ -64,10 +67,10 @@ fn configuration(cli: &Cli) -> Result<CoreConfig> {
         .unwrap_or_else(|| project.data_local_dir().join("state"));
     let mut config = CoreConfig::new(state, output);
     config.state_mode = match cli.command {
-        Command::Download(_)
-        | Command::Resume { .. }
-        | Command::Merge { .. }
-        | Command::Clean { .. } => StateMode::ReadWrite,
+        Command::Download(ref options) if !options.list_resolutions => StateMode::ReadWrite,
+        Command::Resume { .. } | Command::Merge { .. } | Command::Clean { .. } => {
+            StateMode::ReadWrite
+        }
         _ => StateMode::ReadOnly,
     };
     config.max_jobs = settings.jobs.unwrap_or(3);
@@ -139,6 +142,14 @@ fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
+fn monitors_jobs(command: &Command) -> bool {
+    match command {
+        Command::Download(options) => !options.list_resolutions,
+        Command::Resume { .. } | Command::Merge { .. } => true,
+        _ => false,
+    }
+}
+
 async fn run(cli: Cli) -> u8 {
     let config = match configuration(&cli) {
         Ok(config) => config,
@@ -156,10 +167,7 @@ async fn run(cli: Cli) -> u8 {
     };
     let mut updates = core.jobs();
     let mut revisions = std::collections::HashMap::new();
-    let monitor = matches!(
-        cli.command,
-        Command::Download(_) | Command::Resume { .. } | Command::Merge { .. }
-    );
+    let monitor = monitors_jobs(&cli.command);
     let mut operation = Box::pin(execute(&core, &cli, &config));
     let signal = interrupt();
     tokio::pin!(signal);
@@ -195,7 +203,9 @@ async fn run(cli: Cli) -> u8 {
             _ = interrupt() => { std::process::exit(130); }
         }
         if cli.json {
-            let _ = output::json("jobs", &**core.jobs().borrow());
+            if !matches!(&cli.command, Command::Download(options) if options.list_resolutions) {
+                let _ = output::json("jobs", &**core.jobs().borrow());
+            }
             output::error(
                 &CoreError::new(ErrorCode::Cancelled, "user interruption"),
                 true,
@@ -444,12 +454,9 @@ async fn execute(core: &Core, cli: &Cli, config: &CoreConfig) -> Result<u8> {
         Command::Qualities { input, part, auth } => {
             authenticate(core, auth).await?;
             let item = core.resolve(input.as_str().into()).await?;
-            let selected = quality_part(item.parts, *part)?;
-            output::result(
-                "qualities",
-                &core.quality_catalog(selected.reference).await?,
-                cli.json,
-            )?;
+            let selected = quality_part(item.parts.clone(), *part)?;
+            let catalog = core.quality_catalog(selected.reference.clone()).await?;
+            output::qualities(&item, &selected, &catalog, cli.json)?;
         }
         Command::Login { method } => {
             match method {
@@ -493,6 +500,12 @@ async fn execute(core: &Core, cli: &Cli, config: &CoreConfig) -> Result<u8> {
         }
         Command::Download(options) => {
             authenticate(core, &options.auth).await?;
+            if options.list_resolutions {
+                return resolutions::query(core, &options.inputs, &options.parts, |report| {
+                    output::resolution_report(&report, cli.json)
+                })
+                .await;
+            }
             let quality = if options.quality == "highest" {
                 None
             } else {

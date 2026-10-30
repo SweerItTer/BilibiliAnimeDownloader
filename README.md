@@ -16,8 +16,11 @@ Replace `KEYWORD` with a search term and `VIDEO_ID` with an ID from the results 
 
 ```sh
 ./bin/bili search "KEYWORD" --type video --page 1 --auth anonymous
+./bin/bili download VIDEO_ID --list-resolutions --parts all --auth anonymous
 ./bin/bili download VIDEO_ID --parts all --output "$HOME/Videos/Bilibili" --auth anonymous
 ```
+
+Use `--list-resolutions` to view each part's quality IDs, actual dimensions, frame rate, codec and access status without starting a download. Select a listed Quality ID with `download VIDEO_ID --quality QUALITY_ID`; dimensions and Stream IDs are different values. Missing metadata or access reasons appear as unknown. Use `--parts 1,3-5` to choose parts, or `qualities VIDEO_ID --part 3` for one part. Add `--json` for machine-readable output. On Windows, use `.\bili.exe` in PowerShell with the same arguments.
 
 The CLI prints completed file paths. It does not install or launch a video player. Use `./bin/bili --help` for other commands and options.
 
