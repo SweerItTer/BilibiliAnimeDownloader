@@ -5,7 +5,6 @@
 ### ✨ Features
 
 - Add a shared update protocol in `bili_core` and the `bili update [--check] [--pre-release[=true|false]]` command on top of it: per-product release descriptors, SemVer-precedence selection across stable and pre-release channels, verified archive download, a versioned install layout with an atomic `CURRENT` pointer, and a throttled reminder that announces each available version at most once per channel.
-- Local Linux package-entry verification and a real PTY reminder smoke passed: three local merges succeeded, the second same-cache run left `last_checked_unix` unchanged, and a fresh-cache JSON TTY merge emitted valid envelopes without writing the reminder cache. No compatible higher descriptor was available, so no visible new-version announcement or notification deduplication was tested. End-to-end update installation (download, staged-payload validation, `CURRENT` switch) remains unexecuted. `2.0.0-alpha.6` has no installation marker or descriptor and cannot update itself.
 
 ### 🐞 Fixes
 

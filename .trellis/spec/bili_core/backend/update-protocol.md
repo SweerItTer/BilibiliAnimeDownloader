@@ -6,7 +6,7 @@ Every shell (CLI, GUI, TUI) updates through this one protocol. `bili_core::updat
 
 Read this before adding an update command, a release asset, a package layout or a GUI updater.
 
-**Status: the implementation exists but has not passed acceptance.** The fixes and remaining verification gaps are listed in §8. Do not use product self-update to replace a real installation, and do not describe it as verified.
+**Status: CLI implementation is present; full acceptance is incomplete.** Windows has completed a live update, and the repaired Linux installer has completed a cached-archive installation with native validation. The repaired Linux CLI still needs a complete live update; its latest attempt was blocked by GitHub's anonymous API quota. Use isolated installations until the remaining acceptance in §8 is complete.
 
 ## 2. Signatures
 
@@ -171,11 +171,15 @@ Covered by focused tests at the owning boundaries: channel union and precedence,
 
 `archive_file_links_can_precede_targets_but_must_resolve` must place a tar symlink before its target, accept the contained file once extraction finishes, read the linked bytes, and reject a target that remains missing. The real Linux package exposed this ordering assumption; an archive test that writes every target first cannot regress it.
 
-Observed results (2026-10-30): 50 focused `bili_core` tests, 3 `core-bootstrap` tests, 17 CLI tests, CLI-scoped Clippy, 18 Python tests, actionlint for both workflows, and final formatting passed. The workspace Clippy run exited 101 at `core-bootstrap/src/main.rs:76` on `resolve(&root, &id)` (`needless_borrow`); it does not establish Clippy results for other workspace crates.
+Observed results (2026-10-30): feature baseline `6b6906c` ([CI 40993213232](https://github.com/SweerItTer/BilibiliAnimeDownloader/actions/runs/40993213232)) and version-only QA candidate `09a11f0` ([CI 40997142311](https://github.com/SweerItTer/BilibiliAnimeDownloader/actions/runs/40997142311)) passed Linux/Windows CLI-source builds and tests, MSVC package inspection, and Ubuntu 22.04/24.04 package checks.
+Full-workspace Clippy passed before the forward-link repair; the repair then passed all 19 installer tests, affected-core all-target Clippy, and workspace formatting.
 
-The local Linux release package's descriptor matched archive hash and size; offline verification passed extraction, checksums, source/configuration, dependency closure, and clean-environment outer-entry `--help`, `--version`, and doctor (`FFmpeg 8.0.3`). A separate PTY smoke ran three local fixture merges through outer `bin/bili`; all exited 0. The first run created `update-reminders.json`, and a second merge with the same cache preserved its bytes and `last_checked_unix`. A fresh-profile `--json` TTY run emitted eight valid JSON envelopes and wrote no update cache. No compatible higher descriptor was available, so a visible new-version announcement or notification deduplication was not exercised.
+An earlier Linux package smoke passed extraction, checksums, source/configuration, dependency closure, and clean-environment outer-entry `--help`, `--version`, and doctor (`FFmpeg 8.0.3`). Its separate PTY smoke ran three local fixture merges successfully: the second same-cache merge preserved the reminder cache bytes and `last_checked_unix`, and a fresh-profile JSON TTY run emitted eight valid envelopes without writing an update cache. That smoke had no compatible newer descriptor, so a visible new-version announcement and notification deduplication were not exercised.
 
-Not covered: any complete update installation. No run has downloaded and installed an update, validated its staged payload, and switched `CURRENT` end to end. No Windows/MSVC package has been produced or checked, and this local Linux run is not Ubuntu 2.35 evidence. These observations precede the repair in §8 and do not qualify the repaired Windows package.
+The later Windows live smoke updated baseline `6b6906c` to the version-only QA release `2.0.0-alpha.6.updater-test.20261030.2`. It covered stable/pre-release selection and explicit flag precedence, failure with a blocked installation lock, real archive download, staged doctor, `CURRENT` activation, the new outer entry and native runtime, retention of the old executable and user files, and a repeated no-op update. Its profile and runtime environment were isolated; it made no Bilibili request.
+
+The Linux live smoke downloaded that same release but rejected its valid forward library symlinks. After the repair, a temporary SDK consumer used the actual core transaction to install the previously hash-verified official archive, validate the staged CLI in a cleared environment, and switch `CURRENT`. The outer entry reported the new version and FFmpeg 8.0.3; the old payload, bootstrap and user file retained their hashes.
+This proves the repaired install path with a real package, not a complete post-repair live CLI update. The new CLI's network attempt stopped at exhausted GitHub quota before installation.
 
 ## 7. Wrong versus correct
 
@@ -193,6 +197,6 @@ Ordinary Windows workspace checks no longer require static CRT. Every shipping b
 
 The staged doctor runs in a private directory with a cleared environment. Windows system directories come from Win32, not inherited `PATH` or `SystemRoot`. Its regression uses a real DLL available on a developer path: validation must fail until the DLL is installed beside the payload.
 
-Remaining acceptance: exact-head full Windows/Linux CI and package checks, and an end-to-end update using a compatible newer release. Cross-target `cargo check` is not Windows execution, and focused module tests are not full-workspace or glibc 2.35 qualification.
+Remaining acceptance: complete a Linux CLI update over GitHub after the forward-link repair. Retain successful Linux/Windows build, test and package CI results matched to the submitted sources; prior-baseline CI and a cached SDK installation do not replace the missing live CLI run. Cross-target `cargo check` is not Windows execution, and a local build is not glibc 2.35 qualification.
 
 Additionally, the published `2.0.0-alpha.6` package predates this protocol: it contains no installation marker and no release descriptor, so it cannot update itself. The first compatible installation has to be installed manually.

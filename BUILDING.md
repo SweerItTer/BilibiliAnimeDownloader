@@ -31,7 +31,10 @@ python3 scripts/package.py --target x86_64-unknown-linux-gnu \
 
 The runtime package keeps the stable entry at `bin/bili` and the CLI plus native libraries under `versions/<id>/`; the `CURRENT` pointer selects the payload. The package has independent inner-payload and outer-installation SHA256SUMS files and needs no build-time `FFMPEG_DIR`.
 
-The release also publishes `bili-update-cli-<target>.json` beside the package archive; it is a separate Release asset, not a file inside the package, and it is covered by the same checksum file. The updater reads it to find the package. From a packaged build, `./bin/bili update --check` only reports a newer release; `./bin/bili update` installs one. An unpackaged developer build refuses to install, because it has no installation marker. Installing an update has **not** passed acceptance and must not be used on a real installation yet; the protocol and remaining verification gaps are in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). The same applies to the Windows path, which has no published package and no MSVC verification.
+The release also publishes `bili-update-cli-<target>.json` beside the package archive; it is a separate Release asset, not a file inside the package, and it is covered by the same checksum file. The updater reads it to find the package. From a packaged build, `./bin/bili update --check` only reports a newer release; `./bin/bili update` installs one. An unpackaged developer build refuses to install, because it has no installation marker.
+
+The feature baseline passed Linux and Windows CI builds/tests, MSVC package inspection, and Ubuntu 22.04/24.04 package checks. Windows also passed a real GitHub download-and-install smoke. After fixing Linux archive links that precede their targets, the core installer successfully installed a cached official archive and ran the staged native doctor in a clean environment.
+That is not a complete live CLI update: the latest Linux attempt was blocked by GitHub's anonymous API quota. Keep self-update trials isolated until the remaining acceptance in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md) is complete. The published Alpha 6 package cannot self-update; install the first compatible package into a new directory manually.
 
 ## Linux build environment image
 

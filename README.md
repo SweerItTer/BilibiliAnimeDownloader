@@ -21,15 +21,16 @@ Replace `KEYWORD` with a search term and `VIDEO_ID` with an ID from the results 
 
 The CLI prints completed file paths. It does not install or launch a video player. Use `./bin/bili --help` for other commands and options.
 
-## Checking for updates
+## Checking and installing updates
 
-A CLI **built from this branch** can report a newer release without changing anything. The published `2.0.0-alpha.6` package does not contain an `update` subcommand at all, so the command below does not exist there:
+A CLI **built from this branch** supports checking and manually installing updates from a compatible versioned package. Use isolated installations while acceptance is incomplete. The published `2.0.0-alpha.6` package has no `update` subcommand:
 
 ```sh
 ./bin/bili update --check
+./bin/bili update
 ```
 
-`--pre-release` also considers pre-release versions for that one command (`--pre-release=false` forces the stable channel even when the settings file opts in). Installing an update and automatic update checks are implemented but **not acceptance-verified**; do not rely on the CLI to replace its own installation. The `2.0.0-alpha.6` package predates this protocol and has no installation marker, so it cannot update itself — a future compatible package must be installed by hand once.
+`--pre-release` also considers pre-release versions for that one command (`--pre-release=false` forces the stable channel even when the settings file opts in). Windows has passed a real download-and-install smoke. The repaired Linux installer has installed a cached official archive and passed native runtime checks, but its complete live CLI update remains unverified because GitHub's anonymous API quota was exhausted. `2.0.0-alpha.6` predates this protocol and cannot update itself: extract the first compatible package into a new directory by hand.
 
 The shared protocol, its descriptor format, the configuration keys and remaining verification gaps are documented in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). `auto_update` there is a GUI-only preference; the CLI only ever checks unless you run `bili update` yourself.
 
