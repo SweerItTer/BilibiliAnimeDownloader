@@ -231,7 +231,7 @@ def main():
         for native_lib in sorted((stage / "lib").glob("*.so*")):
             if not native_lib.is_symlink():
                 subprocess.run([patchelf, "--set-rpath", "$ORIGIN", str(native_lib)], check=True)
-        inspect_linux(stage, {"PATH": "/usr/bin:/bin"})
+        inspect_linux(stage, {"PATH": "/usr/bin:/bin"}, f"bin/{binary}")
     collect_dependency_licenses(stage, work, args.target, runtime_license_paths,
                                 "gui" if gui else "core-cli")
     native_dir = stage / "share/bili/native"

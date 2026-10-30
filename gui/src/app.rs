@@ -1307,7 +1307,6 @@ impl App {
     fn about_brand(&mut self, ui: &mut Ui) {
         let icon = self.ensure_icon(ui.ctx());
         let status = self.updates.status().clone();
-        let checking = status.is_checking();
         theme::card_frame().show(ui, |ui| {
             theme::inset(theme::card()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1352,7 +1351,11 @@ impl App {
                         }
                     }
                     ui.add_space(10.0);
-                    let check_label = if checking { "正在检查" } else { "检查更新" };
+                    let check_label = match &status {
+                        UpdateStatus::Checking => "正在检查",
+                        UpdateStatus::Downloading(_) => "正在下载",
+                        _ => "检查更新",
+                    };
                     let extra = match &status {
                         UpdateStatus::Available(_) => Some(("下载并安装", Icon::Download)),
                         UpdateStatus::Ready { .. } => Some(("立即重启并更新", Icon::Refresh)),
@@ -1373,7 +1376,7 @@ impl App {
                             self.reduced,
                         )
                         .clicked()
-                            && !checking
+                            && !status.is_checking()
                         {
                             self.updates.start(self.prefs.update_channel);
                         }

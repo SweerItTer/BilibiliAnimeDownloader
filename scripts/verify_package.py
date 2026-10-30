@@ -332,8 +332,8 @@ def run(command, env, cwd, *, encoding=None, deadline=None):
     return result.stdout + result.stderr
 
 
-def inspect_linux(root, env):
-    app = root / "bin/bili"
+def inspect_linux(root, env, executable="bin/bili"):
+    app = root / executable
     dynamic = run(["readelf", "-d", str(app)], env, root)
     if "$ORIGIN/../lib" not in dynamic:
         raise ValueError("Linux app lacks required app-relative RUNPATH")
