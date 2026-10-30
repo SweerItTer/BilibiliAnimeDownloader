@@ -29,7 +29,7 @@ Only download content you are authorized to save. The application does not bypas
 
 ## Limits and build
 
-This Alpha does not include the GUI, Aria2, verification WebView, search sorting, or corrupted-segment repair. Stability, performance, and recovery have not been fully tested. FFmpeg is supplied as replaceable shared libraries; no FFmpeg executable or player is shipped or launched. The application is under the [MIT License with Commons Clause](LICENSE); FFmpeg and other third-party components have separate terms in the package notices.
+This branch adds the native desktop GUI; the Alpha release still targets Linux x86_64, and Windows release assets are not published yet. Aria2, verification WebView, search sorting, and corrupted-segment repair are not included. Stability, performance, and recovery have not been fully tested. FFmpeg is supplied as replaceable shared libraries; no FFmpeg executable or player is shipped or launched. The application is under the [MIT License with Commons Clause](LICENSE); FFmpeg and other third-party components have separate terms in the package notices.
 
 See [BUILDING.md](BUILDING.md) for developer build requirements and commands.
 

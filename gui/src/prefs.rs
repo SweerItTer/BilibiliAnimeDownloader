@@ -141,6 +141,8 @@ pub struct GuiPrefs {
     pub remember_login: bool,
     pub output: Option<PathBuf>,
     pub auto_check: bool,
+    /// Download and stage a new GUI release; the swap still needs a restart.
+    pub auto_update: bool,
     pub update_channel: UpdateChannel,
     /// Unix seconds of the last successful or failed check. No credentials.
     pub last_check: u64,
@@ -163,6 +165,7 @@ impl Default for GuiPrefs {
             remember_login: false,
             output: None,
             auto_check: false,
+            auto_update: false,
             update_channel: UpdateChannel::Stable,
             last_check: 0,
         }

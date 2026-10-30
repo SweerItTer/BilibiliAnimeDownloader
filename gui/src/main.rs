@@ -66,11 +66,21 @@ fn window_icon() -> Option<egui::IconData> {
 }
 
 fn main() {
+    if let Some(request) = update::helper_request() {
+        std::process::exit(update::run_helper(request));
+    }
+    if update::apply_pending_update() {
+        return;
+    }
+    if std::env::args_os().skip(1).any(|arg| arg == "--version") {
+        println!("Bili {}", update::VERSION);
+        return;
+    }
     if std::env::args_os()
         .skip(1)
         .any(|arg| arg == "--help" || arg == "-h")
     {
-        println!("Bili native desktop\nUsage: gui [--state-dir PATH]\nThe state directory defaults to the platform bili data directory. Login is session-only unless you choose to keep it in the OS credential store.");
+        println!("Bili native desktop\nUsage: gui [--state-dir PATH] [--version]\nThe state directory defaults to the platform bili data directory. Login is session-only unless you choose to keep it in the OS credential store.");
         return;
     }
     let prefs = GuiPrefs::load();

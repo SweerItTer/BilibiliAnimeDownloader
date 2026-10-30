@@ -33,7 +33,7 @@ CLI 会显示已完成文件的路径；不会安装或启动播放器。其他�
 
 ## 限制与构建
 
-此 Alpha 不包含 GUI、Aria2、验证 WebView、搜索排序或损坏分段修复；稳定性、性能和恢复能力还没有充分测试。FFmpeg 以可替换共享库形式提供；不会随包提供或启动 FFmpeg 可执行文件，也不会启动播放器。应用程序采用[附加 Commons Clause 的 MIT 许可证](LICENSE)；FFmpeg 和其他第三方组件适用软件包声明中的独立条款。
+此分支新增原生桌面 GUI；Alpha 发布仍只针对 Linux x86_64，暂不发布 Windows 发布包。Aria2、验证 WebView、搜索排序或损坏分段修复尚未包含；稳定性、性能和恢复能力还没有充分测试。FFmpeg 以可替换共享库形式提供；不会随包提供或启动 FFmpeg 可执行文件，也不会启动播放器。应用程序采用[附加 Commons Clause 的 MIT 许可证](LICENSE)；FFmpeg 和其他第三方组件适用软件包声明中的独立条款。
 
 开发构建要求和命令见 [BUILDING.md](BUILDING.md)。
 

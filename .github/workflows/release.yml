@@ -123,8 +123,14 @@ jobs:
       - name: Build CLI
         run: cargo build -p core-cli --release --locked --target x86_64-unknown-linux-gnu
 
+      - name: Build GUI
+        run: cargo build -p gui --release --locked --target x86_64-unknown-linux-gnu
+
       - name: Package runtime-only candidate
         run: python3 scripts/package.py --target x86_64-unknown-linux-gnu --profile release --native-prefix target/native/x86_64-unknown-linux-gnu --runtime-only
+
+      - name: Package GUI candidate with update descriptor
+        run: python3 scripts/package.py --product gui --target x86_64-unknown-linux-gnu --profile release --native-prefix target/native/x86_64-unknown-linux-gnu --runtime-only
 
       - name: Build matched native probe consumer
         run: python3 scripts/verify_core_linkage.py --mode rlib --profile release --target x86_64-unknown-linux-gnu --native-prefix target/native/x86_64-unknown-linux-gnu --output target/release-probe
@@ -139,18 +145,22 @@ jobs:
           from pathlib import Path
 
           root = Path.cwd()
-          excluded = {".git", "release-candidate", "release-probe"}
-          def locate(name):
-              matches = [p for p in root.rglob(name)
-                         if p.is_file() and not any(part in excluded for part in p.relative_to(root).parts)]
+          packages = root / "target/packages/x86_64-unknown-linux-gnu"
+          gui_packages = packages / "gui"
+          def locate(directory, name):
+              matches = sorted(path for path in directory.glob(name) if path.is_file())
               if len(matches) != 1:
-                  raise SystemExit(f"expected exactly one {name}, found {len(matches)}")
+                  raise SystemExit(f"expected exactly one {name} in {directory}, found {len(matches)}")
               return matches[0]
 
-          package = locate("bili-x86_64-unknown-linux-gnu-release.tar.gz")
-          native = locate("bili-native-source-x86_64-unknown-linux-gnu.tar.gz")
+          package = locate(packages, "bili-x86_64-unknown-linux-gnu-release.tar.gz")
+          native = locate(packages, "bili-native-source-x86_64-unknown-linux-gnu.tar.gz")
+          gui = locate(gui_packages, "bili-gui-x86_64-unknown-linux-gnu-release.tar.gz")
+          descriptor = locate(gui_packages, "bili-update-gui-x86_64-unknown-linux-gnu.json")
           shutil.copy2(package, Path("target/release-candidate/package") / package.name)
           shutil.copy2(native, Path("target/release-candidate/native-source") / native.name)
+          shutil.copy2(gui, Path("target/release-candidate/package") / gui.name)
+          shutil.copy2(descriptor, Path("target/release-candidate/package") / descriptor.name)
           fixture = Path("target/media-fixtures/h264-aac.mp4")
           if not fixture.is_file():
               raise SystemExit("generated h264-aac.mp4 fixture is missing")
@@ -247,12 +257,23 @@ jobs:
             --probe-helper target/release-candidate/probe/bin/bili-core-sdk-consumer \
             --report target/release-verification/report.json
 
+      - name: Verify GUI package and update descriptor
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=$(find target/release-candidate/package -maxdepth 1 -type f -name 'bili-gui-x86_64-unknown-linux-gnu-release.tar.gz' -print -quit)
+          descriptor=$(find target/release-candidate/package -maxdepth 1 -type f -name 'bili-update-gui-x86_64-unknown-linux-gnu.json' -print -quit)
+          test -n "$package" && test -n "$descriptor"
+          python3 scripts/verify_gui_package.py "$package" "$descriptor" --target x86_64-unknown-linux-gnu --report target/release-verification/gui-report.json
+
       - name: Upload safe verification report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: release-linux-verification-report
-          path: target/release-verification/report.json
+          path: |
+            target/release-verification/report.json
+            target/release-verification/gui-report.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -274,6 +295,7 @@ jobs:
           package = next((root / "package").glob("bili-x86_64-unknown-linux-gnu-release.tar.gz"))
           native = next((root / "native-source").glob("bili-native-source-x86_64-unknown-linux-gnu.tar.gz"))
           report = json.loads(Path("target/release-verification/report.json").read_text())
+          gui_report = json.loads(Path("target/release-verification/gui-report.json").read_text())
           version = tomllib.loads(Path("core-cli/Cargo.toml").read_text())["package"]["version"]
           digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
           if (report.get("status") != "passed" or report.get("package_validation") != "passed"
@@ -285,6 +307,13 @@ jobs:
               raise SystemExit("verification receipt does not satisfy the offline release gate")
           if report.get("package_sha256") != digest(package) or report.get("native_source_sha256") != digest(native):
               raise SystemExit("verification receipt hashes do not match candidate archives")
+          gui = next((root / "package").glob("bili-gui-x86_64-unknown-linux-gnu-release.tar.gz"))
+          gui_descriptor = next((root / "package").glob("bili-update-gui-x86_64-unknown-linux-gnu.json"))
+          if (gui_report.get("status") != "passed" or gui_report.get("product") != "gui"
+                  or gui_report.get("target") != "x86_64-unknown-linux-gnu"
+                  or gui_report.get("version") != version
+                  or gui_report.get("package_sha256") != digest(gui)):
+              raise SystemExit("GUI verification receipt does not satisfy the release gate")
 
           with tarfile.open(package, "r:gz") as archive:
               member = archive.extractfile("bili-x86_64-unknown-linux-gnu-release/BUILD_INFO.json")
@@ -308,10 +337,12 @@ jobs:
           public.mkdir(parents=True, exist_ok=True)
           shutil.copy2(package, public / package.name)
           shutil.copy2(native, public / native.name)
+          shutil.copy2(gui, public / gui.name)
+          shutil.copy2(gui_descriptor, public / gui_descriptor.name)
           shutil.copy2("CHANGELOG.md", public / "CHANGELOG.md")
           shutil.copy2("target/release-verification/report.json", public / "verification.json")
-          files = [public / package.name, public / native.name,
-                   public / "CHANGELOG.md", public / "verification.json"]
+          files = [public / package.name, public / native.name, public / gui.name,
+                   public / gui_descriptor.name, public / "CHANGELOG.md", public / "verification.json"]
           (public / "SHA256SUMS").write_text("".join(f"{digest(path)}  {path.name}\n" for path in files))
           subprocess.run(["sha256sum", "--check", "--strict", "SHA256SUMS"], cwd=public, check=True)
           archive_path = Path("target/release-linux-public.tar.gz")
@@ -378,11 +409,13 @@ jobs:
           names = {
               "bili-x86_64-unknown-linux-gnu-release.tar.gz",
               "bili-native-source-x86_64-unknown-linux-gnu.tar.gz",
+              "bili-gui-x86_64-unknown-linux-gnu-release.tar.gz",
+              "bili-update-gui-x86_64-unknown-linux-gnu.json",
               "CHANGELOG.md", "verification.json", "SHA256SUMS",
           }
           root = Path("target/release-publish")
           if {p.name for p in root.iterdir()} != names or not all((root / n).is_file() for n in names):
-              raise SystemExit("qualified bundle does not contain the exact five-file release allowlist")
+              raise SystemExit("qualified bundle does not contain the exact release allowlist")
           PY
 
       - name: Create draft release, upload, read back, and publish
@@ -419,6 +452,8 @@ jobs:
           files=(
             "$ASSET_DIR/bili-x86_64-unknown-linux-gnu-release.tar.gz"
             "$ASSET_DIR/bili-native-source-x86_64-unknown-linux-gnu.tar.gz"
+            "$ASSET_DIR/bili-gui-x86_64-unknown-linux-gnu-release.tar.gz"
+            "$ASSET_DIR/bili-update-gui-x86_64-unknown-linux-gnu.json"
             "$ASSET_DIR/CHANGELOG.md"
             "$ASSET_DIR/verification.json"
             "$ASSET_DIR/SHA256SUMS"
@@ -431,7 +466,7 @@ jobs:
           [[ "$actual" == "$expected" ]] || { echo "release asset names differ from allowlist" >&2; exit 1; }
           readback=$(mktemp -d "$RUNNER_TEMP/release-readback.XXXXXX")
           gh release download "$TAG" --repo "$REPO_SLUG" --dir "$readback"
-          [[ $(find "$readback" -maxdepth 1 -type f | wc -l) -eq 5 ]] || { echo "downloaded asset count differs from allowlist" >&2; exit 1; }
+          [[ $(find "$readback" -maxdepth 1 -type f | wc -l) -eq 7 ]] || { echo "downloaded asset count differs from allowlist" >&2; exit 1; }
           cmp "$ASSET_DIR/SHA256SUMS" "$readback/SHA256SUMS"
           (cd "$readback" && sha256sum -c --strict SHA256SUMS)
           draft=$(gh release view "$TAG" --repo "$REPO_SLUG" --json isDraft -q '.isDraft')

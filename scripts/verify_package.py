@@ -370,16 +370,16 @@ def parse_windows_dependencies(output):
     return re.findall(r"^\s*([A-Za-z0-9_.-]+\.dll)\s*$", output, re.M | re.I)
 
 
-def inspect_windows(root, env):
+def inspect_windows(root, env, executable="bili.exe"):
     dumpbin = shutil.which("dumpbin")
     if not dumpbin:
         raise ValueError("dumpbin is required for Windows import inspection")
-    files = [root / "bili.exe", *sorted(root.glob("*.dll"))]
+    files = [root / executable, *sorted(root.glob("*.dll"))]
     bundled = {p.name.lower() for p in root.glob("*.dll")}
     names = bundled
     required = ({"avformat-62.dll", "libavformat-62.dll"}, {"avcodec-62.dll", "libavcodec-62.dll"}, {"avutil-60.dll", "libavutil-60.dll"})
     if not all(names & variants for variants in required):
-        raise ValueError("Windows package lacks required FFmpeg DLLs beside bili.exe")
+        raise ValueError(f"Windows package lacks required FFmpeg DLLs beside {executable}")
     for file in files:
         output = run([dumpbin, "/nologo", "/dependents", str(file)], env, root)
         deps = {name.lower() for name in parse_windows_dependencies(output)}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a reproducible-layout CLI package and its matching source/SDK artifacts."""
+"""Create a reproducible-layout CLI or GUI package with matching source artifacts."""
 import argparse
 import hashlib
 import json
@@ -40,11 +40,11 @@ def copy_tree_files(src, dst, predicate):
                 count += 1
     return count
 
-def collect_dependency_licenses(stage, work, target, runtime_license_paths=()):
-    output = work / "core-cli-license-output"
+def collect_dependency_licenses(stage, work, target, runtime_license_paths=(), product="core-cli"):
+    output = work / f"{product}-license-output"
     command = [
         sys.executable, str(ROOT / "scripts/collect_licenses.py"),
-        "--package", "core-cli", "--target", target, "--output", str(output), "--rust-runtime",
+        "--package", product, "--target", target, "--output", str(output), "--rust-runtime",
     ]
     for path in runtime_license_paths:
         command.extend(("--runtime-license", str(path)))
@@ -101,11 +101,13 @@ def make_sdk_archive(sdk, target, mode, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--product", choices=("cli", "gui"), default="cli",
+                        help="package the CLI or the native GUI")
     parser.add_argument("--target", choices=TARGETS, required=True)
     parser.add_argument("--profile", choices=("debug", "release"), required=True)
     parser.add_argument("--native-prefix", type=Path)
     parser.add_argument("--runtime-only", action="store_true",
-                        help="create only the CLI and matching native-source assets; omit Rust SDKs")
+                        help="create only the product and matching native-source assets; omit Rust SDKs")
     args = parser.parse_args()
     kind = TARGETS[args.target]
     if (kind == "windows") != (sys.platform == "win32") or (kind == "linux") != (sys.platform == "linux"):
@@ -143,21 +145,29 @@ def main():
         raise SystemExit("native build enables a forbidden GPL/nonfree/v3/static/program component")
     if sha256(recipe) != native.get("recipe_sha256"):
         raise SystemExit("native build recipe changed since the recorded build")
-    app = ROOT / "target" / args.target / args.profile / ("bili.exe" if kind == "windows" else "bili")
+    gui = args.product == "gui"
+    binary = ("gui.exe" if kind == "windows" else "gui") if gui else ("bili.exe" if kind == "windows" else "bili")
+    app = ROOT / "target" / args.target / args.profile / binary
     if not app.is_file():
-        raise SystemExit(f"missing built CLI executable: {app}")
+        raise SystemExit(f"missing built {'GUI' if gui else 'CLI'} executable: {app}")
     out = ROOT / "target/packages" / args.target
+    if gui:
+        out = out / "gui"
     out.mkdir(parents=True, exist_ok=True)
     package_work = tempfile.TemporaryDirectory(prefix=".bili-package-", dir=out)
     work = Path(package_work.name)
-    stem = f"bili-{args.target}-{args.profile}"
+    stem = (
+        f"bili-gui-{args.target}-{args.profile}"
+        if gui
+        else f"bili-{args.target}-{args.profile}"
+    )
     stage = work / stem
     stage.mkdir()
     native_source_asset = make_native_source_bundle(work, args.target, prefix, info_path, archive, lock)
     runtime_license_paths = []
     crt_payload_files = []
     if kind == "windows":
-        package_app = stage / "bili.exe"
+        package_app = stage / binary
         shutil.copy2(app, package_app)
         dlls = sorted(p for p in prefix.rglob("*") if p.is_file() and p.suffix.lower() == ".dll")
         for dll in dlls:
@@ -197,12 +207,12 @@ def main():
             path for path in stage.glob("*.dll")
             if path.name.lower().startswith(("vcruntime", "msvcp", "concrt"))
         )
-        inspect_windows(stage, os.environ.copy())
+        inspect_windows(stage, os.environ.copy(), binary)
         if crt_payload_files:
             runtime_license_paths = collect_windows_redist_notices(stage / "licenses/windows-redist")
     else:
         (stage / "bin").mkdir()
-        package_app = stage / "bin/bili"
+        package_app = stage / "bin" / binary
         staged_app = package_app
         shutil.copy2(app, staged_app)
         staged_app.chmod(0o755)
@@ -222,7 +232,8 @@ def main():
             if not native_lib.is_symlink():
                 subprocess.run([patchelf, "--set-rpath", "$ORIGIN", str(native_lib)], check=True)
         inspect_linux(stage, {"PATH": "/usr/bin:/bin"})
-    collect_dependency_licenses(stage, work, args.target, runtime_license_paths)
+    collect_dependency_licenses(stage, work, args.target, runtime_license_paths,
+                                "gui" if gui else "core-cli")
     native_dir = stage / "share/bili/native"
     native_dir.mkdir(parents=True)
     shutil.copy2(info_path, native_dir / "build-info.json")
@@ -251,8 +262,13 @@ def main():
     shutil.copy2(ROOT / "LICENSE", stage / "LICENSE")
     shutil.copy2(ROOT / "scripts/THIRD_PARTY_NOTICES.txt", stage / "THIRD_PARTY_NOTICES.txt")
     usage = (
-        "Bilibili CLI package\n\nRun bili --help for commands. Keep Linux bin/ and lib/ together; "
+        "Bilibili GUI package\n\nRun the gui executable to open the desktop window. Keep Linux bin/ and lib/ together; "
+        "on Windows keep gui.exe beside its runtime DLLs.\n"
+        if gui
+        else "Bilibili CLI package\n\nRun bili --help for commands. Keep Linux bin/ and lib/ together; "
         "on Windows keep bili.exe beside its runtime DLLs.\n"
+    )
+    usage += (
         "The application license is in LICENSE. FFmpeg is a separate replaceable LGPL shared library, "
         "not an executable; see THIRD_PARTY_NOTICES.txt and share/bili/native/source for source and "
         "replacement instructions.\n"
@@ -268,11 +284,13 @@ def main():
     rustc = subprocess.run(["rustc", "-Vv"], check=True, capture_output=True, text=True).stdout
     version_output = subprocess.run([str(package_app), "--version"], check=True,
                                     capture_output=True, text=True).stdout.strip()
-    if not version_output.startswith("bili "):
-        raise SystemExit(f"cannot determine packaged CLI version from: {version_output!r}")
-    app_version = version_output.removeprefix("bili ")
+    prefix = "Bili " if gui else "bili "
+    if not version_output.startswith(prefix):
+        raise SystemExit(f"cannot determine packaged version from: {version_output!r}")
+    app_version = version_output.removeprefix(prefix)
     metadata = {
-        "schema_version": 1, "target": args.target, "profile": args.profile,
+        "schema_version": 1, "product": "gui" if gui else "cli",
+        "target": args.target, "profile": args.profile,
         "app_version": app_version,
         "rustc": rustc.strip(), "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
         "native_build_info_sha256": sha256(info_path), "native_configure": effective,
@@ -309,19 +327,39 @@ def main():
             raise SystemExit(f"missing matched SDK output: {sdk_root}")
         for mode in ("rlib", "dylib"):
             sdk_archives.append(make_sdk_archive(sdk_root / mode, args.target, mode, work))
+    descriptor_asset = None
+    if gui:
+        descriptor = {
+            "schema_version": 1,
+            "product": "gui",
+            "target": args.target,
+            "version": app_version,
+            "archive": {
+                "name": package.name,
+                "format": "zip" if kind == "windows" else "tar.gz",
+                "sha256": sha256(package),
+                "size": package.stat().st_size,
+            },
+        }
+        descriptor_asset = work / f"bili-update-gui-{args.target}.json"
+        descriptor_asset.write_text(json.dumps(descriptor, indent=2) + "\n", encoding="utf-8")
+    extras = [path for path in (descriptor_asset, *sdk_archives) if path is not None]
     external_sums = [f"{sha256(package)}  {package.name}", f"{sha256(native_source_asset)}  {native_source_asset.name}"] + [
-        f"{sha256(path)}  {path.name}" for path in sdk_archives
+        f"{sha256(path)}  {path.name}" for path in extras
     ]
     sums_file = work / "SHA256SUMS"
     sums_file.write_text("\n".join(external_sums) + "\n", encoding="ascii")
-    for artifact in (native_source_asset, package, *sdk_archives, sums_file):
+    for artifact in (native_source_asset, package, *extras, sums_file):
         os.replace(artifact, out / artifact.name)
     package = out / package.name
     native_source_asset = out / native_source_asset.name
+    descriptor_asset = out / descriptor_asset.name if descriptor_asset is not None else None
     sdk_archives = [out / path.name for path in sdk_archives]
     package_work.cleanup()
     print(f"Package: {package}")
     print(f"Native source: {native_source_asset}")
+    if descriptor_asset is not None:
+        print(f"Update descriptor: {descriptor_asset}")
     for path in sdk_archives:
         print(f"SDK: {path}")
 

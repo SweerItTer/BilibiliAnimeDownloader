@@ -1306,15 +1306,8 @@ impl App {
 
     fn about_brand(&mut self, ui: &mut Ui) {
         let icon = self.ensure_icon(ui.ctx());
-        let checking = self.updates.status().is_checking();
-        let available = match self.updates.status() {
-            UpdateStatus::Available(release) => Some((release.tag.clone(), release.url.clone())),
-            _ => None,
-        };
-        let error = match self.updates.status() {
-            UpdateStatus::Error(message) => Some(message.clone()),
-            _ => None,
-        };
+        let status = self.updates.status().clone();
+        let checking = status.is_checking();
         theme::card_frame().show(ui, |ui| {
             theme::inset(theme::card()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1327,28 +1320,49 @@ impl App {
                     ui.label(RichText::new("Bili").size(30.0).strong());
                     theme::muted(ui, format!("v{} · 原生桌面下载器", update::VERSION));
                     ui.add_space(8.0);
-                    if checking {
-                        theme::loading(ui, self.reduced, "正在检查更新…");
-                    } else if let Some((tag, _)) = &available {
-                        ui.label(
-                            RichText::new(format!("发现新版本 {tag}"))
-                                .color(theme::primary())
-                                .strong(),
-                        );
-                    } else if let Some(error) = &error {
-                        ui.colored_label(theme::ERROR, error);
-                    } else if matches!(self.updates.status(), UpdateStatus::UpToDate) {
-                        ui.label(RichText::new("已是最新版本").color(theme::GREEN));
-                    } else {
-                        theme::muted(ui, "尚未检查更新");
+                    match &status {
+                        UpdateStatus::Checking => {
+                            theme::loading(ui, self.reduced, "正在检查更新…");
+                        }
+                        UpdateStatus::Downloading(release) => {
+                            let label = format!("正在下载 {}…", release.tag);
+                            theme::loading(ui, self.reduced, &label);
+                        }
+                        UpdateStatus::Available(release) => {
+                            ui.label(
+                                RichText::new(format!("发现新版本 {}", release.tag))
+                                    .color(theme::primary())
+                                    .strong(),
+                            );
+                        }
+                        UpdateStatus::Ready { version } => {
+                            ui.label(
+                                RichText::new(format!("v{version} 已下载，重启后生效"))
+                                    .color(theme::GREEN),
+                            );
+                        }
+                        UpdateStatus::Error(message) => {
+                            ui.colored_label(theme::ERROR, message);
+                        }
+                        UpdateStatus::UpToDate => {
+                            ui.label(RichText::new("已是最新版本").color(theme::GREEN));
+                        }
+                        UpdateStatus::Idle => {
+                            theme::muted(ui, "尚未检查更新");
+                        }
                     }
                     ui.add_space(10.0);
                     let check_label = if checking { "正在检查" } else { "检查更新" };
+                    let extra = match &status {
+                        UpdateStatus::Available(_) => Some(("下载并安装", Icon::Download)),
+                        UpdateStatus::Ready { .. } => Some(("立即重启并更新", Icon::Refresh)),
+                        _ => None,
+                    };
                     let mut row_width = theme::button_width_for(ui, check_label);
-                    if available.is_some() {
-                        row_width +=
-                            ui.spacing().item_spacing.x + theme::button_width_for(ui, "打开更新页");
+                    if let Some((label, _)) = extra {
+                        row_width += ui.spacing().item_spacing.x + theme::button_width_for(ui, label);
                     }
+                    let mut apply_update = false;
                     ui.horizontal_wrapped(|ui| {
                         ui.add_space(((ui.available_width() - row_width) / 2.0).max(0.0));
                         if theme::button(
@@ -1363,26 +1377,42 @@ impl App {
                         {
                             self.updates.start(self.prefs.update_channel);
                         }
-                        if let Some((_, url)) = &available {
-                            if theme::button(
-                                ui,
-                                "打开更新页",
-                                Icon::Arrow,
-                                ButtonKind::Soft,
-                                self.reduced,
-                            )
-                            .clicked()
-                            {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        match (&status, extra) {
+                            (UpdateStatus::Available(_), Some((label, symbol))) => {
+                                if theme::button(
+                                    ui,
+                                    label,
+                                    symbol,
+                                    ButtonKind::Soft,
+                                    self.reduced,
+                                )
+                                .clicked()
+                                {
+                                    self.updates.install();
+                                }
                             }
+                            (UpdateStatus::Ready { .. }, Some((label, symbol))) => {
+                                apply_update = theme::button(
+                                    ui,
+                                    label,
+                                    symbol,
+                                    ButtonKind::Soft,
+                                    self.reduced,
+                                )
+                                .clicked();
+                            }
+                            _ => {}
                         }
                     });
+                    if apply_update {
+                        self.restart_for_update(ui.ctx());
+                    }
                     ui.add_space(10.0);
                     theme::inset(theme::background()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         theme::muted(
                             ui,
-                            "仅查询 GitHub Releases 的公开版本信息，不上传账号、Cookie 或下载记录；不会自动下载或安装。",
+                            "只查询 GitHub Releases 的公开信息，不上传账号、Cookie 或下载记录。下载后按发布清单校验大小与 SHA-256，确认重启后才替换当前版本。",
                         );
                         ui.label(
                             RichText::new(format!(
@@ -1396,6 +1426,20 @@ impl App {
                 });
             });
         });
+    }
+
+    fn restart_for_update(&mut self, ctx: &egui::Context) {
+        let Some(staged) = self.updates.staged().cloned() else {
+            return;
+        };
+        match update::spawn_helper(&staged) {
+            Ok(()) => {
+                self.allow_close = true;
+                self.confirming_close = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(error) => self.raise(error),
+        }
     }
 
     fn about_info(&mut self, ui: &mut Ui) {
@@ -1412,6 +1456,22 @@ impl App {
                         self.updates.start(self.prefs.update_channel);
                     }
                 }
+                ui.add_space(8.0);
+                if ui
+                    .checkbox(
+                        &mut self.prefs.auto_update,
+                        "自动下载更新（重启应用时完成替换）",
+                    )
+                    .changed()
+                {
+                    self.touch_prefs();
+                }
+                theme::hint_indented(
+                    ui,
+                    "hint-auto-update",
+                    "发现新版本后自动下载并按发布清单校验；仍需重启应用才会替换当前版本。",
+                );
+                ui.add_space(6.0);
                 theme::muted(ui, "更新通道决定检查稳定版还是包含预发布的 Beta。");
                 ui.horizontal_wrapped(|ui| {
                     theme::muted(ui, "更新通道");
@@ -1774,18 +1834,38 @@ impl eframe::App for App {
         if self.busy == Some(Busy::Search) {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
+        if self.updates.status().is_checking() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         if self.error.is_some() || self.notice.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
         if self.updates.poll() {
-            self.prefs.last_check = now_epoch();
-            self.touch_prefs();
-            if let UpdateStatus::Available(release) = self.updates.status() {
-                let tag = release.tag.clone();
-                self.inform(Notice {
-                    text: format!("发现新版本 {tag}"),
-                    open_about: true,
-                });
+            match self.updates.status().clone() {
+                UpdateStatus::Available(release) => {
+                    self.prefs.last_check = now_epoch();
+                    self.touch_prefs();
+                    if self.prefs.auto_update {
+                        self.updates.install();
+                    } else {
+                        self.inform(Notice {
+                            text: format!("发现新版本 {}", release.tag),
+                            open_about: true,
+                        });
+                    }
+                }
+                UpdateStatus::UpToDate => {
+                    self.prefs.last_check = now_epoch();
+                    self.touch_prefs();
+                }
+                UpdateStatus::Ready { version } => {
+                    self.inform(Notice {
+                        text: format!("新版本 {version} 已下载，重启后生效。"),
+                        open_about: true,
+                    });
+                }
+                UpdateStatus::Error(message) => self.raise(message),
+                _ => {}
             }
         }
         if self.prefs.auto_check

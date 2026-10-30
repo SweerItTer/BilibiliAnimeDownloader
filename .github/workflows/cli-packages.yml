@@ -23,6 +23,7 @@ jobs:
       scope: ${{ steps.classify.outputs.scope }}
       docs_changed: ${{ steps.classify.outputs.docs_changed }}
       run_cli: ${{ steps.classify.outputs.run_cli }}
+      run_gui: ${{ steps.classify.outputs.run_gui }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -322,6 +323,23 @@ jobs:
           path: target/native-replacement/${{ matrix.target }}
           if-no-files-found: error
           retention-days: 30
+      - name: Build GUI
+        if: needs.scope.outputs.run_gui == 'true'
+        run: cargo build -p gui --release --locked --target ${{ matrix.target }}
+      - name: Package GUI with update descriptor (Linux)
+        if: ${{ needs.scope.outputs.run_gui == 'true' && runner.os == 'Linux' }}
+        run: python3 scripts/package.py --product gui --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}" --runtime-only
+      - name: Package GUI with update descriptor (Windows)
+        if: ${{ needs.scope.outputs.run_gui == 'true' && runner.os == 'Windows' }}
+        run: python scripts/package.py --product gui --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}" --runtime-only
+      - name: Upload GUI product download
+        if: needs.scope.outputs.run_gui == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-product-${{ matrix.target }}
+          path: target/packages/${{ matrix.target }}/gui
+          if-no-files-found: error
+          retention-days: 30
 
   smoke:
     name: Extract and inspect ${{ matrix.target }} on ${{ matrix.os }}
@@ -395,10 +413,54 @@ jobs:
           path: candidate/public-smoke-report.json
           if-no-files-found: warn
           retention-days: 30
+  gui-smoke:
+    name: Verify ${{ matrix.target }} GUI package
+    needs: [scope, build]
+    if: ${{ needs.scope.outputs.run_gui == 'true' && needs.build.result == 'success' && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: gui-product-${{ matrix.target }}
+          path: gui
+      - name: Verify GUI package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd gui
+          sha256sum -c SHA256SUMS
+          python3 "$GITHUB_WORKSPACE/scripts/verify_gui_package.py" "bili-gui-${{ matrix.target }}-release.tar.gz" "bili-update-gui-${{ matrix.target }}.json" --target "${{ matrix.target }}" --report gui-report.json
+      - name: Verify GUI package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Location gui
+          Get-Content SHA256SUMS | ForEach-Object { $parts = $_ -split '  ', 2; if ((Get-FileHash $parts[1] -Algorithm SHA256).Hash.ToLower() -ne $parts[0]) { throw "Checksum mismatch: $($parts[1])" } }
+          python "$env:GITHUB_WORKSPACE/scripts/verify_gui_package.py" "bili-gui-${{ matrix.target }}-release.zip" "bili-update-gui-${{ matrix.target }}.json" --target "${{ matrix.target }}" --report gui-report.json
+      - name: Upload GUI verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-verification-${{ matrix.target }}
+          path: gui/gui-report.json
+          if-no-files-found: warn
+          retention-days: 30
+
   ci-result:
     name: CI result
     if: ${{ always() }}
-    needs: [scope, docs, media-fixtures, build, smoke]
+    needs: [scope, docs, media-fixtures, build, smoke, gui-smoke]
     runs-on: ubuntu-latest
     env:
       SCOPE: ${{ needs.scope.outputs.scope }}
@@ -408,6 +470,7 @@ jobs:
       FIXTURES_RESULT: ${{ needs.media-fixtures.result }}
       BUILD_RESULT: ${{ needs.build.result }}
       SMOKE_RESULT: ${{ needs.smoke.result }}
+      GUI_RESULT: ${{ needs.gui-smoke.result }}
     steps:
       - name: Require expected checks for the selected route
         run: |
@@ -419,15 +482,23 @@ jobs:
             test "$DOCS_RESULT" = skipped
           fi
           case "$SCOPE" in
-            full|cli)
+            full)
               test "$FIXTURES_RESULT" = success
               test "$BUILD_RESULT" = success
               test "$SMOKE_RESULT" = success
+              test "$GUI_RESULT" = success
+              ;;
+            cli)
+              test "$FIXTURES_RESULT" = success
+              test "$BUILD_RESULT" = success
+              test "$SMOKE_RESULT" = success
+              test "$GUI_RESULT" = skipped
               ;;
             gui)
               test "$FIXTURES_RESULT" = skipped
               test "$BUILD_RESULT" = success
               test "$SMOKE_RESULT" = skipped
+              test "$GUI_RESULT" = success
               ;;
             docs)
               test "$FIXTURES_RESULT" = skipped
