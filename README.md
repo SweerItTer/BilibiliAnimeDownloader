@@ -30,7 +30,9 @@ A CLI **built from this branch** supports checking and manually installing updat
 ./bin/bili update
 ```
 
-`--pre-release` also considers pre-release versions for that one command (`--pre-release=false` forces the stable channel even when the settings file opts in). Windows has passed a real download-and-install smoke. The repaired Linux installer has installed a cached official archive and passed native runtime checks, but its complete live CLI update remains unverified because GitHub's anonymous API quota was exhausted. `2.0.0-alpha.6` predates this protocol and cannot update itself: extract the first compatible package into a new directory by hand.
+Checks read a fixed HTTPS static index; archives download directly from the matching tagged GitHub Release. The client does not call the Releases API or require an API key. `--pre-release` also considers pre-release versions for that one command (`--pre-release=false` forces the stable channel even when the settings file opts in).
+
+Static-index deployment and Linux/Windows live-update acceptance are still pending. Earlier Windows live-update and repaired Linux cached-install checks cover the installation transaction, not the new discovery path. `2.0.0-alpha.6` predates this protocol and cannot update itself: extract the first compatible package into a new directory by hand.
 
 The shared protocol, its descriptor format, the configuration keys and remaining verification gaps are documented in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). `auto_update` there is a GUI-only preference; the CLI only ever checks unless you run `bili update` yourself.
 

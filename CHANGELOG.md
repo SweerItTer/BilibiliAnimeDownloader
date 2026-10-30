@@ -5,6 +5,7 @@
 ### ✨ Features
 
 - Add a shared update protocol in `bili_core` and the `bili update [--check] [--pre-release[=true|false]]` command on top of it: per-product release descriptors, SemVer-precedence selection across stable and pre-release channels, verified archive download, a versioned install layout with an atomic `CURRENT` pointer, and a throttled reminder that announces each available version at most once per channel.
+- Discover updates through one bounded static HTTPS catalog shared by CLI, GUI and TUI; retain product/target isolation and stable/pre-release SemVer precedence without client Releases API calls or API keys.
 
 ### 🐞 Fixes
 
@@ -35,6 +36,7 @@
 - Fix the truncated Linux build-container digest so the matrix job can pull the published CI image.
 - Retry the pinned FFmpeg source download on transient connection failures; the SHA-256 pin still rejects any bad bytes.
 - Archive successful CI runs' non-product handoffs in GHCR with digest-pinned readback before deleting Actions copies. Use a trusted default-branch workflow; preserve failed-run inputs and both SDK verification modes without uploading the unused rlib SDK archive.
+- Rebuild and deploy the complete static update catalog after qualified release publication, with an index-only manual entry in the same workflow; preserve ordinary tag/main release gates and the six-asset release bundle.
 
 ## [2.0.0-alpha.6] - 2026-10-29
 

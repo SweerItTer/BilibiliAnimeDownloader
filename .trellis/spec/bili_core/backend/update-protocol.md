@@ -6,7 +6,7 @@ Every shell (CLI, GUI, TUI) updates through this one protocol. `bili_core::updat
 
 Read this before adding an update command, a release asset, a package layout or a GUI updater.
 
-**Status: static discovery is the approved contract; its implementation and new acceptance are pending.** This replaces client-side GitHub Releases API discovery, including for the future GUI. Prior Windows live-update and repaired Linux cached-install results cover the installation transaction, not this new discovery path. Use isolated installations until the remaining acceptance in §8 is complete.
+**Status: static discovery is implemented; deployment and new live acceptance are pending.** This replaces client-side GitHub Releases API discovery, including for the future GUI. Prior Windows live-update and repaired Linux cached-install results cover the installation transaction, not this new discovery path. Use isolated installations until the remaining acceptance in §8 is complete.
 
 ## 2. Signatures
 
@@ -111,7 +111,8 @@ The official client entry is `https://sweeritter.github.io/BilibiliAnimeDownload
 
 Each `descriptors` element is the existing descriptor object above, not another URL. The index has at most 1,000 releases and 1 MiB of decoded response bytes; excess is an explicit error, never a truncated successful check. Unknown extra fields are ignored. Tags must be unique canonical `v<semver>` values, and each release has at most one descriptor per product/target. A published release without a supported descriptor remains present with an empty array: removing it would incorrectly turn `NoCompatibleRelease` into `UpToDate`.
 
-The existing release workflow publishes qualified archives and descriptor assets first, then rebuilds and deploys this complete catalog through Actions-based GitHub Pages. Only the CI publisher uses the Releases API and its existing `GITHUB_TOKEN`; users need no token. The publisher excludes drafts, noncanonical tags and tags whose prerelease flag disagrees with SemVer; it validates descriptor schema, identity, tag version, archive name, format, digest and advertised archive size. Invalid present descriptors fail publication rather than silently disappearing.
+The existing release workflow publishes qualified archives and descriptor assets first, then rebuilds and deploys this complete catalog through Actions-based GitHub Pages. Its approved manual entry rebuilds/deploys the catalog only: it must not build or publish an application release or bypass the tag/main release gates. Only the CI publisher uses the Releases API and its existing `GITHUB_TOKEN`; users need no token.
+The publisher excludes drafts, noncanonical tags and tags whose prerelease flag disagrees with SemVer; it validates descriptor schema, identity, tag version, archive name, format, digest and advertised archive size. Invalid present descriptors fail publication rather than silently disappearing.
 
 Keep stable and pre-release history together. A later publication of an older tag must not overwrite a newer channel pointer; Rust selects by SemVer precedence rather than publication order. Do not add the index to the six-asset release bundle or change the installer/layout protocol. Serialize publication so overlapping releases cannot deploy an older catalog last.
 
