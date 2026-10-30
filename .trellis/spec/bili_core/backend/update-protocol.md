@@ -6,7 +6,7 @@ Every shell (CLI, GUI, TUI) updates through this one protocol. `bili_core::updat
 
 Read this before adding an update command, a release asset, a package layout or a GUI updater.
 
-**Status: the implementation exists but has not passed acceptance.** Four known defects are listed in §8. Do not use product self-update to replace a real installation, and do not describe it as verified.
+**Status: the implementation exists but has not passed acceptance.** The fixes and remaining verification gaps are listed in §8. Do not use product self-update to replace a real installation, and do not describe it as verified.
 
 ## 2. Signatures
 
@@ -171,7 +171,7 @@ Observed results (2026-10-30): 50 focused `bili_core` tests, 3 `core-bootstrap` 
 
 The local Linux release package's descriptor matched archive hash and size; offline verification passed extraction, checksums, source/configuration, dependency closure, and clean-environment outer-entry `--help`, `--version`, and doctor (`FFmpeg 8.0.3`). A separate PTY smoke ran three local fixture merges through outer `bin/bili`; all exited 0. The first run created `update-reminders.json`, and a second merge with the same cache preserved its bytes and `last_checked_unix`. A fresh-profile `--json` TTY run emitted eight valid JSON envelopes and wrote no update cache. No compatible higher descriptor was available, so a visible new-version announcement or notification deduplication was not exercised.
 
-Not covered: any complete update installation. No run has downloaded and installed an update, validated its staged payload, and switched `CURRENT` end to end. No Windows/MSVC package has been produced or checked, and this local Linux run is not Ubuntu 2.35 evidence. All four blockers in §8 remain unmodified.
+Not covered: any complete update installation. No run has downloaded and installed an update, validated its staged payload, and switched `CURRENT` end to end. No Windows/MSVC package has been produced or checked, and this local Linux run is not Ubuntu 2.35 evidence. These observations precede the repair in §8 and do not qualify the repaired Windows package.
 
 ## 7. Wrong versus correct
 
@@ -179,15 +179,16 @@ Wrong: shell copies candidate selection or re-derives the identity from `BUILD_I
 
 Correct: one `Identity` from compile-time values, one `check`, one verified archive, one `validate` callback, and one `CURRENT` rename performed by `install_payload`.
 
-## 8. Known blockers (not fixed)
+## 8. Repair and remaining acceptance
 
-These are code defects in the delivered implementation, recorded with their exact locations. None of them is an intended limitation, and none may be documented as approved behaviour:
+The installation lock now protects a fresh `CURRENT` read and comparison with the selected payload's build metadata. A stale process cannot activate an older or equal-precedence candidate, including a version differing only in SemVer build metadata. Invalid selected metadata fails closed before staging.
 
-| Blocker | Location | Effect |
-|---|---|---|
-| Candidate is compared only with the running identity; `CURRENT` is not re-read after the lock is taken | `bili_core/src/install/mod.rs:339-350` | Two concurrent installs can leave an older payload selected |
-| `Staged::identity` reports the old running identity instead of the candidate | `bili_core/src/install/mod.rs:409-415` | The staged-payload check compares against the old version, so a valid new payload is rejected and the candidate identity is never verified |
-| Default Windows workspace `check`/`test` is blocked by a compile guard | `core-bootstrap/src/main.rs:18` | The ordinary workspace check/test cannot run on Windows; an actual MSVC package has not been verified (the explicit `crt-static` shipping build is a separate path) |
-| The staged-payload check forwards inherited `PATH` on Windows | `core-cli/src/update.rs:310-315` | A missing DLL could be resolved from a developer native prefix instead of the package closure |
+`Staged::identity` now describes the candidate after its metadata and executable digest have been checked. The CLI still requires the staged doctor's reported product, target and version to match that candidate.
+
+Ordinary Windows workspace checks no longer require static CRT. Every shipping bootstrap build enables `packaged`; that feature rejects a Windows build without `crt-static`. Packaging still inspects the actual PE imports and refuses non-system DLL dependencies.
+
+The staged doctor runs in a private directory with a cleared environment. Windows system directories come from Win32, not inherited `PATH` or `SystemRoot`. Its regression uses a real DLL available on a developer path: validation must fail until the DLL is installed beside the payload.
+
+Remaining acceptance: exact-head full Windows/Linux CI and package checks, and an end-to-end update using a compatible newer release. Cross-target `cargo check` is not Windows execution, and focused module tests are not full-workspace or glibc 2.35 qualification.
 
 Additionally, the published `2.0.0-alpha.6` package predates this protocol: it contains no installation marker and no release descriptor, so it cannot update itself. The first compatible installation has to be installed manually.

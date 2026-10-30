@@ -267,6 +267,34 @@ fn validate_staged(
     Ok(())
 }
 
+/// Resolve system directories through Win32, not inherited environment values.
+#[cfg(windows)]
+fn windows_directories() -> std::result::Result<(PathBuf, PathBuf), InstallError> {
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemWindowsDirectoryW(buffer: *mut u16, size: u32) -> u32;
+        fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    }
+    let read = |get: unsafe extern "system" fn(*mut u16, u32) -> u32| {
+        let mut buffer = vec![0u16; 32768];
+        // SAFETY: the live writable buffer has the size supplied to Win32.
+        let length = unsafe { get(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        if length == 0 || length >= buffer.len() {
+            return Err(InstallError::Validator);
+        }
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]));
+        if !path.is_absolute() {
+            return Err(InstallError::Validator);
+        }
+        Ok(path)
+    };
+    Ok((
+        read(GetSystemWindowsDirectoryW)?,
+        read(GetSystemDirectoryW)?,
+    ))
+}
+
 /// Execute the staged payload's `doctor` with a private profile and an empty
 /// inherited environment, then accept only its strict JSON envelope.
 fn staged_doctor(
@@ -306,13 +334,19 @@ fn staged_doctor(
         .env("LOCALAPPDATA", &local)
         .env("TMPDIR", scratch.join("tmp"))
         .env("TEMP", scratch.join("tmp"))
-        .env("TMP", scratch.join("tmp"));
-    // Windows cannot start a process without its system directories.
+        .env("TMP", scratch.join("tmp"))
+        .current_dir(scratch);
+    // Only system directories may supplement the DLLs beside the staged EXE.
+    // Never inherit the developer PATH or its working directory.
     #[cfg(windows)]
-    for name in ["SystemRoot", "WINDIR", "PATH"] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
+    {
+        let (windows, system) = windows_directories()?;
+        let path =
+            std::env::join_paths([system, windows.clone()]).map_err(|_| InstallError::Validator)?;
+        command
+            .env("SystemRoot", &windows)
+            .env("WINDIR", &windows)
+            .env("PATH", path);
     }
     let mut child = command.spawn().map_err(|_| InstallError::Validator)?;
     let stdout = child.stdout.take().ok_or(InstallError::Validator)?;
@@ -552,5 +586,130 @@ mod tests {
         assert_ne!(stable, preview);
         assert!(stable.ends_with("update/cli/x86_64-unknown-linux-gnu/stable"));
         assert!(preview.ends_with("update/cli/x86_64-unknown-linux-gnu/pre-release"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_doctor_runs_in_private_directory_without_parent_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::TempDir::new().expect("tempdir");
+        let scratch = temporary.path().join("private");
+        let entry = temporary.path().join("doctor");
+        // The shell uses builtins only. A developer loader path or a parent
+        // working directory would make this executable refuse validation.
+        std::fs::write(
+            &entry,
+            br#"#!/bin/sh
+[ "$PWD" = "${HOME%/home}" ] || exit 1
+[ -z "${LD_LIBRARY_PATH+x}" ] || exit 1
+[ -z "${FFMPEG_DIR+x}" ] || exit 1
+printf '%s\n' '{"schema_version":1,"type":"doctor","data":{"native":{}}}'
+"#,
+        )
+        .expect("fixture");
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        assert!(staged_doctor(&entry, &scratch).is_ok());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn staged_doctor_rejects_dlls_available_only_on_parent_path() {
+        let temporary = tempfile::TempDir::new().expect("tempdir");
+        let developer = temporary.path().join("developer");
+        let payload = temporary.path().join("payload");
+        std::fs::create_dir_all(&developer).expect("developer directory");
+        std::fs::create_dir_all(&payload).expect("payload directory");
+        std::fs::write(
+            developer.join("dependency.c"),
+            "__declspec(dllexport) int dependency(void) { return 7; }",
+        )
+        .expect("DLL source");
+        std::fs::write(
+            developer.join("probe.c"),
+            r#"
+#include <stdio.h>
+__declspec(dllimport) int dependency(void);
+int main(void) {
+    if (dependency() != 7) return 1;
+    puts("{\"schema_version\":1,\"type\":\"doctor\",\"data\":{\"native\":{}}}");
+    return 0;
+}
+"#,
+        )
+        .expect("EXE source");
+        for arguments in [
+            vec!["/nologo", "/LD", "/MT", "dependency.c", "/Fedeveloper.dll"],
+            vec!["/nologo", "/MT", "probe.c", "developer.lib", "/Feprobe.exe"],
+        ] {
+            let result = std::process::Command::new("cl")
+                .args(arguments)
+                .current_dir(&developer)
+                .output()
+                .expect("initialized MSVC toolchain");
+            assert!(
+                result.status.success(),
+                "MSVC fixture compilation: {}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+        }
+        let entry = payload.join("probe.exe");
+        std::fs::rename(developer.join("probe.exe"), &entry).expect("stage EXE without DLL");
+        let mut paths = vec![developer.clone()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = std::env::join_paths(paths).expect("test PATH");
+        let baseline = std::process::Command::new(&entry)
+            .env("PATH", &path)
+            .current_dir(temporary.path())
+            .output()
+            .expect("developer launch");
+        assert!(
+            baseline.status.success(),
+            "developer PATH must make the missing DLL loadable"
+        );
+        // Use a separate test process so the developer PATH never races with
+        // other tests in this process.
+        let result = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "update::tests::windows_staged_doctor_probe",
+                "--nocapture",
+            ])
+            .env("PATH", path)
+            .env("BILI_TEST_DOCTOR_ROOT", temporary.path())
+            .output()
+            .expect("isolated test process");
+        assert!(
+            result.status.success()
+                && String::from_utf8_lossy(&result.stdout).contains("BILI_STAGED_DOCTOR_PROBE_OK"),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_staged_doctor_probe() {
+        let Some(root) = std::env::var_os("BILI_TEST_DOCTOR_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let entry = root.join("payload/probe.exe");
+        let scratch = root.join("private");
+        assert_eq!(
+            staged_doctor(&entry, &scratch),
+            Err(InstallError::Validator)
+        );
+        std::fs::copy(
+            root.join("developer/developer.dll"),
+            root.join("payload/developer.dll"),
+        )
+        .expect("install package DLL");
+        assert!(
+            staged_doctor(&entry, &scratch).is_ok(),
+            "package-local DLL must load"
+        );
+        println!("BILI_STAGED_DOCTOR_PROBE_OK");
     }
 }

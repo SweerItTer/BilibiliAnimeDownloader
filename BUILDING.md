@@ -10,7 +10,7 @@ Install a C compiler, `make`, NASM, `pkg-config`, Clang/libclang (for bindings),
 export FFMPEG_DIR="$PWD/target/native/x86_64-unknown-linux-gnu"
 python3 scripts/build_ffmpeg.py --target x86_64-unknown-linux-gnu
 cargo build -p core-cli --release --locked --target x86_64-unknown-linux-gnu
-cargo build -p core-bootstrap --bin bili-bootstrap --release --locked --target x86_64-unknown-linux-gnu
+cargo build -p core-bootstrap --bin bili-bootstrap --features packaged --release --locked --target x86_64-unknown-linux-gnu
 ```
 
 `FFMPEG_DIR` is used only to find native libraries at build time. To run this unpackaged developer build, set the loader path:
@@ -31,7 +31,7 @@ python3 scripts/package.py --target x86_64-unknown-linux-gnu \
 
 The runtime package keeps the stable entry at `bin/bili` and the CLI plus native libraries under `versions/<id>/`; the `CURRENT` pointer selects the payload. The package has independent inner-payload and outer-installation SHA256SUMS files and needs no build-time `FFMPEG_DIR`.
 
-The release also publishes `bili-update-cli-<target>.json` beside the package archive; it is a separate Release asset, not a file inside the package, and it is covered by the same checksum file. The updater reads it to find the package. From a packaged build, `./bin/bili update --check` only reports a newer release; `./bin/bili update` installs one. An unpackaged developer build refuses to install, because it has no installation marker. Installing an update has **not** passed acceptance and must not be used on a real installation yet; the protocol and the exact open blockers are in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). The same applies to the Windows path, which has no published package and no MSVC verification.
+The release also publishes `bili-update-cli-<target>.json` beside the package archive; it is a separate Release asset, not a file inside the package, and it is covered by the same checksum file. The updater reads it to find the package. From a packaged build, `./bin/bili update --check` only reports a newer release; `./bin/bili update` installs one. An unpackaged developer build refuses to install, because it has no installation marker. Installing an update has **not** passed acceptance and must not be used on a real installation yet; the protocol and remaining verification gaps are in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). The same applies to the Windows path, which has no published package and no MSVC verification.
 
 ## Linux build environment image
 
@@ -106,10 +106,10 @@ Use an initialized Visual Studio x64 MSVC developer environment, MSYS2 Bash/make
 $env:FFMPEG_DIR = "$PWD\target\native\x86_64-pc-windows-msvc"
 python scripts/build_ffmpeg.py --target x86_64-pc-windows-msvc
 cargo build -p core-cli --release --locked --target x86_64-pc-windows-msvc
-cargo rustc -p core-bootstrap --bin bili-bootstrap --release --locked --target x86_64-pc-windows-msvc -- -C target-feature=+crt-static
+cargo rustc -p core-bootstrap --bin bili-bootstrap --features packaged --release --locked --target x86_64-pc-windows-msvc -- -C target-feature=+crt-static
 ```
 
-No Windows CLI package has been published. The installer entry is statically linked to the C runtime; runtime DLLs remain inside the selected `versions/<id>/` payload.
+No Windows CLI package has been published. Ordinary workspace checks use the development bootstrap; shipping builds enable `packaged`, which rejects Windows builds without `crt-static`. Package inspection also checks actual DLL imports. The installer entry is statically linked to the C runtime; runtime DLLs remain inside the selected `versions/<id>/` payload.
 
 ## Local checks
 

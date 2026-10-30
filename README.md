@@ -31,7 +31,7 @@ A CLI **built from this branch** can report a newer release without changing any
 
 `--pre-release` also considers pre-release versions for that one command (`--pre-release=false` forces the stable channel even when the settings file opts in). Installing an update and automatic update checks are implemented but **not acceptance-verified**; do not rely on the CLI to replace its own installation. The `2.0.0-alpha.6` package predates this protocol and has no installation marker, so it cannot update itself — a future compatible package must be installed by hand once.
 
-The shared protocol, its descriptor format, the configuration keys and the exact open blockers are documented in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). `auto_update` there is a GUI-only preference; the CLI only ever checks unless you run `bili update` yourself.
+The shared protocol, its descriptor format, the configuration keys and remaining verification gaps are documented in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). `auto_update` there is a GUI-only preference; the CLI only ever checks unless you run `bili update` yourself.
 
 ## Login and privacy
 
