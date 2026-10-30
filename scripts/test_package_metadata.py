@@ -79,6 +79,30 @@ class PackageMetadataTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         validate_descriptor(invalid, target, version, archive)
 
+    def test_gui_descriptor_is_generalized_and_ignores_unknown_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "bili-gui-x86_64-pc-windows-msvc-release.zip"
+            archive.write_bytes(b"gui archive")
+            descriptor = descriptor_document(
+                "x86_64-pc-windows-msvc", "2.0.0", archive, product="gui")
+            descriptor["packaged_at"] = "ignored by older builds"
+            descriptor["archive"]["revision"] = 3
+            validate_descriptor(
+                descriptor, "x86_64-pc-windows-msvc", "2.0.0", archive, product="gui")
+            with self.assertRaises(ValueError):
+                validate_descriptor(
+                    descriptor, "x86_64-pc-windows-msvc", "2.0.0", archive, product="cli")
+            for mutate in (
+                lambda value: value["archive"].update(name="../escape.tar.gz"),
+                lambda value: value["archive"].update(name=".hidden.tar.gz"),
+                lambda value: value["archive"].update(size=512 * 1024 * 1024 + 1),
+            ):
+                invalid = json.loads(json.dumps(descriptor))
+                mutate(invalid)
+                with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                    validate_descriptor(
+                        invalid, "x86_64-pc-windows-msvc", None, product="gui")
+
 
 if __name__ == "__main__":
     unittest.main()

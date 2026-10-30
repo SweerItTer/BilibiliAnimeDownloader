@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,6 +12,7 @@ permissions:
 jobs:
   build-candidate:
     name: Build tagged Linux release candidate
+    if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     permissions:
@@ -465,3 +467,47 @@ jobs:
           gh release edit "$TAG" --repo "$REPO_SLUG" --draft=false --prerelease="$PRERELEASE" --latest="$LATEST" --verify-tag
           state=$(gh release view "$TAG" --repo "$REPO_SLUG" --json isDraft,isPrerelease -q '[.isDraft,.isPrerelease] | @tsv')
           [[ "$state" == "$(printf 'false\t%s' "$PRERELEASE")" ]] || { echo "published release state is unexpected" >&2; exit 1; }
+
+  publish-update-index:
+    name: Publish complete static update index
+    needs: publish-release
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.publish-release.result == 'success') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: release-static-update-index
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO_SLUG: ${{ github.repository }}
+    steps:
+      - name: Checkout catalog publisher
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Rebuild complete static update catalog
+        shell: bash
+        run: python3 scripts/update_index.py --repository "$REPO_SLUG" --output target/pages
+
+      - name: Upload static update catalog
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/pages
+
+      - name: Deploy static update catalog
+        id: deployment
+        uses: actions/deploy-pages@v4

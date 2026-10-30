@@ -1,4 +1,4 @@
-"""Shared metadata checks for CLI package and release assets."""
+"""Shared metadata checks for product packages and release assets."""
 import hashlib
 import json
 import shutil
@@ -9,8 +9,11 @@ TARGETS = {
     "x86_64-unknown-linux-gnu": ("linux", "tar.gz"),
     "x86_64-pc-windows-msvc": ("windows", "zip"),
 }
+PRODUCTS = ("cli", "gui", "tui")
 PRODUCT = "cli"
 PROTOCOL = 1
+MAX_ASSET_NAME = 128
+MAX_ARCHIVE_SIZE = 512 * 1024 * 1024
 
 
 def sha256(path):
@@ -44,20 +47,40 @@ def parse_doctor_identity(doctor_output, version_output, target):
         raise ValueError("cannot validate CLI doctor build identity") from error
 
 
-def descriptor_name(target):
+def descriptor_name(target, product=PRODUCT):
     if target not in TARGETS:
         raise ValueError(f"unsupported package target: {target}")
-    return f"bili-update-cli-{target}.json"
+    if product not in PRODUCTS:
+        raise ValueError(f"unsupported package product: {product}")
+    return f"bili-update-{product}-{target}.json"
 
 
-def descriptor_document(target, version, archive):
+def descriptor_identity(name):
+    if isinstance(name, str):
+        for product in PRODUCTS:
+            for target in TARGETS:
+                if name == descriptor_name(target, product):
+                    return product, target
+    raise ValueError(f"unsupported update descriptor asset: {name}")
+
+
+def safe_archive_name(name):
+    return (isinstance(name, str) and 0 < len(name) <= MAX_ASSET_NAME
+            and not name.startswith(".")
+            and ".." not in name
+            and re.fullmatch(r"[0-9A-Za-z._+-]+", name) is not None)
+
+
+def descriptor_document(target, version, archive, product=PRODUCT):
     if target not in TARGETS:
         raise ValueError(f"unsupported package target: {target}")
+    if product not in PRODUCTS:
+        raise ValueError(f"unsupported package product: {product}")
     _, archive_format = TARGETS[target]
     archive = Path(archive)
     return {
         "schema_version": PROTOCOL,
-        "product": PRODUCT,
+        "product": product,
         "target": target,
         "version": version,
         "archive": {
@@ -69,25 +92,28 @@ def descriptor_document(target, version, archive):
     }
 
 
-def validate_descriptor(document, target, version, archive_path=None):
+def validate_descriptor(document, target, version, archive_path=None, product=PRODUCT):
     if target not in TARGETS:
         raise ValueError(f"unsupported package target: {target}")
+    if product not in PRODUCTS:
+        raise ValueError(f"unsupported package product: {product}")
     _, archive_format = TARGETS[target]
     if (not isinstance(document, dict)
-            or set(document) != {"schema_version", "product", "target", "version", "archive"}
+            or not {"schema_version", "product", "target", "version", "archive"} <= set(document)
             or type(document["schema_version"]) is not int or document["schema_version"] != PROTOCOL
-            or document["product"] != PRODUCT or document["target"] != target
+            or document["product"] != product or document["target"] != target
             or not isinstance(document["version"], str) or not document["version"]
             or (version is not None and document["version"] != version)):
         raise ValueError("update descriptor identity/schema mismatch")
     archive = document["archive"]
     if (not isinstance(archive, dict)
-            or set(archive) != {"name", "format", "sha256", "size"}
+            or not {"name", "format", "sha256", "size"} <= set(archive)
             or archive["format"] != archive_format
-            or not isinstance(archive["name"], str) or not archive["name"]
+            or not safe_archive_name(archive["name"])
             or not isinstance(archive["sha256"], str)
             or not re.fullmatch(r"[0-9a-f]{64}", archive["sha256"])
-            or type(archive["size"]) is not int or archive["size"] <= 0):
+            or type(archive["size"]) is not int
+            or archive["size"] <= 0 or archive["size"] > MAX_ARCHIVE_SIZE):
         raise ValueError("update descriptor archive reference is invalid")
     if archive_path is not None:
         path = Path(archive_path)
@@ -97,15 +123,15 @@ def validate_descriptor(document, target, version, archive_path=None):
     return document
 
 
-def load_descriptor(path, target, version, archive_path=None):
+def load_descriptor(path, target, version, archive_path=None, product=PRODUCT):
     path = Path(path)
-    if path.name != descriptor_name(target):
+    if path.name != descriptor_name(target, product):
         raise ValueError("update descriptor filename does not match its target")
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("update descriptor is missing or malformed") from error
-    return validate_descriptor(document, target, version, archive_path)
+    return validate_descriptor(document, target, version, archive_path, product)
 
 
 def write_inventory(root):
