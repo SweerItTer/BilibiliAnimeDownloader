@@ -53,6 +53,7 @@ pub enum Status {
     Idle,
     Checking,
     UpToDate,
+    NoCompatibleRelease,
     Available(Release),
     Downloading(Release),
     Ready { version: String },
@@ -278,19 +279,12 @@ fn check(channel: UpdateChannel) -> Result<Status, String> {
     }
 
     candidates.sort_by(|a, b| b.version.cmp_precedence(&a.version));
-    let descriptor_name = format!("bili-update-{PRODUCT}-{TARGET}.json");
+    let mut skipped = false;
     for candidate in candidates {
-        let descriptors: Vec<_> = candidate
-            .assets
-            .iter()
-            .filter(|asset| asset.name == descriptor_name)
-            .collect();
-        let Some(descriptor) = descriptors.first() else {
+        let Some(descriptor) = target_descriptor(&candidate.assets, TARGET)? else {
+            skipped = true;
             continue;
         };
-        if descriptors.len() > 1 {
-            return Err("发布清单中的更新描述不唯一。".into());
-        }
         let text = text_body(&client, &descriptor.url, MAX_DESCRIPTOR)?;
         let archive = parse_descriptor(&text, &candidate.tag)?;
         let mut matches = candidate
@@ -316,7 +310,20 @@ fn check(channel: UpdateChannel) -> Result<Status, String> {
             page_url: candidate.page_url,
         }));
     }
+    if skipped {
+        return Ok(Status::NoCompatibleRelease);
+    }
     Ok(Status::UpToDate)
+}
+
+fn target_descriptor<'a>(assets: &'a [Asset], target: &str) -> Result<Option<&'a Asset>, String> {
+    let name = format!("bili-update-{PRODUCT}-{target}.json");
+    let mut matches = assets.iter().filter(|asset| asset.name == name);
+    let descriptor = matches.next();
+    if matches.next().is_some() {
+        return Err("发布清单中的更新描述不唯一。".into());
+    }
+    Ok(descriptor)
 }
 
 fn text_body(client: &reqwest::blocking::Client, url: &str, limit: u64) -> Result<String, String> {
@@ -376,6 +383,14 @@ fn parse_descriptor(text: &str, expected_tag: &str) -> Result<ArchiveRef, String
         .ok_or_else(|| "更新描述缺少安装包名称。".to_owned())?;
     if !safe_archive_name(name) {
         return Err("更新描述的安装包名称不安全。".into());
+    }
+    let expected_suffix = if TARGET.contains("windows") {
+        ".zip"
+    } else {
+        ".tar.gz"
+    };
+    if !name.starts_with(&format!("bili-gui-{TARGET}-")) || !name.ends_with(expected_suffix) {
+        return Err("更新描述的安装包不是当前平台的 GUI 包。".into());
     }
     let format = archive.get("format").and_then(Value::as_str);
     let expected_format = if TARGET.contains("windows") {
@@ -816,6 +831,25 @@ fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn gui_archive_name(target: &str) -> String {
+        format!(
+            "bili-gui-{target}-release.{}",
+            if target.contains("windows") {
+                "zip"
+            } else {
+                "tar.gz"
+            }
+        )
+    }
+
+    fn asset(name: &str) -> Asset {
+        Asset {
+            name: name.to_owned(),
+            url: String::new(),
+            size: 1,
+        }
+    }
+
     fn descriptor(version: &str, target: &str, name: &str, size: u64) -> String {
         format!(
             r#"{{"schema_version":1,"product":"gui","target":"{target}","version":"{version}",
@@ -846,12 +880,8 @@ mod tests {
 
     #[test]
     fn descriptor_pins_product_target_and_archive() {
-        let text = descriptor(
-            "2.0.0-alpha.7",
-            TARGET,
-            "bili-gui-x86_64-pc-windows-msvc-release.zip",
-            1024,
-        );
+        let name = gui_archive_name(TARGET);
+        let text = descriptor("2.0.0-alpha.7", TARGET, &name, 1024);
         let archive = parse_descriptor(&text, "v2.0.0-alpha.7").expect("valid descriptor");
         assert_eq!(archive.size, 1024);
 
@@ -859,8 +889,48 @@ mod tests {
         assert!(parse_descriptor(&wrong_product, "v2.0.0-alpha.7").is_err());
         let wrong_tag = parse_descriptor(&text, "v2.0.0-alpha.8");
         assert!(wrong_tag.is_err());
-        let unsafe_name = text.replace("bili-gui-x86_64-pc-windows-msvc-release.zip", "../gui.zip");
+        let unsafe_name = text.replace(&name, "../gui.zip");
         assert!(parse_descriptor(&unsafe_name, "v2.0.0-alpha.7").is_err());
+        let cli_package = text.replace(
+            &name,
+            &format!(
+                "bili-{TARGET}-release.{}",
+                if TARGET.contains("windows") {
+                    "zip"
+                } else {
+                    "tar.gz"
+                }
+            ),
+        );
+        assert!(parse_descriptor(&cli_package, "v2.0.0-alpha.7").is_err());
+    }
+
+    #[test]
+    fn releases_without_this_platforms_gui_package_are_skipped() {
+        let linux_cli = [
+            asset("bili-x86_64-unknown-linux-gnu-release.tar.gz"),
+            asset("bili-native-source-x86_64-unknown-linux-gnu.tar.gz"),
+            asset("bili-update-cli-x86_64-unknown-linux-gnu.json"),
+            asset("SHA256SUMS"),
+        ];
+        assert!(target_descriptor(&linux_cli, "x86_64-pc-windows-msvc")
+            .unwrap()
+            .is_none());
+        assert!(target_descriptor(&linux_cli, "x86_64-unknown-linux-gnu")
+            .unwrap()
+            .is_none());
+
+        let windows_gui = [
+            asset("bili-gui-x86_64-pc-windows-msvc-release.zip"),
+            asset("bili-update-gui-x86_64-pc-windows-msvc.json"),
+            asset("SHA256SUMS"),
+        ];
+        assert!(target_descriptor(&windows_gui, "x86_64-pc-windows-msvc")
+            .unwrap()
+            .is_some());
+        assert!(target_descriptor(&windows_gui, "x86_64-unknown-linux-gnu")
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(unix)]

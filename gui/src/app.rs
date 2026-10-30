@@ -1346,6 +1346,9 @@ impl App {
                         UpdateStatus::UpToDate => {
                             ui.label(RichText::new("已是最新版本").color(theme::GREEN));
                         }
+                        UpdateStatus::NoCompatibleRelease => {
+                            theme::muted(ui, "更高版本暂无适用于当前平台的 GUI 包");
+                        }
                         UpdateStatus::Idle => {
                             theme::muted(ui, "尚未检查更新");
                         }
@@ -1857,7 +1860,7 @@ impl eframe::App for App {
                         });
                     }
                 }
-                UpdateStatus::UpToDate => {
+                UpdateStatus::UpToDate | UpdateStatus::NoCompatibleRelease => {
                     self.prefs.last_check = now_epoch();
                     self.touch_prefs();
                 }

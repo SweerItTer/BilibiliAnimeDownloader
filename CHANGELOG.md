@@ -4,7 +4,7 @@
 
 ### ✨ Features
 
-- Add native GUI update checks against per-product release descriptors, SHA-256 and size verification, staged installation after restart, and optional automatic download. Login and download content never leave the device.
+- Add native GUI update checks against per-product release descriptors, SHA-256 and size verification, staged installation after restart, and optional automatic download. Releases without a published GUI package for the running product and target are skipped and reported as no compatible release. Login and download content never leave the device.
 
 ### 📝 Documentation
 
