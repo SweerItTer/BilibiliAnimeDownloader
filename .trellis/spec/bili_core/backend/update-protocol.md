@@ -6,7 +6,7 @@ Every shell (CLI, GUI, TUI) updates through this one protocol. `bili_core::updat
 
 Read this before adding an update command, a release asset, a package layout or a GUI updater.
 
-**Status: CLI implementation is present; full acceptance is incomplete.** Windows has completed a live update, and the repaired Linux installer has completed a cached-archive installation with native validation. The repaired Linux CLI still needs a complete live update; its latest attempt was blocked by GitHub's anonymous API quota. Use isolated installations until the remaining acceptance in §8 is complete.
+**Status: static discovery is the approved contract; its implementation and new acceptance are pending.** This replaces client-side GitHub Releases API discovery, including for the future GUI. Prior Windows live-update and repaired Linux cached-install results cover the installation transaction, not this new discovery path. Use isolated installations until the remaining acceptance in §8 is complete.
 
 ## 2. Signatures
 
@@ -31,7 +31,7 @@ impl CheckOutcome {                      // the stable way for a shell to consum
     pub fn candidate(&self) -> Option<&UpdateCandidate>;
     pub fn is_available(&self) -> bool;
 }
-pub struct Updater;                       // Updater::new() is pinned to the official repository
+pub struct Updater;                       // Updater::new() pins the official HTTPS index and repository
 impl Updater {
     pub async fn check(&self, identity: &Identity, channel: Channel) -> Result<CheckOutcome, UpdateError>;
     pub async fn download(&self, candidate: &UpdateCandidate, destination: &Path) -> Result<u64, UpdateError>;
@@ -94,15 +94,34 @@ One GitHub Release, tagged `v<semver>`, may carry descriptors for several produc
 - `schema_version` must equal `PROTOCOL`; unknown extra fields are ignored for forward compatibility.
 - `product` and `target` must equal the compiled identity; `version` must equal the release tag, the descriptor and the identity the new payload reports, and must be strictly greater than the running version. None of these fields decides what the running shell is; they are checked against it.
 - `archive.name` is a plain basename (no separators, no `..`, no leading dot, ≤128 characters), `format` must be the target's only legal format, `sha256` is 64 lowercase hex characters, `size` is between 1 and 512 MiB.
-- The release must advertise the archive exactly once and with exactly `size` bytes. Zero, a different size, or a missing asset is rejected.
+- The publisher must find the archive exactly once among the release assets and verify its advertised size against `archive.size` before including the descriptor in the static index.
+
+### Static index and publication
+
+The official client entry is `https://sweeritter.github.io/BilibiliAnimeDownloader/updates/v1/index.json`. This is the selected publication address, not a claim that deployment has already passed. The client performs one bounded HTTPS GET; it never calls the Releases API, supplies a shared API key, scrapes HTML, or falls back to API discovery.
+
+```json
+{
+  "schema_version": 1,
+  "releases": [
+    { "tag": "v2.0.0", "descriptors": [] }
+  ]
+}
+```
+
+Each `descriptors` element is the existing descriptor object above, not another URL. The index has at most 1,000 releases and 1 MiB of decoded response bytes; excess is an explicit error, never a truncated successful check. Unknown extra fields are ignored. Tags must be unique canonical `v<semver>` values, and each release has at most one descriptor per product/target. A published release without a supported descriptor remains present with an empty array: removing it would incorrectly turn `NoCompatibleRelease` into `UpToDate`.
+
+The existing release workflow publishes qualified archives and descriptor assets first, then rebuilds and deploys this complete catalog through Actions-based GitHub Pages. Only the CI publisher uses the Releases API and its existing `GITHUB_TOKEN`; users need no token. The publisher excludes drafts, noncanonical tags and tags whose prerelease flag disagrees with SemVer; it validates descriptor schema, identity, tag version, archive name, format, digest and advertised archive size. Invalid present descriptors fail publication rather than silently disappearing.
+
+Keep stable and pre-release history together. A later publication of an older tag must not overwrite a newer channel pointer; Rust selects by SemVer precedence rather than publication order. Do not add the index to the six-asset release bundle or change the installer/layout protocol. Serialize publication so overlapping releases cannot deploy an older catalog last.
 
 ### Selection
 
-1. Enumerate `GET /repos/{owner}/{repo}/releases?per_page=100`, at most 10 pages. Page 10 still full is an error ("cannot complete the check"), never "up to date".
-2. Skip drafts. Accept only tags that parse as canonical `v<semver>`, and only when GitHub's prerelease flag agrees with the presence of a version pre-release segment.
-3. Compare with `semver` **precedence**: build metadata never makes a version newer. Only a strictly higher version is a candidate, so a downgrade is not expressible.
-4. `Stable` accepts versions without a pre-release segment; `PreRelease` accepts both and takes the highest of the two. It never steps down to a pre-release when a stable version is higher.
-5. The highest remaining release that ships a valid descriptor for this product and target wins. A release with no descriptor for this product is skipped and the search continues with the next qualifying release; `NoCompatibleRelease` is reported only when every newer release in the selected channel lacks one. A newer release whose descriptor is present but fails validation is an error, never a silent skip.
+1. Fetch and validate the complete static index; reject an unsupported schema, malformed index, duplicate tag or duplicate product/target descriptor.
+2. Compare with `semver` **precedence**: build metadata never makes a version newer. Only a strictly higher version is a candidate, so a downgrade is not expressible.
+3. `Stable` accepts versions without a pre-release segment; `PreRelease` accepts both and takes the highest of the two. It never steps down to a pre-release when a stable version is higher.
+4. The highest remaining release that ships a valid descriptor for the compiled product and target wins. Missing descriptors are skipped; `NoCompatibleRelease` means every newer release in the selected channel lacks one. A qualifying matching descriptor that fails validation is an error, never a silent skip.
+5. Downloads still use the official repository's tag-specific `/releases/download/<tag>/<archive.name>` URL. The index cannot choose another repository or supply an arbitrary download URL.
 
 ### Configuration
 
@@ -115,6 +134,12 @@ One GitHub Release, tagged `v<semver>`, may carry descriptors for several produc
 Absent keys keep these defaults, so older settings files stay valid. The root object still rejects unknown keys. A shell's flag wins for one invocation: `allow_pre_release = true` plus `--pre-release=false` checks the stable channel.
 
 `auto_update` is a GUI-only preference. The CLI refuses an explicit `update` command while it is true and explains the setting; it never installs anything on its own. Its automatic reminder is check-only.
+
+### GUI integration
+
+The GUI uses this same `Updater` with a compile-time `Identity(Product::Gui, target, version)`; a CLI-only release never authorizes installing a CLI package into a GUI installation. Missing GUI descriptors produce the same no-compatible outcome, not a CLI fallback. The GUI owns async scheduling, check/result presentation and its `auto_update` preference, not discovery or installation logic. Explicit channel choice overrides saved `allow_pre_release` for that operation.
+
+Before activation, the GUI supplies its own headless staged-payload validator: check candidate product/target/version and the packaged native closure without opening a window or invoking the CLI. GUI acceptance must exercise that validator and failure preservation; the CLI doctor is not a substitute.
 
 ### Installation layout
 
@@ -141,13 +166,15 @@ Automatic reminders are shell policy: human terminal only, never with machine-re
 
 | Condition | Classification |
 |---|---|
-| Draft, malformed tag, prerelease flag disagrees with the version | Release skipped |
+| Draft, noncanonical tag, prerelease flag disagrees with the version | Publisher excludes release |
+| Invalid index JSON/shape, duplicate or noncanonical tag | `UpdateError::MalformedIndex` |
+| Duplicate product/target descriptor within one release | `UpdateError::AmbiguousDescriptor` |
 | Every qualifying newer release lacks a descriptor for this product and target | `CheckOutcome::NoCompatibleRelease` |
 | Descriptor schema, product, target or version disagrees | `UpdateError::{UnsupportedSchema, ProductMismatch, TargetMismatch, VersionMismatch}` |
-| Unsafe archive name, impossible format, bad digest, bad or disagreeing size | `UpdateError::{UnsafeAssetName, ArchiveKindMismatch, DigestMismatch, SizeMismatch}` |
-| Archive named once but absent, or advertised twice | `UpdateError::{MissingAsset, AmbiguousAsset}` |
-| More releases than the page budget | `UpdateError::TooManyReleases` (never "up to date") |
-| Transport, HTTP status, quota, oversized body, timeout | `UpdateError::{Transport, HttpStatus, RateLimited, ResponseTooLarge, Timeout}` |
+| Unsafe archive name, impossible format, bad digest or invalid size | `UpdateError::{UnsafeAssetName, ArchiveKindMismatch, DigestMismatch, SizeMismatch}` |
+| Named archive absent, advertised twice, or advertised size disagrees | Publisher rejects catalog publication |
+| More than 1,000 index releases | `UpdateError::TooManyReleases` (never "up to date") |
+| Transport, HTTP status, rate limit, oversized body, timeout | `UpdateError::{Transport, HttpStatus, RateLimited, ResponseTooLarge, Timeout}` |
 | Reminder state locked by another process | `UpdateError::Busy`; the caller must not wait |
 | Running executable not in a packaged installation | `InstallError::NotPackaged` |
 | Marker or `CURRENT` missing or mismatched | `InstallError::{MarkerInvalid, CurrentInvalid, MarkerMismatch}` |
@@ -163,11 +190,11 @@ Good: a GUI calls `Updater::check` for `Product::Gui`, shows the candidate, down
 
 Base: an offline diagnostic command prints its report and never performs a network check.
 
-Bad: a shell parses release assets itself, compares versions with `Ord` (build metadata), treats an exhausted page budget as "up to date", or installs a payload whose `doctor` it never ran.
+Bad: a shell calls the Releases API, parses release assets itself, compares versions with `Ord` (build metadata), treats an incomplete index as "up to date", or installs a payload whose runtime validation it never ran.
 
 ## 6. Tests
 
-Covered by focused tests at the owning boundaries: channel union and precedence, build metadata, drafts and inconsistent flags, missing descriptors, descriptor defects, duplicate descriptors and archives, paging past a full first page, page-budget failure, rate limiting, redirect allow-list, reminder intervals, failed-check throttling, per-channel deduplication, busy locks, clock rollback, corrupt state, settings compatibility, flag strictness, exit-code classes, and doctor envelope/size rejection.
+Required discovery coverage: a complete static-index HTTP response, stable/pre-release union and precedence, build metadata, out-of-order publication, missing GUI versus CLI descriptors, matching descriptor defects, duplicate tags/descriptors, schema and byte/count bounds, HTTP failures, redirect allow-list and absence of API fallback. Publisher coverage must retain descriptor-less releases, exclude drafts/inconsistent tags, and reject descriptor/archive identity or size defects before deployment. Preserve reminder intervals, failed-check throttling, per-channel deduplication, busy locks, clock rollback, corrupt state, settings compatibility, flag strictness, exit-code classes, and doctor envelope/size rejection.
 
 `archive_file_links_can_precede_targets_but_must_resolve` must place a tar symlink before its target, accept the contained file once extraction finishes, read the linked bytes, and reject a target that remains missing. The real Linux package exposed this ordering assumption; an archive test that writes every target first cannot regress it.
 
@@ -197,6 +224,6 @@ Ordinary Windows workspace checks no longer require static CRT. Every shipping b
 
 The staged doctor runs in a private directory with a cleared environment. Windows system directories come from Win32, not inherited `PATH` or `SystemRoot`. Its regression uses a real DLL available on a developer path: validation must fail until the DLL is installed beside the payload.
 
-Remaining acceptance: complete a Linux CLI update over GitHub after the forward-link repair. Retain successful Linux/Windows build, test and package CI results matched to the submitted sources; prior-baseline CI and a cached SDK installation do not replace the missing live CLI run. Cross-target `cargo check` is not Windows execution, and a local build is not glibc 2.35 qualification.
+Remaining acceptance: exercise static discovery and complete a Linux CLI update after the forward-link repair; repeat the Windows update against the new discovery path. Retain successful Linux/Windows build, test and package CI results matched to the submitted sources. Prior REST-discovery CI and a cached SDK installation do not replace these live runs. Cross-target `cargo check` is not Windows execution, and a local build is not glibc 2.35 qualification.
 
 Additionally, the published `2.0.0-alpha.6` package predates this protocol: it contains no installation marker and no release descriptor, so it cannot update itself. The first compatible installation has to be installed manually.

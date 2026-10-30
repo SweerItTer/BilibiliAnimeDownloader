@@ -22,4 +22,4 @@ One integration owner runs consolidated fmt/check/clippy/test after source/depen
 | [Error Handling](error-handling.md) | Typed safe errors, per-job/batch exit precedence |
 | [Quality Guidelines](quality-guidelines.md) | Seven-section commands/config/output/native/SDK/package acceptance |
 | [Logging Guidelines](logging-guidelines.md) | stdout/stderr, secret exclusion and evidence |
-| [Update protocol](../../bili_core/backend/update-protocol.md) | Shared release descriptor, channel rules, install layout and the `--pre-release`/`auto_update` boundary the CLI must follow |
+| [Update protocol](../../bili_core/backend/update-protocol.md) | Shared static HTTPS discovery, release descriptor, channel rules, install layout and the `--pre-release`/`auto_update` boundary the CLI must follow |
