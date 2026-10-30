@@ -9,6 +9,10 @@ either shell.
 
 ## Common work
 
+- **Project-wide rules** — for planning, CI/release, or documentation changes,
+  read the `项目约定` section in `.trellis/spec/guides/index.md`.
+  Keep these rules there; pass the relevant rules to delegated agents rather
+  than assuming they inherit this file.
 - **Before changing code** — read `.trellis/workflow.md`, then the package
   index and only the guides it points to:
   - `bili_core`: `.trellis/spec/bili_core/backend/index.md`

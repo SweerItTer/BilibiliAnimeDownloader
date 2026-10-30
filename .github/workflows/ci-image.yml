@@ -1,0 +1,146 @@
+name: CI image
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'scripts/ci/Dockerfile'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/ci-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish Linux builder image
+    # Python 3.12+ (tomllib) reads the Rust channel from rust-toolchain.toml.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      reference: ${{ steps.publish.outputs.reference }}
+      rustchannel: ${{ steps.rust.outputs.channel }}
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}/ci-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the pinned Rust channel
+        id: rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
+          echo "Pinned Rust channel: ${channel}"
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg "RUST_VERSION=${{ steps.rust.outputs.channel }}" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            -t ci-linux:local - < scripts/ci/Dockerfile
+
+      - name: Check the built image
+        shell: bash
+        env:
+          EXPECTED_RUST: ${{ steps.rust.outputs.channel }}
+        run: |
+          set -euo pipefail
+          docker run --rm --env EXPECTED_RUST ci-linux:local bash -ec '
+            set -eu
+            . /etc/os-release
+            test "${VERSION_ID}" = "22.04"
+            ldd --version | head -1 | grep -q " 2.35"
+            rustc --version | grep -q "^rustc ${EXPECTED_RUST} "
+            python3 -c "import ssl, sys, tomllib; assert sys.version_info[:2] == (3, 13)"
+            clang --version > /dev/null
+            pkg-config --version > /dev/null
+            cmake --version > /dev/null
+            ninja --version > /dev/null
+            nasm -v > /dev/null
+            patchelf --version > /dev/null
+            work="$(mktemp -d)"
+            cd "${work}"
+            printf "%s\n" "fn main() { println!(\"rust ok\"); }" > smoke.rs
+            rustc smoke.rs -o smoke
+            ./smoke
+            printf "%s\n" "#include <math.h>" "#include <stdio.h>" "int main(void) { printf(\"c ok %.1f\\n\", sqrt(9.0)); return 0; }" > smoke.c
+            clang smoke.c -o smoke-c -lm
+            ./smoke-c
+            rm -rf "${work}"
+          '
+
+      - name: Publish the image
+        id: publish
+        shell: bash
+        env:
+          CR_PAT: ${{ github.token }}
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: |
+          set -euo pipefail
+          # IMAGE is provided by the job environment.
+          # shellcheck disable=SC2153
+          image="${IMAGE,,}"
+          tagged="${image}:sha-${GITHUB_SHA}"
+          echo "${CR_PAT}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          docker tag ci-linux:local "${tagged}"
+          docker push "${tagged}"
+          digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${tagged}" | sed -n "s|^${image}@\(sha256:[0-9a-f]\{64\}\)$|\1|p")"
+          test -n "${digest}" || { echo "no pushed RepoDigest recorded for ${tagged}" >&2; exit 1; }
+          echo "reference=${image}@${digest}" >> "$GITHUB_OUTPUT"
+          echo "Published \`${image}@${digest}\` for \`${GITHUB_SHA}\`." >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io
+
+  pull-check:
+    name: Pull the published image
+    needs: publish
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Pull the pinned digest and check the environment
+        shell: bash
+        env:
+          CR_PAT: ${{ github.token }}
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+          REFERENCE: ${{ needs.publish.outputs.reference }}
+          EXPECTED_RUST: ${{ needs.publish.outputs.rustchannel }}
+        run: |
+          set -euo pipefail
+          echo "${CR_PAT}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          start=$(date +%s)
+          docker pull "${REFERENCE}"
+          seconds=$(( $(date +%s) - start ))
+          docker image inspect --format 'image_size_bytes={{.Size}}' "${REFERENCE}"
+          docker run --rm --env EXPECTED_RUST "${REFERENCE}" bash -ec '
+            set -eu
+            . /etc/os-release
+            test "${VERSION_ID}" = "22.04"
+            ldd --version | head -1 | grep -q " 2.35"
+            rustc --version | grep -q "^rustc ${EXPECTED_RUST} "
+            python3 -c "import ssl, sys, tomllib; assert sys.version_info[:2] == (3, 13)"
+            work="$(mktemp -d)"
+            cd "${work}"
+            printf "%s\n" "fn main() { println!(\"rust ok\"); }" > smoke.rs
+            rustc smoke.rs -o smoke
+            ./smoke
+            printf "%s\n" "#include <stdio.h>" "int main(void) { printf(\"c ok\\n\"); return 0; }" > smoke.c
+            clang smoke.c -o smoke-c
+            ./smoke-c
+            cd /
+            rm -rf "${work}"
+          '
+          {
+            echo "Pull of \`${REFERENCE}\` took ${seconds}s on a fresh runner."
+            echo "Consumers should use this image@sha256 reference."
+          } >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io

@@ -815,6 +815,9 @@ def interruptible_download(command, env, cwd, state_dir, timeout=180):
             elif isinstance(value, (bool, int)) or value is None:
                 if value is not None:
                     fields[key] = value
+        status = error.get("http_status")
+        if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+            fields["http_status"] = status
         return fields
 
     def job_fields(job):
@@ -1156,7 +1159,7 @@ def validate_selected_media(probe, plan):
 def verify_basic_live_media(executable, state_dir, output_dir, env, cwd, media_id,
                            probe_helper, report, timeout=900, max_bytes=134217728):
     if public_media_identifier(media_id) != "BV1gD4y1o72p":
-        raise ValueError("basic-alpha profile requires the fixed authorized sample BV1gD4y1o72p")
+        raise ValueError("basic profile requires the fixed authorized sample BV1gD4y1o72p")
     state_dir.mkdir(mode=0o700)
     output_dir.mkdir(mode=0o700)
     deadline = time.monotonic() + timeout
@@ -1168,7 +1171,7 @@ def verify_basic_live_media(executable, state_dir, output_dir, env, cwd, media_i
     videos = [item for item in reps if item["audio"] is False]
     audios = [item for item in reps if item["audio"] is True]
     if not videos or not audios:
-        raise ValueError("basic-alpha requires returned video and audio representations")
+        raise ValueError("basic requires returned video and audio representations")
     video = min(videos, key=lambda item: item["bandwidth"])
     audio = min(audios, key=lambda item: item["bandwidth"])
     estimated = (video["bandwidth"] + audio["bandwidth"]) * 635 // 8
@@ -1186,11 +1189,11 @@ def verify_basic_live_media(executable, state_dir, output_dir, env, cwd, media_i
                 if time.monotonic() >= deadline:
                     process.kill()
                     process.wait()
-                    raise TimeoutError("basic-alpha deadline expired during download/merge")
+                    raise TimeoutError("basic deadline expired during download/merge")
                 if os.fstat(stdout.fileno()).st_size > 16 * 1024 * 1024 or os.fstat(stderr.fileno()).st_size > 65536:
                     process.kill()
                     process.wait()
-                    raise ValueError("basic-alpha CLI output exceeded its bound")
+                    raise ValueError("basic CLI output exceeded its bound")
                 resources = list(state_dir.glob("**/resource-*.media"))
                 resource_bytes = sum(path.stat().st_size for path in resources if path.is_file())
                 outputs = [path for path in output_dir.rglob("*") if path.is_file()]
@@ -1198,16 +1201,16 @@ def verify_basic_live_media(executable, state_dir, output_dir, env, cwd, media_i
                 if sample_bytes > max_bytes:
                     process.kill()
                     process.wait()
-                    raise ValueError("basic-alpha resource/output bytes exceeded its bound")
+                    raise ValueError("basic resource/output bytes exceeded its bound")
                 time.sleep(0.1)
             if process.returncode:
-                raise RuntimeError(f"basic-alpha CLI failed ({process.returncode})")
+                raise RuntimeError(f"basic CLI failed ({process.returncode})")
             if os.fstat(stdout.fileno()).st_size > 16 * 1024 * 1024 or os.fstat(stderr.fileno()).st_size > 65536:
-                raise ValueError("basic-alpha CLI output exceeded its bound")
+                raise ValueError("basic CLI output exceeded its bound")
             stdout.seek(0)
             result = stdout.read(16 * 1024 * 1024 + 1)
             if len(result) > 16 * 1024 * 1024:
-                raise ValueError("basic-alpha CLI output exceeded its bound")
+                raise ValueError("basic CLI output exceeded its bound")
             result = result.decode("utf-8")
         finally:
             if process.poll() is None:
@@ -1215,11 +1218,11 @@ def verify_basic_live_media(executable, state_dir, output_dir, env, cwd, media_i
                 process.wait()
     jobs = result_jobs(result)
     if len(jobs) != 1:
-        raise ValueError("basic-alpha did not return exactly one managed job")
+        raise ValueError("basic did not return exactly one managed job")
     job = jobs[0]
     if job.get("phase") != "Completed" or job.get("error") is not None or any(
             component.get("error") is not None for component in job.get("components", [])):
-        raise ValueError("basic-alpha job or requested component failed")
+        raise ValueError("basic job or requested component failed")
     job_id, media, completion = validate_managed_job(job, state_dir, output_dir)
     plan = job.get("plan")
     if (not isinstance(plan, dict) or plan.get("video", {}).get("id") != video["id"]
@@ -1229,17 +1232,17 @@ def verify_basic_live_media(executable, state_dir, output_dir, env, cwd, media_i
     resource_bytes = sum(path.stat().st_size for path in resources if path.is_file())
     outputs = [path for path in output_dir.rglob("*") if path.is_file()]
     if resource_bytes + sum(path.stat().st_size for path in outputs) > max_bytes:
-        raise ValueError("basic-alpha final resource/output bytes exceeded its bound")
+        raise ValueError("basic final resource/output bytes exceeded its bound")
     if not media.is_file() or media.stat().st_size <= 0 or media.stat().st_size > max_bytes:
-        raise ValueError("basic-alpha output is empty or exceeds the byte budget")
+        raise ValueError("basic output is empty or exceeds the byte budget")
     if completion.get("size") != media.stat().st_size or completion.get("sha256") != sha256(media):
-        raise ValueError("basic-alpha output does not match its committed hash/size")
+        raise ValueError("basic output does not match its committed hash/size")
     if time.monotonic() >= deadline:
-        raise TimeoutError("basic-alpha verification exceeded its deadline")
+        raise TimeoutError("basic verification exceeded its deadline")
     streams = json.loads(run([str(probe_helper), "--probe", str(media)], env, cwd,
                              encoding="utf-8", deadline=deadline))
     selected = validate_selected_media(streams, plan)
-    report["basic_alpha_smoke"] = {
+    report["basic_smoke"] = {
         "outcome": "passed", "job_id": job_id, "phase": "Completed",
         "sha256": completion["sha256"], "size": completion["size"],
         "selected_streams": selected,
@@ -1338,7 +1341,7 @@ def main():
     parser.add_argument("--replacement-fixture", type=Path, help="verified synthetic h264-aac.mp4 input for replacement-library managed remux")
     parser.add_argument("--offline-fixture", type=Path, help="synthetic fixture for an isolated managed remux smoke")
     parser.add_argument("--public-media-id", help="opt in to anonymous live media smoke")
-    parser.add_argument("--public-media-profile", choices=("full-recovery", "basic-alpha"), default="full-recovery")
+    parser.add_argument("--public-media-profile", choices=("full-recovery", "basic"), default="full-recovery")
     parser.add_argument("--live-timeout-seconds", type=int, default=900)
     parser.add_argument("--max-media-bytes", type=int, default=134217728)
     parser.add_argument("--report", type=Path, help="write an artifact-safe JSON record of actual verification outcomes")
@@ -1349,19 +1352,19 @@ def main():
         parser.error("--offline-fixture requires --probe-helper or --sdk-artifact")
     if args.offline_fixture and not args.offline_fixture.is_file():
         parser.error("--offline-fixture does not exist")
-    if args.public_media_profile == "basic-alpha":
-        if not args.public_media_id:
-            parser.error("basic-alpha requires --public-media-id BV1gD4y1o72p")
-        if public_id != "BV1gD4y1o72p" or args.target != "x86_64-unknown-linux-gnu":
-            parser.error("basic-alpha requires BV1gD4y1o72p on x86_64-unknown-linux-gnu")
-        if not args.probe_helper and not args.sdk_artifact:
-            parser.error("basic-alpha requires --probe-helper or --sdk-artifact")
     public_id = public_media_identifier(args.public_media_id)
+    if args.public_media_profile == "basic":
+        if not args.public_media_id:
+            parser.error("basic requires --public-media-id BV1gD4y1o72p")
+        if public_id != "BV1gD4y1o72p" or args.target != "x86_64-unknown-linux-gnu":
+            parser.error("basic requires BV1gD4y1o72p on x86_64-unknown-linux-gnu")
+        if not args.probe_helper and not args.sdk_artifact:
+            parser.error("basic requires --probe-helper or --sdk-artifact")
     report = {
         "schema_version": 1,
         "status": "incomplete",
         "target": args.target,
-        "public_media_profile": args.public_media_profile,
+        "public_media_profile": args.public_media_profile if args.public_media_id else None,
         "public_media_id": public_id,
         "media_path": f"https://www.bilibili.com/video/{public_id}" if public_id else None,
         "public_media_input_provided": bool(args.public_media_id),
@@ -1468,7 +1471,7 @@ def main():
                                      probe_helper, env, base)
             report["replacement_smoke"] = "passed"
         if args.public_media_id:
-            if args.public_media_profile == "basic-alpha":
+            if args.public_media_profile == "basic":
                 if probe_helper is None:
                     probe_helper = find_probe_helper(args.sdk_artifact.resolve(), base / "sdk")
                 if not probe_helper.is_file():
@@ -1488,8 +1491,8 @@ def main():
         if args.replacement_prefix:
             print("Compatible-library replacement and synthetic managed-remux smoke passed.")
         if args.public_media_id:
-            if args.public_media_profile == "basic-alpha":
-                print("Opt-in anonymous basic-alpha download/merge smoke passed.")
+            if args.public_media_profile == "basic":
+                print("Opt-in anonymous basic download/merge smoke passed.")
             else:
                 print("Opt-in anonymous full-recovery media smoke passed.")
 

@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible problem with the CLI or its documentation.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Issues are public.** Never post cookies, tokens, signed URLs, or unredacted logs. For security reports, use [GitHub's private vulnerability reporting form](https://github.com/SweerItTer/BilibiliAnimeDownloader/security/advisories/new).
+  - type: input
+    id: version
+    attributes:
+      label: Version or source revision
+      description: For a packaged CLI, include the output of `bili --version`.
+      placeholder: 2.0.0-alpha.6
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: Ubuntu 22.04, x86_64
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the command and safe sample input where relevant. If it is not reproducible, describe what you observed.
+      placeholder: |
+        1. Run ...
+        2. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized output or other evidence
+      description: Optional. Remove cookies, tokens, private URLs, and other sensitive information before posting.

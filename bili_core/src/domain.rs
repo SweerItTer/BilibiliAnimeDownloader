@@ -30,6 +30,9 @@ pub struct CoreError {
     pub code: ErrorCode,
     pub operation: String,
     pub retryable: bool,
+    /// HTTP response status when a response was received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
     /// Original signed FFmpeg AVERROR value; never native text, paths or URLs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_code: Option<i32>,
@@ -41,6 +44,7 @@ impl CoreError {
             code,
             operation: operation.into(),
             retryable: false,
+            http_status: None,
             native_code: None,
         }
     }
