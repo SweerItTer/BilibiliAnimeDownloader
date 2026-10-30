@@ -945,7 +945,9 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "unicode-width",
  "zeroize",
 ]
 
