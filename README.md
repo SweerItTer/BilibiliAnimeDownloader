@@ -23,7 +23,7 @@ The CLI prints completed file paths. It does not install or launch a video playe
 
 ## Checking and installing updates
 
-A CLI **built from this branch** supports checking and manually installing updates from a compatible versioned package. Use isolated installations while acceptance is incomplete. The published `2.0.0-alpha.6` package has no `update` subcommand:
+A CLI **built from this branch** supports checking and manually installing updates from a compatible versioned package. Use isolated installations for this unreleased updater. The published `2.0.0-alpha.6` package has no `update` subcommand:
 
 ```sh
 ./bin/bili update --check
@@ -32,9 +32,11 @@ A CLI **built from this branch** supports checking and manually installing updat
 
 Checks read a fixed HTTPS static index; archives download directly from the matching tagged GitHub Release. The client does not call the Releases API or require an API key. `--pre-release` also considers pre-release versions for that one command (`--pre-release=false` forces the stable channel even when the settings file opts in).
 
-Static-index deployment and Linux/Windows live-update acceptance are still pending. Earlier Windows live-update and repaired Linux cached-install checks cover the installation transaction, not the new discovery path. `2.0.0-alpha.6` predates this protocol and cannot update itself: extract the first compatible package into a new directory by hand.
+The static index is deployed, and live Linux and Windows upgrades have passed in isolated installations. On Windows, the shallower test installation passed; the deeper one failed with `Corruption` before activation and preserved the old installation. The cause remains unresolved.
 
-The shared protocol, its descriptor format, the configuration keys and remaining verification gaps are documented in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). `auto_update` there is a GUI-only preference; the CLI only ever checks unless you run `bili update` yourself.
+`2.0.0-alpha.6` predates this protocol and cannot update itself: extract the first compatible package into a new directory by hand.
+
+The shared protocol, descriptor format, configuration keys, verification results and known limits are documented in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). `auto_update` there is a GUI-only preference; the CLI only ever checks unless you run `bili update` yourself.
 
 ## Login and privacy
 

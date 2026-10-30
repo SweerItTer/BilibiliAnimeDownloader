@@ -23,7 +23,7 @@ CLI 会显示已完成文件的路径；不会安装或启动播放器。其他�
 
 ## 检查和安装更新
 
-**由本分支构建**的 CLI 支持检查更新，并从兼容的新布局软件包中手动安装更新。验收完成前，请只在隔离的安装目录中试用。已发布的 `2.0.0-alpha.6` 软件包没有 `update` 子命令：
+**由本分支构建**的 CLI 支持检查更新，并从兼容的新布局软件包中手动安装更新。这项功能尚未正式发布，请在隔离的安装目录中试用。已发布的 `2.0.0-alpha.6` 软件包没有 `update` 子命令：
 
 ```sh
 ./bin/bili update --check
@@ -32,9 +32,11 @@ CLI 会显示已完成文件的路径；不会安装或启动播放器。其他�
 
 检查更新时读取固定的 HTTPS 静态清单，安装包仍直接从对应 Tag 的 GitHub Release 下载。客户端不调用 Releases API，也不需要 API key。`--pre-release` 仅对这一次命令同时考虑预发布版本（配置文件中已允许预发布时，`--pre-release=false` 仍可强制切回稳定渠道）。
 
-静态清单部署及 Linux／Windows 联网升级验收尚未完成。此前 Windows 联网升级与修复后 Linux 缓存安装的结果只覆盖安装事务，不代表新发现路径已通过验收。`2.0.0-alpha.6` 早于本协议，无法自我更新；首个兼容版本需要手工解压到新目录中安装。
+静态清单已部署，Linux 和 Windows 均已在隔离目录中完成联网升级。Windows 的较浅测试目录升级通过；较深测试目录在激活前以 `Corruption` 退出，旧安装保持不变，原因尚未定位。
 
-共享协议、descriptor 格式、配置项与当前已知阻断记录在[升级协议说明](.trellis/spec/bili_core/backend/update-protocol.md)。其中的 `auto_update` 仅供 GUI 使用；CLI 只在你亲自执行 `bili update` 时才会安装，其余情况最多做一次检查。
+`2.0.0-alpha.6` 早于本协议，无法自我更新；首个兼容版本需要手工解压到新目录中安装。
+
+共享协议、descriptor 格式、配置项、验证结果与已知限制记录在[升级协议说明](.trellis/spec/bili_core/backend/update-protocol.md)。其中的 `auto_update` 仅供 GUI 使用；CLI 只在你亲自执行 `bili update` 时才会安装，其余情况最多做一次检查。
 
 ## 登录与隐私
 

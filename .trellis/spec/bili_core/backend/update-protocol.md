@@ -6,7 +6,7 @@ Every shell (CLI, GUI, TUI) updates through this one protocol. `bili_core::updat
 
 Read this before adding an update command, a release asset, a package layout or a GUI updater.
 
-**Status: static discovery is implemented; deployment and new live acceptance are pending.** This replaces client-side GitHub Releases API discovery, including for the future GUI. Prior Windows live-update and repaired Linux cached-install results cover the installation transaction, not this new discovery path. Use isolated installations until the remaining acceptance in §8 is complete.
+**Status: static discovery is implemented and deployed; real Linux and Windows upgrades passed, but a deeper Windows installation still fails before activation.** This replaces client-side GitHub Releases API discovery, including for the future GUI. The unresolved Windows result and the verified installation boundaries are recorded in §8; do not generalize the successful installation to every path.
 
 ## 2. Signatures
 
@@ -98,7 +98,7 @@ One GitHub Release, tagged `v<semver>`, may carry descriptors for several produc
 
 ### Static index and publication
 
-The official client entry is `https://sweeritter.github.io/BilibiliAnimeDownloader/updates/v1/index.json`. This is the selected publication address, not a claim that deployment has already passed. The client performs one bounded HTTPS GET; it never calls the Releases API, supplies a shared API key, scrapes HTML, or falls back to API discovery.
+The deployed official client entry is `https://sweeritter.github.io/BilibiliAnimeDownloader/updates/v1/index.json`. The client performs one bounded HTTPS GET; it never calls the Releases API, supplies a shared API key, scrapes HTML, or falls back to API discovery.
 
 ```json
 {
@@ -215,7 +215,7 @@ Wrong: shell copies candidate selection or re-derives the identity from `BUILD_I
 
 Correct: one `Identity` from compile-time values, one `check`, one verified archive, one `validate` callback, and one `CURRENT` rename performed by `install_payload`.
 
-## 8. Repair and remaining acceptance
+## 8. Repair and acceptance evidence
 
 The installation lock now protects a fresh `CURRENT` read and comparison with the selected payload's build metadata. A stale process cannot activate an older or equal-precedence candidate, including a version differing only in SemVer build metadata. Invalid selected metadata fails closed before staging.
 
@@ -225,6 +225,12 @@ Ordinary Windows workspace checks no longer require static CRT. Every shipping b
 
 The staged doctor runs in a private directory with a cleared environment. Windows system directories come from Win32, not inherited `PATH` or `SystemRoot`. Its regression uses a real DLL available on a developer path: validation must fail until the DLL is installed beside the payload.
 
-Remaining acceptance: exercise static discovery and complete a Linux CLI update after the forward-link repair; repeat the Windows update against the new discovery path. Retain successful Linux/Windows build, test and package CI results matched to the submitted sources. Prior REST-discovery CI and a cached SDK installation do not replace these live runs. Cross-target `cargo check` is not Windows execution, and a local build is not glibc 2.35 qualification.
+Matching-source qualification passed for [A `9b483d3`](https://github.com/SweerItTer/BilibiliAnimeDownloader/actions/runs/41090277429) and [version-only B `dacb1d0`](https://github.com/SweerItTer/BilibiliAnimeDownloader/actions/runs/41090823279): Linux/Windows builds and tests, Windows 2022 package inspection, and Ubuntu 22.04/24.04 package checks. B changes only the CLI version and its lockfile entry.
+
+Actual Linux (WSL2) and native Windows CLI runs used the public static index and tagged GitHub archives to update A to `2.0.0-alpha.6.updater-test.20261031.1`. They verified channel/flag precedence, failure preservation under a held lock, archive installation and staged doctor, `CURRENT` activation, new version/native doctor, unchanged bootstrap/old payload/user file, and repeated no-op updates. Linux A was rebuilt locally with the existing locked source/native/package recipe; Windows A and both B packages came from matching-source CI. No developer loader override or Bilibili request was used. Local Linux execution is not glibc 2.35 qualification; that evidence comes from the independent Ubuntu 22.04 package check.
+
+**Known Windows failure:** the shallower isolated installation completed those checks; the deeper test installation still returned `Corruption` before activation after correcting its profile fixture. Its `CURRENT`, old payload, bootstrap and user file remained unchanged. The cause is not located; shallower-path success does not resolve this failure. Receipts and original errors are retained under ignored `target/update-checks/static-cutover-20261030/`.
+
+Windows isolation fixtures must create physical `USERPROFILE/AppData/Roaming` and `USERPROFILE/AppData/Local` directories. Setting `APPDATA`/`LOCALAPPDATA` alone did not satisfy `directories::ProjectDirs::from("", "", "bili")`: both A and B doctor failed with `locate private platform directories`; creating that directory tree restored B doctor with unchanged binaries and environment. This fixture error is separate from the unresolved deeper-installation failure.
 
 Additionally, the published `2.0.0-alpha.6` package predates this protocol: it contains no installation marker and no release descriptor, so it cannot update itself. The first compatible installation has to be installed manually.

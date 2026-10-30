@@ -21,7 +21,7 @@
 ### 📝 Documentation
 
 - Add community conduct, contribution, security and accessibility guidance, plus issue forms and a pull request template.
-- Document the shared update protocol, the GUI validation boundary and installation verification limits.
+- Document the shared static update protocol, GUI validation boundary, verified Linux/Windows upgrades and the unresolved deeper Windows installation failure.
 
 ### 📦 Build/Packaging
 
