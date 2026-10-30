@@ -341,7 +341,7 @@ fn raw_tar(path: &Path, entries: &[(&str, &[u8])]) {
         header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
         body.extend_from_slice(&header);
         body.extend_from_slice(data);
-        body.extend(std::iter::repeat(0u8).take((512 - data.len() % 512) % 512));
+        body.extend(std::iter::repeat_n(0u8, (512 - data.len() % 512) % 512));
     }
     body.extend_from_slice(&[0u8; 1024]);
     let mut encoder = flate2::write::GzEncoder::new(
@@ -395,6 +395,7 @@ fn install_commits_staged_payload_and_keeps_every_other_file() {
         &candidate,
         &archive,
         |staged| {
+            assert_eq!(staged.identity(), &identity(NEW_VERSION, TARGET));
             assert_eq!(
                 fs::read(staged.entry()).expect("staged entry"),
                 app,
@@ -507,18 +508,19 @@ fn pointer_write_failure_leaves_no_new_payload_behind() {
         b"new",
         "bili-0.2.0-x86_64-unknown-linux-gnu",
     );
-    // A directory in place of the pointer makes the single rename fail before
-    // the activation commit point.
-    fs::remove_file(installed.root.join(CURRENT_FILE)).expect("remove pointer");
-    fs::create_dir(installed.root.join(CURRENT_FILE)).expect("blocking directory");
-    write(&installed.root.join(CURRENT_FILE).join("keep"), b"x");
 
     let result = install_payload(
         &installed.exe(TARGET),
         &identity("0.1.0", TARGET),
         &candidate,
         &archive,
-        |_| Ok(()),
+        |_| {
+            // Fail activation after the locked CURRENT check has succeeded.
+            fs::remove_file(installed.root.join(CURRENT_FILE)).expect("remove pointer");
+            fs::create_dir(installed.root.join(CURRENT_FILE)).expect("blocking directory");
+            write(&installed.root.join(CURRENT_FILE).join("keep"), b"x");
+            Ok(())
+        },
     );
     assert_eq!(result, Err(InstallError::Filesystem));
     assert_eq!(
@@ -984,4 +986,49 @@ fn symlinks_inside_a_payload_are_verified_through_their_targets() {
         |_| Ok(())
     )
     .is_err());
+}
+
+#[test]
+fn stale_process_cannot_replace_a_newer_selected_payload() {
+    let installed = Installed::new(TARGET);
+    let running = identity("0.1.0", TARGET);
+    let (archive, newest) = staged(&installed, "0.3.0", b"newest", "package");
+    install_payload(&installed.exe(TARGET), &running, &newest, &archive, |_| {
+        Ok(())
+    })
+    .expect("first updater commits");
+    let selected = installed.current();
+    let versions = installed.versions();
+    for version in ["0.2.0", "0.3.0", "0.3.0+different-build"] {
+        let (archive, older) = staged(&installed, version, b"stale candidate", "package");
+        assert_eq!(
+            install_payload(&installed.exe(TARGET), &running, &older, &archive, |_| {
+                panic!("stale candidate must not reach validation")
+            }),
+            Err(InstallError::Downgrade),
+            "{version}"
+        );
+        assert_eq!(installed.current(), selected);
+        assert_eq!(installed.versions(), versions);
+        installed.assert_staging_clean();
+    }
+}
+
+#[test]
+fn invalid_selected_payload_refuses_update_without_staging() {
+    let installed = Installed::new(TARGET);
+    let (archive, candidate) = staged(&installed, NEW_VERSION, b"new", "package");
+    write(&installed.root.join(CURRENT_FILE), b"invalid pointer");
+    assert_eq!(
+        install_payload(
+            &installed.exe(TARGET),
+            &identity("0.1.0", TARGET),
+            &candidate,
+            &archive,
+            |_| Ok(())
+        ),
+        Err(InstallError::CurrentInvalid)
+    );
+    assert_eq!(installed.current(), "invalid pointer");
+    installed.assert_staging_clean();
 }

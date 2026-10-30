@@ -238,7 +238,7 @@ impl Channel {
 /// Update preferences owned by shell configuration.
 ///
 /// Unknown fields are tolerated so a newer GUI may share one configuration
-/// file with an older CLI; `auto_update` gates check-only TTY reminders, never
+/// file with an older CLI; `check_updates` gates check-only TTY reminders, never
 /// an automatic download or install, which still requires an explicit update command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]

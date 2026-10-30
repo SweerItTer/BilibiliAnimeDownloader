@@ -83,7 +83,7 @@ pub enum InstallError {
     InventoryMismatch,
     /// Payload metadata disagrees with the expected product, target or version.
     PayloadIdentity,
-    /// The candidate is not newer than the running version.
+    /// The candidate is not newer than the running or currently selected version.
     Downgrade,
     /// The archive needs a newer layout or entry protocol than this build has.
     ProtocolIncompatible,
@@ -106,7 +106,7 @@ impl std::fmt::Display for InstallError {
             Self::ArchiveLayout => "update archive layout is unsafe or unexpected",
             Self::InventoryMismatch => "update archive contents do not match their inventory",
             Self::PayloadIdentity => "update payload identity disagrees with this installation",
-            Self::Downgrade => "update candidate is not newer than the running version",
+            Self::Downgrade => "update candidate is not newer than the installed version",
             Self::ProtocolIncompatible => "update needs a newer installation or entry protocol",
             Self::Validator => "staged payload failed validation",
         };
@@ -336,7 +336,7 @@ where
     if reference.format != identity.target().archive_kind() {
         return Err(InstallError::ArchiveLayout);
     }
-    if candidate.version <= *identity.version() {
+    if !candidate.version.cmp_precedence(identity.version()).is_gt() {
         return Err(InstallError::Downgrade);
     }
     let (size, digest) = hash_file(archive)?;
@@ -348,6 +348,15 @@ where
     }
 
     let lock = InstallLock::acquire(&root)?;
+    // Another updater may have committed while this process downloaded the
+    // archive. The running executable is immutable and can now be stale.
+    let current_id = root.current()?;
+    let current_info = read_build_info(&root.versions().join(current_id.as_str()), identity)?;
+    let current_version =
+        Version::parse(&current_info.app_version).map_err(|_| InstallError::PayloadIdentity)?;
+    if !candidate.version.cmp_precedence(&current_version).is_gt() {
+        return Err(InstallError::Downgrade);
+    }
     let work = begin_work(&root)?;
     let outcome = expand(&root, identity, candidate, archive, &work, validate);
     drop(lock);
@@ -391,7 +400,10 @@ where
     archive::verify_inventory(&payload, &payload.join("SHA256SUMS"))?;
     archive::check_links(&payload)?;
 
-    let info = read_build_info(&payload, identity, candidate)?;
+    let info = read_build_info(&payload, identity)?;
+    if info.app_version != candidate.version.to_string() {
+        return Err(InstallError::PayloadIdentity);
+    }
     let entry = payload.join(payload_entry(identity.target()));
     let entry_meta = fs::symlink_metadata(&entry).map_err(|_| InstallError::PayloadIdentity)?;
     if !entry_meta.is_file() {
@@ -406,11 +418,14 @@ where
         return Err(InstallError::PayloadIdentity);
     }
 
+    let candidate_identity =
+        Identity::new(identity.product(), identity.target(), &info.app_version)
+            .map_err(|_| InstallError::PayloadIdentity)?;
     let staged = Staged {
         payload: payload.clone(),
         id: &archive_id,
         target: identity.target(),
-        identity,
+        identity: &candidate_identity,
     };
     validate(&staged)?;
 
@@ -446,11 +461,7 @@ struct PayloadBuildInfo {
     bootstrap_protocol: u32,
 }
 
-fn read_build_info(
-    payload: &Path,
-    identity: &Identity,
-    candidate: &UpdateCandidate,
-) -> Result<PayloadBuildInfo, InstallError> {
+fn read_build_info(payload: &Path, identity: &Identity) -> Result<PayloadBuildInfo, InstallError> {
     let bytes =
         fs::read(payload.join("BUILD_INFO.json")).map_err(|_| InstallError::PayloadIdentity)?;
     let info: PayloadBuildInfo =
@@ -462,10 +473,7 @@ fn read_build_info(
     {
         return Err(InstallError::ProtocolIncompatible);
     }
-    if info.product != identity.product()
-        || info.target != identity.target().triple()
-        || info.app_version != candidate.version.to_string()
-    {
+    if info.product != identity.product() || info.target != identity.target().triple() {
         return Err(InstallError::PayloadIdentity);
     }
     if !is_lower_hex(&info.app_sha256) || info.app_sha256.len() != 64 {

@@ -551,16 +551,16 @@ fn permitted(url: &Url) -> bool {
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
         return false;
     }
-    let host_allowed = match url.host_str() {
+    let host_allowed = matches!(
+        url.host_str(),
         Some(
             "api.github.com"
-            | "github.com"
-            | "objects.githubusercontent.com"
-            | "release-assets.githubusercontent.com",
-        ) => true,
-        Some("127.0.0.1" | "localhost") => cfg!(test),
-        _ => false,
-    };
+                | "github.com"
+                | "objects.githubusercontent.com"
+                | "release-assets.githubusercontent.com"
+        )
+    ) || (cfg!(test)
+        && matches!(url.host_str(), Some("127.0.0.1" | "localhost")));
     if !host_allowed {
         return false;
     }
@@ -666,9 +666,9 @@ mod tests {
         version: &str,
         archive: &str,
         format: &str,
-        digest: &str,
-        size: u64,
+        integrity: (&str, u64),
     ) -> String {
+        let (digest, size) = integrity;
         format!(
             r#"{{"schema_version":{schema},"product":"{product}","target":"{target}","version":"{version}","archive":{{"name":"{archive}","format":"{format}","sha256":"{digest}","size":{size}}}}}"#
         )
@@ -682,8 +682,7 @@ mod tests {
             version,
             ARCHIVE,
             "tar.gz",
-            DIGEST,
-            4096,
+            (DIGEST, 4096),
         )
     }
 
@@ -773,8 +772,7 @@ mod tests {
                     "2.1.0-alpha.1",
                     ARCHIVE,
                     "tar.gz",
-                    DIGEST,
-                    4096,
+                    (DIGEST, 4096),
                 ),
             ),
         ];
@@ -880,8 +878,7 @@ mod tests {
                     "2.0.0",
                     ARCHIVE,
                     "tar.gz",
-                    DIGEST,
-                    4096,
+                    (DIGEST, 4096),
                 ),
                 UpdateError::UnsupportedSchema(2),
             ),
@@ -894,8 +891,7 @@ mod tests {
                     "2.0.0",
                     ARCHIVE,
                     "tar.gz",
-                    DIGEST,
-                    4096,
+                    (DIGEST, 4096),
                 ),
                 UpdateError::ProductMismatch,
             ),
@@ -908,8 +904,7 @@ mod tests {
                     "2.0.0",
                     ARCHIVE,
                     "tar.gz",
-                    DIGEST,
-                    4096,
+                    (DIGEST, 4096),
                 ),
                 UpdateError::TargetMismatch,
             ),
@@ -922,8 +917,7 @@ mod tests {
                     "2.0.1",
                     ARCHIVE,
                     "tar.gz",
-                    DIGEST,
-                    4096,
+                    (DIGEST, 4096),
                 ),
                 UpdateError::VersionMismatch,
             ),
@@ -936,8 +930,7 @@ mod tests {
                     "2.0.0",
                     ARCHIVE,
                     "tar.gz",
-                    "zz",
-                    4096,
+                    ("zz", 4096),
                 ),
                 UpdateError::DigestMismatch,
             ),
@@ -950,8 +943,7 @@ mod tests {
                     "2.0.0",
                     ARCHIVE,
                     "tar.gz",
-                    DIGEST,
-                    0,
+                    (DIGEST, 0),
                 ),
                 UpdateError::SizeMismatch,
             ),
@@ -964,8 +956,7 @@ mod tests {
                     "2.0.0",
                     "../evil.tar.gz",
                     "tar.gz",
-                    DIGEST,
-                    4096,
+                    (DIGEST, 4096),
                 ),
                 UpdateError::UnsafeAssetName,
             ),
@@ -978,8 +969,7 @@ mod tests {
                     "2.0.0",
                     ARCHIVE,
                     "zip",
-                    DIGEST,
-                    4096,
+                    (DIGEST, 4096),
                 ),
                 UpdateError::ArchiveKindMismatch,
             ),
@@ -992,8 +982,7 @@ mod tests {
                     "2.0.0",
                     "other.tar.gz",
                     "tar.gz",
-                    DIGEST,
-                    4096,
+                    (DIGEST, 4096),
                 ),
                 UpdateError::MissingAsset,
             ),
