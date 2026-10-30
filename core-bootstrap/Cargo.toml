@@ -5,6 +5,10 @@ edition = "2021"
 publish = false
 description = "Dependency-free installation entry that starts the payload named by CURRENT"
 
+[features]
+# Shipping builds enforce the independent installation entry contract.
+packaged = []
+
 [dependencies]
 
 [[bin]]

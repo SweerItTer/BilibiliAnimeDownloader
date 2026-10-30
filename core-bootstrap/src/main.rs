@@ -15,7 +15,7 @@
 //! local DLL dependency: it is the only file the installer may replace at the
 //! installation root, and a missing runtime DLL there would break every start.
 
-#[cfg(all(windows, not(target_feature = "crt-static")))]
+#[cfg(all(windows, feature = "packaged", not(target_feature = "crt-static")))]
 compile_error!(
     "core-bootstrap must be built with `-C target-feature=+crt-static` on Windows; \
      a dynamically linked C runtime would leave the installation entry depending \
@@ -73,7 +73,7 @@ fn start(executable: &Path) -> Result<PathBuf, &'static str> {
     let current = fs::read(root.join(CURRENT)).map_err(|_| "installation pointer is missing")?;
     let text = std::str::from_utf8(&current).map_err(|_| "installation pointer is not text")?;
     let id = parse_pointer(text)?;
-    let payload = resolve(&root, &id)?;
+    let payload = resolve(&root, id)?;
     Ok(payload)
 }
 
@@ -204,9 +204,9 @@ mod tests {
         drop(file);
         assert_eq!(resolve(&root, ID).expect("payload"), entry);
 
-        let other = "v-ffffffffffffffffffffffffffffffff";
         #[cfg(unix)]
         {
+            let other = "v-ffffffffffffffffffffffffffffffff";
             let link = root.join(VERSIONS).join(other).join(PAYLOAD);
             fs::create_dir_all(link.parent().expect("payload directory"))
                 .expect("payload directory");
@@ -218,16 +218,16 @@ mod tests {
     #[test]
     fn start_requires_a_marker_in_the_installation_root() {
         let root = scratch("start");
-        let linux = root.join("bin/bili");
-        fs::create_dir_all(&root.join("bin")).expect("bin");
-        fs::write(&linux, b"bootstrap").expect("entry");
-        assert_eq!(start(&linux).err(), Some("not a packaged installation"));
+        let entry = root.join(PAYLOAD);
+        fs::create_dir_all(entry.parent().expect("entry parent")).expect("entry directory");
+        fs::write(&entry, b"bootstrap").expect("entry");
+        assert_eq!(start(&entry).err(), Some("not a packaged installation"));
 
         fs::write(root.join(MARKER), b"{}").expect("marker");
-        assert_eq!(start(&linux).err(), Some("installation pointer is missing"));
+        assert_eq!(start(&entry).err(), Some("installation pointer is missing"));
         fs::write(root.join(CURRENT), format!("{ID}\n")).expect("pointer");
         assert_eq!(
-            start(&linux).err(),
+            start(&entry).err(),
             Some("installation pointer names a payload that is not installed")
         );
     }
