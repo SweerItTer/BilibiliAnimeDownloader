@@ -1,9 +1,10 @@
-//! Anonymous GitHub release discovery for one compiled identity.
+//! Static release-index discovery for one compiled identity.
 //!
-//! The client is a dedicated anonymous authority: no cookies, no
-//! authorization, no inherited Bilibili headers, an explicit user agent and a
-//! redirect policy that only follows the GitHub hosts a release download may
-//! legitimately use. Every response body has a size bound.
+//! The client performs one bounded HTTPS GET against the official static
+//! index: no cookies, no authorization, an explicit user agent and a redirect
+//! policy that only follows the official site and GitHub hosts. The index is
+//! the only discovery source; the GitHub Releases API is never called and
+//! there is no fallback path.
 
 use super::{Channel, CheckOutcome, Descriptor, Identity, UpdateCandidate, UpdateError, PROTOCOL};
 use futures_util::StreamExt;
@@ -12,17 +13,18 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
-const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
+/// Largest static index this build accepts, after decoding.
+const MAX_INDEX_BYTES: usize = 1024 * 1024;
+/// Most releases one static index may list.
+const MAX_INDEX_RELEASES: usize = 1_000;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ASSET_NAME: usize = 128;
 const MAX_TAG: usize = 64;
-const PAGE_SIZE: usize = 100;
-const MAX_PAGES: usize = 10;
 const MAX_REDIRECTS: usize = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -32,11 +34,10 @@ const ARCHIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const ARCHIVE_DEADLINE: Duration = Duration::from_secs(60 * 60);
 const OFFICIAL_OWNER: &str = "SweerItTer";
 const OFFICIAL_NAME: &str = "BilibiliAnimeDownloader";
-const OFFICIAL_API: &str = "https://api.github.com";
+const OFFICIAL_INDEX: &str =
+    "https://sweeritter.github.io/BilibiliAnimeDownloader/updates/v1/index.json";
 const OFFICIAL_DOWNLOAD: &str = "https://github.com";
 const USER_AGENT: &str = "bili-update-protocol/1";
-const API_ACCEPT: &str = "application/vnd.github+json";
-const API_VERSION: &str = "2022-11-28";
 
 /// Source repository a product is published from.
 ///
@@ -72,21 +73,21 @@ impl Repository {
     }
 }
 
-/// Discovers releases for the official product repository.
+/// Discovers releases from the official static index.
 pub struct Updater {
     repository: Repository,
     client: Client,
     download_client: Client,
-    api_base: Url,
+    index: Url,
     download_base: Url,
 }
 
 impl Updater {
-    /// Anonymous reader for the official API and download hosts.
+    /// Anonymous reader for the official index and download hosts.
     pub fn new() -> Result<Self, UpdateError> {
         Self::build(
             Repository::official(),
-            Url::parse(OFFICIAL_API).map_err(|_| UpdateError::InvalidInput)?,
+            Url::parse(OFFICIAL_INDEX).map_err(|_| UpdateError::InvalidInput)?,
             Url::parse(OFFICIAL_DOWNLOAD).map_err(|_| UpdateError::InvalidInput)?,
             REQUEST_TIMEOUT,
         )
@@ -94,7 +95,7 @@ impl Updater {
 
     fn build(
         repository: Repository,
-        api_base: Url,
+        index: Url,
         download_base: Url,
         timeout: Duration,
     ) -> Result<Self, UpdateError> {
@@ -133,7 +134,7 @@ impl Updater {
             repository,
             client,
             download_client,
-            api_base,
+            index,
             download_base,
         })
     }
@@ -142,11 +143,11 @@ impl Updater {
     /// hosts and the fixed official repository.
     #[cfg(test)]
     pub(crate) fn with_bases(
-        api_base: Url,
+        index: Url,
         download_base: Url,
         timeout: Duration,
     ) -> Result<Self, UpdateError> {
-        Self::build(Repository::official(), api_base, download_base, timeout)
+        Self::build(Repository::official(), index, download_base, timeout)
     }
 
     /// Anonymous, cancel-safe check. Dropping the future aborts all work; no
@@ -156,18 +157,11 @@ impl Updater {
         identity: &Identity,
         channel: Channel,
     ) -> Result<CheckOutcome, UpdateError> {
-        let mut releases = Vec::new();
-        for page in 1..=MAX_PAGES {
-            let body = self.releases_page(page).await?;
-            let items: Vec<RawRelease> =
-                serde_json::from_slice(&body).map_err(|_| UpdateError::Transport)?;
-            let full = items.len() >= PAGE_SIZE;
-            releases.extend(items.into_iter().filter_map(ReleaseCandidate::parse));
-            if !full {
-                return self.select(identity, channel, releases).await;
-            }
-        }
-        Err(UpdateError::TooManyReleases)
+        let body = self
+            .get_limited(self.index.clone(), MAX_INDEX_BYTES)
+            .await?;
+        let releases = parse_index(&body)?;
+        select(identity, channel, releases)
     }
 
     /// Download location of a candidate archive on the allowlisted host.
@@ -268,98 +262,6 @@ impl Updater {
         Ok(received)
     }
 
-    async fn select(
-        &self,
-        identity: &Identity,
-        channel: Channel,
-        mut candidates: Vec<ReleaseCandidate>,
-    ) -> Result<CheckOutcome, UpdateError> {
-        let current = identity.version();
-        candidates.retain(|candidate| {
-            candidate.version.cmp_precedence(current) == Ordering::Greater
-                && channel.accepts(&candidate.version)
-        });
-        if candidates.is_empty() {
-            return Ok(CheckOutcome::UpToDate {
-                current: current.clone(),
-            });
-        }
-        candidates.sort_by(|left, right| {
-            right
-                .version
-                .cmp_precedence(&left.version)
-                .then_with(|| right.version.cmp(&left.version))
-        });
-        let descriptor_name = identity.descriptor_name();
-        for candidate in candidates {
-            match candidate
-                .assets
-                .iter()
-                .filter(|asset| asset.name == descriptor_name)
-                .count()
-            {
-                0 => continue,
-                1 => {}
-                _ => return Err(UpdateError::AmbiguousDescriptor),
-            }
-            let body = self
-                .fetch_asset(&candidate.tag, &descriptor_name, MAX_DESCRIPTOR_BYTES)
-                .await?;
-            let descriptor: Descriptor =
-                serde_json::from_slice(&body).map_err(|_| UpdateError::MalformedDescriptor)?;
-            let descriptor = validate_descriptor(descriptor, identity, &candidate.version)?;
-            let mut bound = candidate
-                .assets
-                .iter()
-                .filter(|asset| asset.name == descriptor.archive.name);
-            let asset = bound.next().ok_or(UpdateError::MissingAsset)?;
-            if bound.next().is_some() {
-                return Err(UpdateError::AmbiguousAsset);
-            }
-            // The release must advertise the exact byte count the descriptor
-            // describes; a zero or merely different size is not accepted.
-            if asset.size != descriptor.archive.size {
-                return Err(UpdateError::SizeMismatch);
-            }
-            return Ok(CheckOutcome::Available(UpdateCandidate {
-                channel: Channel::of(&candidate.version),
-                tag: candidate.tag,
-                version: candidate.version,
-                descriptor,
-            }));
-        }
-        Ok(CheckOutcome::NoCompatibleRelease {
-            current: current.clone(),
-        })
-    }
-
-    async fn releases_page(&self, page: usize) -> Result<Vec<u8>, UpdateError> {
-        let mut url = self.api_base.clone();
-        {
-            let mut segments = url
-                .path_segments_mut()
-                .map_err(|_| UpdateError::InvalidInput)?;
-            segments
-                .pop_if_empty()
-                .push("repos")
-                .push(self.repository.owner())
-                .push(self.repository.name())
-                .push("releases");
-        }
-        url.set_query(Some(&format!("per_page={PAGE_SIZE}&page={page}")));
-        self.get_limited(url, MAX_PAGE_BYTES).await
-    }
-
-    async fn fetch_asset(
-        &self,
-        tag: &str,
-        name: &str,
-        limit: usize,
-    ) -> Result<Vec<u8>, UpdateError> {
-        let url = self.download_url(tag, name)?;
-        self.get_limited(url, limit).await
-    }
-
     fn download_url(&self, tag: &str, name: &str) -> Result<Url, UpdateError> {
         if !safe_tag(tag) || !safe_asset_name(name) {
             return Err(UpdateError::UnsafeAssetName);
@@ -385,8 +287,6 @@ impl Updater {
         let response = self
             .client
             .get(url)
-            .header("accept", API_ACCEPT)
-            .header("x-github-api-version", API_VERSION)
             .send()
             .await
             .map_err(|_| UpdateError::Transport)?;
@@ -408,45 +308,108 @@ impl Updater {
     }
 }
 
-struct ReleaseCandidate {
-    version: Version,
+#[derive(Deserialize)]
+struct RawIndex {
+    schema_version: u32,
+    releases: Vec<RawIndexRelease>,
+}
+
+#[derive(Deserialize)]
+struct RawIndexRelease {
     tag: String,
-    assets: Vec<RawAsset>,
+    descriptors: Vec<Descriptor>,
 }
 
-impl ReleaseCandidate {
-    fn parse(raw: RawRelease) -> Option<Self> {
-        if raw.draft {
-            return None;
-        }
-        let version = tag_version(&raw.tag_name)?;
-        if raw.prerelease != !version.pre.is_empty() {
-            return None;
-        }
-        Some(Self {
-            version,
-            tag: raw.tag_name,
-            assets: raw.assets,
-        })
+struct IndexRelease {
+    tag: String,
+    version: Version,
+    descriptors: Vec<Descriptor>,
+}
+
+/// Parse and validate the complete static index before any selection happens.
+///
+/// A malformed document, a noncanonical or repeated tag is `MalformedIndex`; a
+/// release listing the same product and target twice is `AmbiguousDescriptor`.
+/// Unknown fields are ignored so the publisher can add metadata.
+fn parse_index(body: &[u8]) -> Result<Vec<IndexRelease>, UpdateError> {
+    let raw: RawIndex = serde_json::from_slice(body).map_err(|_| UpdateError::MalformedIndex)?;
+    if raw.schema_version != PROTOCOL {
+        return Err(UpdateError::UnsupportedSchema(raw.schema_version));
     }
+    if raw.releases.len() > MAX_INDEX_RELEASES {
+        return Err(UpdateError::TooManyReleases);
+    }
+    let mut releases = Vec::with_capacity(raw.releases.len());
+    let mut tags = HashSet::new();
+    for release in raw.releases {
+        let Some(version) = tag_version(&release.tag) else {
+            return Err(UpdateError::MalformedIndex);
+        };
+        if !tags.insert(release.tag.clone()) {
+            return Err(UpdateError::MalformedIndex);
+        }
+        let mut pairs = HashSet::new();
+        for descriptor in &release.descriptors {
+            let pair = (descriptor.product.as_str(), descriptor.target.triple());
+            if !pairs.insert(pair) {
+                return Err(UpdateError::AmbiguousDescriptor);
+            }
+        }
+        releases.push(IndexRelease {
+            tag: release.tag,
+            version,
+            descriptors: release.descriptors,
+        });
+    }
+    Ok(releases)
 }
 
-#[derive(Deserialize)]
-struct RawRelease {
-    tag_name: String,
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    prerelease: bool,
-    #[serde(default)]
-    assets: Vec<RawAsset>,
-}
-
-#[derive(Deserialize)]
-struct RawAsset {
-    name: String,
-    #[serde(default)]
-    size: u64,
+/// Pick the highest indexed release that ships a valid descriptor for the
+/// compiled identity. Missing descriptors are skipped; a matching descriptor
+/// that fails validation is an error.
+fn select(
+    identity: &Identity,
+    channel: Channel,
+    mut releases: Vec<IndexRelease>,
+) -> Result<CheckOutcome, UpdateError> {
+    let current = identity.version();
+    releases.retain(|release| {
+        release.version.cmp_precedence(current) == Ordering::Greater
+            && channel.accepts(&release.version)
+    });
+    if releases.is_empty() {
+        return Ok(CheckOutcome::UpToDate {
+            current: current.clone(),
+        });
+    }
+    releases.sort_by(|left, right| {
+        right
+            .version
+            .cmp_precedence(&left.version)
+            .then_with(|| right.version.cmp(&left.version))
+    });
+    for release in releases {
+        let IndexRelease {
+            tag,
+            version,
+            descriptors,
+        } = release;
+        let Some(descriptor) = descriptors.into_iter().find(|descriptor| {
+            descriptor.product == identity.product() && descriptor.target == identity.target()
+        }) else {
+            continue;
+        };
+        let descriptor = validate_descriptor(descriptor, identity, &version)?;
+        return Ok(CheckOutcome::Available(UpdateCandidate {
+            channel: Channel::of(&version),
+            tag,
+            version,
+            descriptor,
+        }));
+    }
+    Ok(CheckOutcome::NoCompatibleRelease {
+        current: current.clone(),
+    })
 }
 
 async fn read_limited(
@@ -546,7 +509,9 @@ fn valid_component(component: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
-/// Hosts a release request may touch. Loopback exists only for crate tests.
+/// Hosts a discovery or download request may touch. Loopback exists only for
+/// crate tests; the GitHub API host is deliberately absent because discovery
+/// never uses it.
 fn permitted(url: &Url) -> bool {
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
         return false;
@@ -554,7 +519,7 @@ fn permitted(url: &Url) -> bool {
     let host_allowed = matches!(
         url.host_str(),
         Some(
-            "api.github.com"
+            "sweeritter.github.io"
                 | "github.com"
                 | "objects.githubusercontent.com"
                 | "release-assets.githubusercontent.com"
@@ -575,18 +540,19 @@ fn permitted(url: &Url) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
 
-    const DESCRIPTOR: &str = "bili-update-cli-x86_64-unknown-linux-gnu.json";
     const ARCHIVE: &str = "bili-x86_64-unknown-linux-gnu-release.tar.gz";
     const DIGEST: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const INDEX_ROUTE: &str = "/updates/v1/index.json";
 
     struct Server {
         base: String,
+        requests: Arc<Mutex<Vec<String>>>,
         stop: Option<tokio::sync::oneshot::Sender<()>>,
         handle: tokio::task::JoinHandle<()>,
     }
@@ -594,6 +560,14 @@ mod tests {
     impl Server {
         fn api(&self) -> Url {
             Url::parse(&self.base).expect("loopback base")
+        }
+
+        fn index(&self) -> Url {
+            Url::parse(&format!("{}{INDEX_ROUTE}", self.base)).expect("loopback index")
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().expect("recorded requests").clone()
         }
     }
 
@@ -608,6 +582,8 @@ mod tests {
 
     async fn serve(routes: Vec<(String, String)>) -> Server {
         let routes: Arc<HashMap<String, String>> = Arc::new(routes.into_iter().collect());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback fixture");
@@ -631,6 +607,10 @@ mod tests {
                             .and_then(|line| line.split_whitespace().nth(1))
                             .unwrap_or_default()
                             .to_string();
+                        recorded
+                            .lock()
+                            .expect("recorded request")
+                            .push(target.clone());
                         let (status, body) = match routes.get(&target) {
                             Some(body) => match body.strip_prefix("#status=") {
                                 Some(code) => (
@@ -654,6 +634,7 @@ mod tests {
         });
         Server {
             base,
+            requests,
             stop: Some(stop),
             handle,
         }
@@ -686,33 +667,34 @@ mod tests {
         )
     }
 
-    fn release(tag: &str, draft: bool, prerelease: bool, assets: &[(&str, u64)]) -> String {
-        let assets = assets
-            .iter()
-            .map(|(name, size)| format!(r#"{{"name":"{name}","size":{size}}}"#))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            r#"{{"tag_name":"{tag}","draft":{draft},"prerelease":{prerelease},"assets":[{assets}]}}"#
+    fn gui_descriptor(version: &str) -> String {
+        descriptor(
+            PROTOCOL,
+            "gui",
+            "x86_64-unknown-linux-gnu",
+            version,
+            ARCHIVE,
+            "tar.gz",
+            (DIGEST, 4096),
         )
     }
 
-    fn page(releases: &[String]) -> String {
-        format!("[{}]", releases.join(","))
+    fn index_release(tag: &str, descriptors: &[String]) -> String {
+        format!(
+            r#"{{"tag":"{tag}","descriptors":[{}]}}"#,
+            descriptors.join(",")
+        )
     }
 
-    fn drafts(count: usize) -> Vec<String> {
-        (0..count)
-            .map(|index| release(&format!("v0.0.{index}"), true, false, &[]))
-            .collect()
+    fn index(schema: u32, releases: &[String]) -> String {
+        format!(
+            r#"{{"schema_version":{schema},"releases":[{}]}}"#,
+            releases.join(",")
+        )
     }
 
-    fn releases_route(page: usize) -> String {
-        format!("/repos/SweerItTer/BilibiliAnimeDownloader/releases?per_page=100&page={page}")
-    }
-
-    fn descriptor_route(tag: &str) -> String {
-        format!("/SweerItTer/BilibiliAnimeDownloader/releases/download/{tag}/{DESCRIPTOR}")
+    fn empty_release(tag: &str) -> String {
+        index_release(tag, &[])
     }
 
     fn identity(version: &str) -> Identity {
@@ -727,7 +709,7 @@ mod tests {
     async fn updater(routes: Vec<(String, String)>) -> (Server, Updater) {
         let server = serve(routes).await;
         let updater = Updater::with_bases(
-            server.api(),
+            server.index(),
             server.api(),
             std::time::Duration::from_secs(5),
         )
@@ -743,40 +725,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stable_and_pre_release_channels_pick_their_highest_match() {
-        let routes = vec![
-            (
-                releases_route(1),
-                page(&[
-                    release(
+    async fn one_index_request_selects_by_channel_and_precedence() {
+        let routes = vec![(
+            INDEX_ROUTE.to_string(),
+            index(
+                1,
+                &[
+                    index_release(
                         "v2.1.0-alpha.1",
-                        false,
-                        true,
-                        &[(DESCRIPTOR, 512), (ARCHIVE, 4096)],
+                        &[descriptor(
+                            PROTOCOL,
+                            "cli",
+                            "x86_64-unknown-linux-gnu",
+                            "2.1.0-alpha.1",
+                            ARCHIVE,
+                            "tar.gz",
+                            (DIGEST, 4096),
+                        )],
                     ),
-                    release(
-                        "v2.0.0",
-                        false,
-                        false,
-                        &[(DESCRIPTOR, 512), (ARCHIVE, 4096)],
-                    ),
-                ]),
+                    index_release("v2.0.0", &[valid_descriptor("2.0.0")]),
+                ],
             ),
-            (descriptor_route("v2.0.0"), valid_descriptor("2.0.0")),
-            (
-                descriptor_route("v2.1.0-alpha.1"),
-                descriptor(
-                    PROTOCOL,
-                    "cli",
-                    "x86_64-unknown-linux-gnu",
-                    "2.1.0-alpha.1",
-                    ARCHIVE,
-                    "tar.gz",
-                    (DIGEST, 4096),
-                ),
-            ),
-        ];
-        let (_server, updater) = updater(routes).await;
+        )];
+        let (server, updater) = updater(routes).await;
         let current = identity("2.0.0-alpha.6");
 
         let stable = updater
@@ -794,25 +765,46 @@ mod tests {
         let preview = preview.candidate().expect("preview candidate");
         assert_eq!(preview.version, Version::parse("2.1.0-alpha.1").unwrap());
         assert_eq!(preview.channel, Channel::PreRelease);
+
+        assert_eq!(
+            server.requests(),
+            vec![INDEX_ROUTE.to_string(); 2],
+            "each check performs exactly one index request"
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_order_publication_still_picks_the_highest_version() {
+        let routes = vec![(
+            INDEX_ROUTE.to_string(),
+            index(
+                1,
+                &[
+                    index_release("v2.0.1", &[valid_descriptor("2.0.1")]),
+                    index_release("v1.9.0", &[valid_descriptor("1.9.0")]),
+                    index_release("v2.0.0", &[valid_descriptor("2.0.0")]),
+                ],
+            ),
+        )];
+        let outcome = single(routes).await.expect("check");
+        assert_eq!(
+            outcome.candidate().expect("candidate").version,
+            Version::parse("2.0.1").unwrap()
+        );
     }
 
     #[tokio::test]
     async fn build_metadata_is_not_an_upgrade() {
-        let routes = vec![
-            (
-                releases_route(1),
-                page(&[release(
+        let routes = vec![(
+            INDEX_ROUTE.to_string(),
+            index(
+                1,
+                &[index_release(
                     "v2.0.0+build.2",
-                    false,
-                    false,
-                    &[(DESCRIPTOR, 512), (ARCHIVE, 4096)],
-                )]),
+                    &[valid_descriptor("2.0.0+build.2")],
+                )],
             ),
-            (
-                descriptor_route("v2.0.0+build.2"),
-                valid_descriptor("2.0.0+build.2"),
-            ),
-        ];
+        )];
         let (_server, updater) = updater(routes).await;
         let outcome = updater
             .check(&identity("2.0.0+build.1"), Channel::Stable)
@@ -824,43 +816,59 @@ mod tests {
     #[tokio::test]
     async fn older_release_is_never_offered() {
         let routes = vec![(
-            releases_route(1),
-            page(&[release("v2.0.0-alpha.5", false, true, &[(DESCRIPTOR, 512)])]),
+            INDEX_ROUTE.to_string(),
+            index(1, &[empty_release("v2.0.0-alpha.5")]),
         )];
         let outcome = single(routes).await.expect("check");
         assert!(matches!(outcome, CheckOutcome::UpToDate { .. }));
     }
 
     #[tokio::test]
-    async fn draft_and_mismatched_prerelease_flags_are_ignored() {
-        let routes = vec![
-            (
-                releases_route(1),
-                page(&[
-                    release("v2.0.0", true, false, &[(DESCRIPTOR, 512)]),
-                    release("v2.1.0-alpha.1", false, false, &[(DESCRIPTOR, 512)]),
-                    release("v2.2.0", false, true, &[(DESCRIPTOR, 512)]),
-                ]),
+    async fn newer_gui_only_release_does_not_block_an_older_cli_release() {
+        let routes = vec![(
+            INDEX_ROUTE.to_string(),
+            index(
+                1,
+                &[
+                    index_release("v2.1.0", &[gui_descriptor("2.1.0")]),
+                    index_release("v2.0.0", &[valid_descriptor("2.0.0")]),
+                ],
             ),
-            (descriptor_route("v2.0.0"), valid_descriptor("2.0.0")),
-        ];
-        let outcome = single(routes).await.expect("check");
-        assert!(matches!(outcome, CheckOutcome::UpToDate { .. }));
+        )];
+        let (server, updater) = updater(routes).await;
+        let current = identity("2.0.0-alpha.6");
+
+        let cli = updater
+            .check(&current, Channel::Stable)
+            .await
+            .expect("cli check");
+        assert_eq!(
+            cli.candidate().expect("cli candidate").version,
+            Version::parse("2.0.0").unwrap()
+        );
+
+        let gui = Identity::new(
+            super::super::Product::Gui,
+            super::super::Target::LinuxX86_64Gnu,
+            "2.0.0-alpha.6",
+        )
+        .expect("gui identity");
+        let gui = updater
+            .check(&gui, Channel::Stable)
+            .await
+            .expect("gui check");
+        assert_eq!(
+            gui.candidate().expect("gui candidate").version,
+            Version::parse("2.1.0").unwrap()
+        );
+        drop(server);
     }
 
     #[tokio::test]
-    async fn release_without_this_product_descriptor_is_not_up_to_date() {
+    async fn cli_identity_never_selects_a_gui_descriptor() {
         let routes = vec![(
-            releases_route(1),
-            page(&[release(
-                "v2.0.0",
-                false,
-                false,
-                &[
-                    ("bili-update-gui-x86_64-unknown-linux-gnu.json", 512),
-                    (ARCHIVE, 4096),
-                ],
-            )]),
+            INDEX_ROUTE.to_string(),
+            index(1, &[index_release("v2.0.0", &[gui_descriptor("2.0.0")])]),
         )];
         let outcome = single(routes).await.expect("check");
         assert!(matches!(outcome, CheckOutcome::NoCompatibleRelease { .. }));
@@ -881,32 +889,6 @@ mod tests {
                     (DIGEST, 4096),
                 ),
                 UpdateError::UnsupportedSchema(2),
-            ),
-            (
-                "product",
-                descriptor(
-                    PROTOCOL,
-                    "gui",
-                    "x86_64-unknown-linux-gnu",
-                    "2.0.0",
-                    ARCHIVE,
-                    "tar.gz",
-                    (DIGEST, 4096),
-                ),
-                UpdateError::ProductMismatch,
-            ),
-            (
-                "target",
-                descriptor(
-                    PROTOCOL,
-                    "cli",
-                    "x86_64-pc-windows-msvc",
-                    "2.0.0",
-                    ARCHIVE,
-                    "tar.gz",
-                    (DIGEST, 4096),
-                ),
-                UpdateError::TargetMismatch,
             ),
             (
                 "version",
@@ -935,7 +917,7 @@ mod tests {
                 UpdateError::DigestMismatch,
             ),
             (
-                "size",
+                "zero size",
                 descriptor(
                     PROTOCOL,
                     "cli",
@@ -944,6 +926,19 @@ mod tests {
                     ARCHIVE,
                     "tar.gz",
                     (DIGEST, 0),
+                ),
+                UpdateError::SizeMismatch,
+            ),
+            (
+                "oversized",
+                descriptor(
+                    PROTOCOL,
+                    "cli",
+                    "x86_64-unknown-linux-gnu",
+                    "2.0.0",
+                    ARCHIVE,
+                    "tar.gz",
+                    (DIGEST, MAX_ARCHIVE_BYTES + 1),
                 ),
                 UpdateError::SizeMismatch,
             ),
@@ -974,79 +969,76 @@ mod tests {
                 UpdateError::ArchiveKindMismatch,
             ),
             (
-                "missing",
-                descriptor(
-                    PROTOCOL,
-                    "cli",
-                    "x86_64-unknown-linux-gnu",
-                    "2.0.0",
-                    "other.tar.gz",
-                    "tar.gz",
-                    (DIGEST, 4096),
-                ),
-                UpdateError::MissingAsset,
-            ),
-            (
-                "malformed",
-                String::from("not json"),
-                UpdateError::MalformedDescriptor,
+                "shape",
+                String::from(r#"{"schema_version":1}"#),
+                UpdateError::MalformedIndex,
             ),
         ];
         for (label, body, expected) in cases {
-            let routes = vec![
-                (
-                    releases_route(1),
-                    page(&[release(
-                        "v2.0.0",
-                        false,
-                        false,
-                        &[(DESCRIPTOR, 512), (ARCHIVE, 4096)],
-                    )]),
-                ),
-                (descriptor_route("v2.0.0"), body),
-            ];
+            let routes = vec![(
+                INDEX_ROUTE.to_string(),
+                index(1, &[index_release("v2.0.0", &[body])]),
+            )];
             let error = single(routes).await.expect_err(label);
             assert_eq!(error, expected, "case {label}");
         }
     }
 
-    #[tokio::test]
-    async fn zero_sized_archive_asset_is_not_accepted() {
-        let routes = vec![
+    #[test]
+    fn descriptor_identity_disagreement_fails_validation() {
+        let current = identity("2.0.0-alpha.6");
+        let tag = Version::parse("2.0.0").expect("version");
+        let cases = [
             (
-                releases_route(1),
-                page(&[release(
-                    "v2.0.0",
-                    false,
-                    false,
-                    &[(DESCRIPTOR, 512), (ARCHIVE, 0)],
-                )]),
+                descriptor(
+                    PROTOCOL,
+                    "gui",
+                    "x86_64-unknown-linux-gnu",
+                    "2.0.0",
+                    ARCHIVE,
+                    "tar.gz",
+                    (DIGEST, 4096),
+                ),
+                UpdateError::ProductMismatch,
             ),
-            (descriptor_route("v2.0.0"), valid_descriptor("2.0.0")),
+            (
+                descriptor(
+                    PROTOCOL,
+                    "cli",
+                    "x86_64-pc-windows-msvc",
+                    "2.0.0",
+                    ARCHIVE,
+                    "tar.gz",
+                    (DIGEST, 4096),
+                ),
+                UpdateError::TargetMismatch,
+            ),
         ];
-        assert_eq!(
-            single(routes).await.expect_err("unpublished size"),
-            UpdateError::SizeMismatch
-        );
+        for (body, expected) in cases {
+            let descriptor: Descriptor = serde_json::from_str(&body).expect("descriptor");
+            assert_eq!(
+                validate_descriptor(descriptor, &current, &tag),
+                Err(expected),
+                "{body}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn duplicate_archive_assets_are_ambiguous() {
-        let routes = vec![
-            (
-                releases_route(1),
-                page(&[release(
+    async fn duplicate_descriptors_within_a_release_are_ambiguous() {
+        let routes = vec![(
+            INDEX_ROUTE.to_string(),
+            index(
+                1,
+                &[index_release(
                     "v2.0.0",
-                    false,
-                    false,
-                    &[(DESCRIPTOR, 512), (ARCHIVE, 4096), (ARCHIVE, 4096)],
-                )]),
+                    &[valid_descriptor("2.0.0"), valid_descriptor("2.0.0")],
+                )],
             ),
-            (descriptor_route("v2.0.0"), valid_descriptor("2.0.0")),
-        ];
+        )];
         assert_eq!(
-            single(routes).await.expect_err("ambiguous archive"),
-            UpdateError::AmbiguousAsset
+            single(routes).await.expect_err("ambiguous"),
+            UpdateError::AmbiguousDescriptor
         );
     }
 
@@ -1054,7 +1046,7 @@ mod tests {
     async fn a_stalled_response_is_bounded() {
         let server = serve_stall().await;
         let updater = Updater::with_bases(
-            server.api(),
+            server.index(),
             server.api(),
             std::time::Duration::from_millis(200),
         )
@@ -1067,6 +1059,107 @@ mod tests {
         assert_eq!(error, UpdateError::Transport);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         drop(server);
+    }
+
+    #[tokio::test]
+    async fn invalid_index_shapes_and_schemas_are_explicit() {
+        for body in [
+            String::from("not json"),
+            String::from("[]"),
+            String::from("{}"),
+            String::from(r#"{"schema_version":1}"#),
+            String::from(r#"{"schema_version":1,"releases":{}}"#),
+        ] {
+            let routes = vec![(INDEX_ROUTE.to_string(), body.clone())];
+            assert_eq!(
+                single(routes).await.expect_err("malformed"),
+                UpdateError::MalformedIndex,
+                "{body}"
+            );
+        }
+        let routes = vec![(INDEX_ROUTE.to_string(), index(2, &[]))];
+        assert_eq!(
+            single(routes).await.expect_err("schema"),
+            UpdateError::UnsupportedSchema(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn noncanonical_or_duplicate_tags_are_malformed() {
+        for release in [
+            empty_release("2.0.0"),
+            empty_release("v2.0"),
+            empty_release("v2.0.0 "),
+        ] {
+            let routes = vec![(
+                INDEX_ROUTE.to_string(),
+                index(1, std::slice::from_ref(&release)),
+            )];
+            assert_eq!(
+                single(routes).await.expect_err("tag"),
+                UpdateError::MalformedIndex,
+                "{release}"
+            );
+        }
+        let routes = vec![(
+            INDEX_ROUTE.to_string(),
+            index(1, &[empty_release("v2.0.0"), empty_release("v2.0.0")]),
+        )];
+        assert_eq!(
+            single(routes).await.expect_err("duplicate tag"),
+            UpdateError::MalformedIndex
+        );
+    }
+
+    #[tokio::test]
+    async fn release_count_bound_is_explicit() {
+        let at_limit: Vec<String> = (0..MAX_INDEX_RELEASES)
+            .map(|index| empty_release(&format!("v0.0.{index}")))
+            .collect();
+        let routes = vec![(INDEX_ROUTE.to_string(), index(1, &at_limit))];
+        assert!(matches!(
+            single(routes).await.expect("at the limit"),
+            CheckOutcome::UpToDate { .. }
+        ));
+
+        let over_limit: Vec<String> = (0..=MAX_INDEX_RELEASES)
+            .map(|index| empty_release(&format!("v0.0.{index}")))
+            .collect();
+        let routes = vec![(INDEX_ROUTE.to_string(), index(1, &over_limit))];
+        assert_eq!(
+            single(routes).await.expect_err("over the limit"),
+            UpdateError::TooManyReleases
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_index_is_rejected() {
+        let routes = vec![(INDEX_ROUTE.to_string(), " ".repeat(MAX_INDEX_BYTES + 1))];
+        assert_eq!(
+            single(routes).await.expect_err("oversized"),
+            UpdateError::ResponseTooLarge
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_index_fields_are_ignored() {
+        let descriptor = valid_descriptor("2.0.0");
+        let descriptor = descriptor.strip_suffix('}').expect("descriptor object");
+        let descriptor = format!(r#"{descriptor},"packaged_at":"ignored"}}"#);
+        let body = format!(
+            r#"{{"schema_version":1,"releases":[{{"tag":"v2.0.0","descriptors":[{descriptor}],"future":7}}],"future":true}}"#
+        );
+        let routes = vec![(INDEX_ROUTE.to_string(), body)];
+        let (server, updater) = updater(routes).await;
+        let outcome = updater
+            .check(&identity("2.0.0-alpha.6"), Channel::Stable)
+            .await
+            .expect("check");
+        assert_eq!(
+            outcome.candidate().expect("candidate").version,
+            Version::parse("2.0.0").unwrap()
+        );
+        assert_eq!(server.requests(), vec![INDEX_ROUTE.to_string()]);
     }
 
     #[test]
@@ -1099,6 +1192,7 @@ mod tests {
     }
 
     async fn serve_stall() -> Server {
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stall fixture");
@@ -1124,86 +1218,14 @@ mod tests {
         });
         Server {
             base,
+            requests,
             stop: Some(stop),
             handle,
         }
     }
 
     #[tokio::test]
-    async fn descriptor_size_must_match_the_release_asset() {
-        let routes = vec![
-            (
-                releases_route(1),
-                page(&[release(
-                    "v2.0.0",
-                    false,
-                    false,
-                    &[(DESCRIPTOR, 512), (ARCHIVE, 2048)],
-                )]),
-            ),
-            (descriptor_route("v2.0.0"), valid_descriptor("2.0.0")),
-        ];
-        assert_eq!(
-            single(routes).await.expect_err("size mismatch"),
-            UpdateError::SizeMismatch
-        );
-    }
-
-    #[tokio::test]
-    async fn duplicate_descriptors_are_ambiguous() {
-        let routes = vec![(
-            releases_route(1),
-            page(&[release(
-                "v2.0.0",
-                false,
-                false,
-                &[(DESCRIPTOR, 512), (DESCRIPTOR, 512), (ARCHIVE, 4096)],
-            )]),
-        )];
-        assert_eq!(
-            single(routes).await.expect_err("ambiguous"),
-            UpdateError::AmbiguousDescriptor
-        );
-    }
-
-    #[tokio::test]
-    async fn paging_reads_past_a_full_first_page() {
-        let mut first = drafts(99);
-        first.push(release("v1.9.0", false, false, &[]));
-        let routes = vec![
-            (releases_route(1), page(&first)),
-            (
-                releases_route(2),
-                page(&[release(
-                    "v2.0.0",
-                    false,
-                    false,
-                    &[(DESCRIPTOR, 512), (ARCHIVE, 4096)],
-                )]),
-            ),
-            (descriptor_route("v2.0.0"), valid_descriptor("2.0.0")),
-        ];
-        let outcome = single(routes).await.expect("paged check");
-        assert_eq!(
-            outcome.candidate().expect("candidate").version,
-            Version::parse("2.0.0").unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn page_limit_is_an_error_not_an_up_to_date_answer() {
-        let mut routes = Vec::new();
-        for index in 1..=MAX_PAGES {
-            routes.push((releases_route(index), page(&drafts(PAGE_SIZE))));
-        }
-        assert_eq!(
-            single(routes).await.expect_err("page limit"),
-            UpdateError::TooManyReleases
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_route_is_a_status_not_an_up_to_date_answer() {
+    async fn missing_index_is_a_status_not_an_up_to_date_answer() {
         let (server, updater) = updater(Vec::new()).await;
         let error = updater
             .check(&identity("2.0.0-alpha.6"), Channel::Stable)
@@ -1215,7 +1237,7 @@ mod tests {
 
     #[tokio::test]
     async fn exhausted_anonymous_quota_is_a_rate_limit() {
-        let routes = vec![(releases_route(1), String::from("#status=429\n"))];
+        let routes = vec![(INDEX_ROUTE.to_string(), String::from("#status=429\n"))];
         assert_eq!(
             single(routes).await.expect_err("rate limit"),
             UpdateError::RateLimited
@@ -1223,9 +1245,9 @@ mod tests {
     }
 
     #[test]
-    fn only_github_hosts_and_crate_loopback_pass_the_redirect_policy() {
+    fn only_official_hosts_and_crate_loopback_pass_the_redirect_policy() {
         for allowed in [
-            "https://api.github.com/repos/x",
+            "https://sweeritter.github.io/BilibiliAnimeDownloader/updates/v1/index.json",
             "https://github.com/x/y/releases/download/v1/a.tar.gz",
             "https://objects.githubusercontent.com/x",
             "https://release-assets.githubusercontent.com/x",
@@ -1233,6 +1255,7 @@ mod tests {
             assert!(permitted(&Url::parse(allowed).expect("url")), "{allowed}");
         }
         for rejected in [
+            "https://api.github.com/repos/x",
             "http://github.com/x",
             "https://evil.example/x",
             "https://user:pass@github.com/x",
@@ -1248,18 +1271,10 @@ mod tests {
 
     #[tokio::test]
     async fn archive_url_stays_on_the_allowlisted_download_base() {
-        let routes = vec![
-            (
-                releases_route(1),
-                page(&[release(
-                    "v2.0.0",
-                    false,
-                    false,
-                    &[(DESCRIPTOR, 512), (ARCHIVE, 4096)],
-                )]),
-            ),
-            (descriptor_route("v2.0.0"), valid_descriptor("2.0.0")),
-        ];
+        let routes = vec![(
+            INDEX_ROUTE.to_string(),
+            index(1, &[index_release("v2.0.0", &[valid_descriptor("2.0.0")])]),
+        )];
         let (server, updater) = updater(routes).await;
         let outcome = updater
             .check(&identity("2.0.0-alpha.6"), Channel::Stable)
@@ -1311,7 +1326,7 @@ mod tests {
             String::from_utf8(bytes.clone()).expect("text fixture"),
         )])
         .await;
-        let updater = Updater::with_bases(server.api(), server.api(), Duration::from_millis(200))
+        let updater = Updater::with_bases(server.index(), server.api(), Duration::from_millis(200))
             .expect("updater");
         let directory = tempfile::TempDir::new().expect("tempdir");
         let destination = directory.path().join("release.tar.gz");
@@ -1333,7 +1348,7 @@ mod tests {
             String::from_utf8(bytes.clone()).expect("text fixture"),
         )])
         .await;
-        let updater = Updater::with_bases(server.api(), server.api(), Duration::from_millis(200))
+        let updater = Updater::with_bases(server.index(), server.api(), Duration::from_millis(200))
             .expect("updater");
         let directory = tempfile::TempDir::new().expect("tempdir");
         let destination = directory.path().join("release.tar.gz");

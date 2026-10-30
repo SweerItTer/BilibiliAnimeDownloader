@@ -91,10 +91,9 @@ fn map_update(error: UpdateError) -> CoreError {
             "update service returned an error status",
         ),
         UpdateError::RateLimited => (ErrorCode::Transport, "update service quota is exhausted"),
-        UpdateError::TooManyReleases => (
-            ErrorCode::Transport,
-            "release listing exceeds the supported page limit",
-        ),
+        UpdateError::TooManyReleases => {
+            (ErrorCode::Transport, "update index lists too many releases")
+        }
         UpdateError::ResponseTooLarge => (
             ErrorCode::Transport,
             "update response exceeds its size bound",

@@ -1,9 +1,10 @@
-//! Anonymous release discovery and reminder bookkeeping shared by every shell.
+//! Static release-index discovery and reminder bookkeeping shared by every shell.
 //!
-//! This module decides what a shell may offer to install, determines whether a
-//! user-visible reminder is due, and exposes `Updater::download` for archive
-//! retrieval. It does not extract or replace a running installation or spawn
-//! its own task: the caller owns the runtime, one-second budget and install transaction.
+//! This module decides what a shell may offer to install from the official
+//! static index, determines whether a user-visible reminder is due, and exposes
+//! `Updater::download` for archive retrieval. It does not extract or replace a
+//! running installation or spawn its own task: the caller owns the runtime,
+//! one-second budget and install transaction.
 //!
 //! Trust boundary: the compiled product, target and version are supplied by the
 //! shell. A remote descriptor is only ever *checked against* that identity, so
@@ -29,7 +30,7 @@ pub const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UpdateError {
-    /// Request could not be sent, the connection failed or the body was not JSON.
+    /// Request could not be sent or the connection failed.
     Transport,
     /// Response carried a status that is neither success nor a rate-limit reply.
     HttpStatus(u16),
@@ -37,15 +38,15 @@ pub enum UpdateError {
     Timeout,
     /// Upstream refused the request because the anonymous budget is exhausted.
     RateLimited,
-    /// More release pages exist than this build is willing to enumerate.
+    /// The static index lists more releases than this build accepts.
     TooManyReleases,
     /// A remote document exceeded its size bound.
     ResponseTooLarge,
-    /// Descriptor is not valid JSON or misses a required field.
-    MalformedDescriptor,
-    /// A release shipped more than one descriptor for this product and target.
+    /// The static index is not valid JSON, has an invalid shape or repeats a tag.
+    MalformedIndex,
+    /// A release lists more than one descriptor for this product and target.
     AmbiguousDescriptor,
-    /// Descriptor schema is newer than this build understands.
+    /// Document schema is newer than this build understands.
     UnsupportedSchema(u32),
     /// Descriptor belongs to a different product.
     ProductMismatch,
@@ -59,12 +60,8 @@ pub enum UpdateError {
     ArchiveKindMismatch,
     /// Archive digest is not a lowercase SHA-256 hex string.
     DigestMismatch,
-    /// Archive size is zero, above the bound, or disagrees with the release.
+    /// Archive size is zero, above the bound, or disagrees with the transfer.
     SizeMismatch,
-    /// Descriptor names an archive the release does not publish.
-    MissingAsset,
-    /// A release advertises more than one asset with the descriptor's name.
-    AmbiguousAsset,
     /// Reminder state is locked by another process right now.
     Busy,
     /// Local filesystem access failed.
@@ -102,11 +99,11 @@ impl fmt::Display for UpdateError {
             Self::HttpStatus(_) => "update response status",
             Self::Timeout => "update transfer exceeded its time budget",
             Self::RateLimited => "update anonymous quota exhausted",
-            Self::TooManyReleases => "release listing exceeds the supported page limit",
+            Self::TooManyReleases => "update index lists too many releases",
             Self::ResponseTooLarge => "update response exceeds its size bound",
-            Self::MalformedDescriptor => "update descriptor is malformed",
+            Self::MalformedIndex => "update index is malformed",
             Self::AmbiguousDescriptor => "release publishes conflicting descriptors",
-            Self::UnsupportedSchema(_) => "update descriptor schema is unsupported",
+            Self::UnsupportedSchema(_) => "update schema is unsupported",
             Self::ProductMismatch => "update descriptor belongs to another product",
             Self::TargetMismatch => "update descriptor belongs to another target",
             Self::VersionMismatch => "update descriptor version disagrees with its tag",
@@ -114,8 +111,6 @@ impl fmt::Display for UpdateError {
             Self::ArchiveKindMismatch => "update archive format is impossible for the target",
             Self::DigestMismatch => "update archive digest is not a SHA-256 hex string",
             Self::SizeMismatch => "update archive size is implausible or disagrees",
-            Self::MissingAsset => "update descriptor names an unpublished archive",
-            Self::AmbiguousAsset => "release publishes duplicate archive assets",
             Self::Busy => "update reminder state is busy",
             Self::Filesystem => "update local filesystem failure",
             Self::InvalidInput => "update identity input is invalid",
