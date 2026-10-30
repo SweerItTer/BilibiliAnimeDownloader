@@ -555,7 +555,9 @@ impl InstallLock {
             })?;
         match file.try_lock_exclusive() {
             Ok(()) => Ok(Self { file }),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(InstallError::Busy),
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                Err(InstallError::Busy)
+            }
             Err(_) => Err(InstallError::Filesystem),
         }
     }
