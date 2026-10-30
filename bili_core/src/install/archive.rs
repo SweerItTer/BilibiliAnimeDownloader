@@ -214,14 +214,9 @@ impl Sink {
             return Err(InstallError::ArchiveLayout);
         }
         let absolute = self.absolute(&relative);
-        symlink(target, &absolute).map_err(|_| InstallError::ArchiveLayout)?;
-        // The link must resolve inside the extracted tree, not merely lexically.
-        let resolved = fs::canonicalize(&absolute).map_err(|_| InstallError::ArchiveLayout)?;
-        let root = fs::canonicalize(&self.destination).map_err(|_| InstallError::Filesystem)?;
-        if !resolved.starts_with(&root) {
-            return Err(InstallError::ArchiveLayout);
-        }
-        Ok(())
+        // A file target may appear later in the archive. The complete tree is
+        // checked by check_links before inventory validation or activation.
+        symlink(target, &absolute).map_err(|_| InstallError::ArchiveLayout)
     }
 
     /// Create missing parent directories, refusing to write through a symlink.

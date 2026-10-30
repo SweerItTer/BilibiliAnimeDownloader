@@ -128,6 +128,7 @@ Absent keys keep these defaults, so older settings files stay valid. The root ob
 - The root is found by walking up at most five directories from the running executable. There is no install-prefix override and no marker search elsewhere.
 - `bin/bili` (Linux) or `bili.exe` (Windows) is the payload entry; the native library closure lives with it in the same version directory.
 - The transaction verifies the archive's size, digest and layout, expands it into the private staging directory, checks every payload identity, runs the caller's `validate` callback, and only then replaces `CURRENT` with a single rename. A failure before that rename leaves the previous pointer untouched.
+- Tar file symlinks may precede their target entries. Extraction checks lexical containment and refuses writes through symlink parents; after the complete archive is extracted, `archive::check_links` must reject dangling, cyclic, directory and out-of-tree targets before inventory validation or the staged callback. Do not require a symlink target to exist while later archive entries are still pending.
 - Files outside the layout are never touched. No automatic rollback, no background daemon and no startup repair process is part of this protocol.
 
 ### Identity and the shell's validation callback
@@ -151,6 +152,7 @@ Automatic reminders are shell policy: human terminal only, never with machine-re
 | Running executable not in a packaged installation | `InstallError::NotPackaged` |
 | Marker or `CURRENT` missing or mismatched | `InstallError::{MarkerInvalid, CurrentInvalid, MarkerMismatch}` |
 | Candidate not newer, payload identity disagrees, layout or inventory wrong, digest wrong | `InstallError::{Downgrade, PayloadIdentity, ArchiveLayout, InventoryMismatch, ArchiveDigest}` |
+| File symlink is dangling, cyclic, resolves to a directory or escapes the extracted tree | `InstallError::ArchiveLayout` |
 | Validation callback rejected the staged payload | `InstallError::Validator` |
 
 Shells map these to their own exit codes; the CLI uses 2 only for local input and configuration errors, and 4 for remote, remote-metadata, lock, corruption and filesystem failures. Error text is static: no URL, header, body or credential ever reaches a message.
@@ -166,6 +168,8 @@ Bad: a shell parses release assets itself, compares versions with `Ord` (build m
 ## 6. Tests
 
 Covered by focused tests at the owning boundaries: channel union and precedence, build metadata, drafts and inconsistent flags, missing descriptors, descriptor defects, duplicate descriptors and archives, paging past a full first page, page-budget failure, rate limiting, redirect allow-list, reminder intervals, failed-check throttling, per-channel deduplication, busy locks, clock rollback, corrupt state, settings compatibility, flag strictness, exit-code classes, and doctor envelope/size rejection.
+
+`archive_file_links_can_precede_targets_but_must_resolve` must place a tar symlink before its target, accept the contained file once extraction finishes, read the linked bytes, and reject a target that remains missing. The real Linux package exposed this ordering assumption; an archive test that writes every target first cannot regress it.
 
 Observed results (2026-10-30): 50 focused `bili_core` tests, 3 `core-bootstrap` tests, 17 CLI tests, CLI-scoped Clippy, 18 Python tests, actionlint for both workflows, and final formatting passed. The workspace Clippy run exited 101 at `core-bootstrap/src/main.rs:76` on `resolve(&root, &id)` (`needless_borrow`); it does not establish Clippy results for other workspace crates.
 

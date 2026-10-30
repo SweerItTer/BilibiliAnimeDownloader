@@ -921,6 +921,51 @@ fn pointer_grammar_accepts_one_newline_only() {
     assert_eq!(VersionId::random().as_str().len(), 34);
 }
 
+#[cfg(unix)]
+#[test]
+fn archive_file_links_can_precede_targets_but_must_resolve() {
+    for target in ["libcodec.so.1", "missing.so"] {
+        let work = TempDir::new().expect("tempdir");
+        let archive = work.path().join("links.tar.gz");
+        tar_with(
+            &archive,
+            &[
+                (
+                    "top/libcodec.so",
+                    tar::EntryType::Symlink,
+                    b"".as_ref(),
+                    Some(target),
+                ),
+                (
+                    "top/libcodec.so.1",
+                    tar::EntryType::Regular,
+                    b"library bytes".as_ref(),
+                    None,
+                ),
+            ],
+        );
+        let tree = archive::extract(
+            &archive,
+            ArchiveKind::TarGz,
+            &work.path().join("extracted"),
+            TARGET,
+        )
+        .expect("extract entries before resolving file links");
+        if target == "missing.so" {
+            assert_eq!(
+                archive::check_links(&tree),
+                Err(InstallError::ArchiveLayout)
+            );
+        } else {
+            archive::check_links(&tree).expect("contained file link");
+            assert_eq!(
+                fs::read(tree.join("libcodec.so")).expect("linked library"),
+                b"library bytes"
+            );
+        }
+    }
+}
+
 #[test]
 fn symlinks_inside_a_payload_are_verified_through_their_targets() {
     let installed = Installed::new(TARGET);

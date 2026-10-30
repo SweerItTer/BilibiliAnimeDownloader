@@ -12,6 +12,7 @@
 - Recheck the selected version under the installation lock to prevent stale updaters from activating an older payload; validate staged payloads against the candidate identity.
 - Isolate staged doctor checks from the developer working directory and DLL search path.
 - Restore ordinary Windows workspace checks while retaining static CRT enforcement for shipping bootstraps; correct cross-platform bootstrap tests and updater Clippy failures.
+- Accept Linux update archives whose file symlinks precede their targets; retain final checks for missing, cyclic, directory and out-of-tree link targets.
 
 ### 💥 Breaking Changes
 
