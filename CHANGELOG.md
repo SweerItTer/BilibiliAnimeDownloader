@@ -14,6 +14,7 @@
 - Fill a missing `support_formats` description from the same-ID accepted-quality description instead of exposing a placeholder label; richer per-format descriptions still win.
 - Recheck the selected version under the installation lock to prevent stale updaters from activating an older payload; validate staged payloads against the candidate identity.
 - Isolate staged doctor checks from the developer working directory and DLL search path.
+- Keep canonical Windows executable paths when validating staged updates and starting installed payloads, so deeply nested directories do not fail at process creation. Retain complete package/native checks and preserve the old version before activation.
 - Restore ordinary Windows workspace checks while retaining static CRT enforcement for shipping bootstraps; correct cross-platform bootstrap tests and updater Clippy failures.
 - Accept Linux update archives whose file symlinks precede their targets; retain final checks for missing, cyclic, directory and out-of-tree link targets.
 
@@ -24,10 +25,11 @@
 ### 📝 Documentation
 
 - Add community conduct, contribution, security and accessibility guidance, plus issue forms and a pull request template.
-- Document qualified Linux CLI updates and the future GUI's shared static protocol, product isolation and headless validation; defer Windows self-update design and acceptance while retaining its unresolved test evidence.
+- Document the shared CLI update protocol, Windows path handling and reproducible offline package acceptance; retain historical Linux/Windows results and the future GUI's product isolation and headless validation contract.
 
 ### 📦 Build/Packaging
 
+- Fingerprint native compiler version output as bytes so localized MSVC diagnostics do not fail the FFmpeg source build when their encoding differs from Python's locale.
 - Narrow Tokio features while keeping `rt-multi-thread` enabled for the `bili_core` SDK consumer; move only test-only `net` to dev-dependencies. Remove unused GUI `image` and Tokio dependencies while retaining JPEG, PNG, WebP, GIF, and eframe backends. This removes 21 lockfile packages with no dependency upgrades.
 - Stage Linux and Windows CLI downloads with their matching FFmpeg source and product-only checksums; leave the separately developed Windows GUI unmodified and unpublished.
 - Emit a `bili-update-cli-<target>.json` descriptor beside each CLI package, check it against the packaged CLI's own `--json doctor` identity, and cover it in the product checksums.

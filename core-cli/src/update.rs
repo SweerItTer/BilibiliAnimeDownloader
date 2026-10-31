@@ -5,6 +5,9 @@
 //! staged-payload runtime check, and how a failure is presented. It never
 //! writes the installation marker or `CURRENT` itself.
 
+#[cfg(all(test, windows))]
+mod package_tests;
+
 use crate::args::{Cli, Command};
 use crate::output;
 use bili_core::install::{self, InstallError, InstallRoot, Installed, Staged};
@@ -123,6 +126,22 @@ fn map_install(error: InstallError) -> CoreError {
         InstallError::Downgrade => (
             ErrorCode::Conflict,
             "update candidate is not newer than the running version",
+        ),
+        InstallError::ArchiveLayout => (
+            ErrorCode::Corruption,
+            "update archive layout is unsafe or unsupported",
+        ),
+        InstallError::InventoryMismatch => (
+            ErrorCode::Corruption,
+            "update files do not match their inventory",
+        ),
+        InstallError::PayloadIdentity => (
+            ErrorCode::Corruption,
+            "update payload identity does not match the candidate",
+        ),
+        InstallError::Validator => (
+            ErrorCode::Corruption,
+            "staged update failed its isolated runtime check",
         ),
         _ => (
             ErrorCode::Corruption,
@@ -314,6 +333,12 @@ fn staged_doctor(
     ] {
         std::fs::create_dir_all(directory).map_err(|_| InstallError::Filesystem)?;
     }
+    // Win32 process creation does not reliably accept ordinary paths beyond
+    // MAX_PATH, even though Rust can extract and inspect those same files.
+    // canonicalize supplies the verbatim Windows spelling for the existing
+    // executable; keep it through Command instead of stripping its prefix.
+    #[cfg(windows)]
+    let entry = std::fs::canonicalize(entry).map_err(|_| InstallError::Validator)?;
     let mut command = std::process::Command::new(entry);
     command
         .arg("--json")
@@ -610,13 +635,8 @@ printf '%s\n' '{"schema_version":1,"type":"doctor","data":{"native":{}}}'
         assert!(staged_doctor(&entry, &scratch).is_ok());
     }
     #[cfg(windows)]
-    #[test]
-    fn staged_doctor_rejects_dlls_available_only_on_parent_path() {
-        let temporary = tempfile::TempDir::new().expect("tempdir");
-        let developer = temporary.path().join("developer");
-        let payload = temporary.path().join("payload");
-        std::fs::create_dir_all(&developer).expect("developer directory");
-        std::fs::create_dir_all(&payload).expect("payload directory");
+    fn windows_doctor_fixture(developer: &Path) {
+        std::fs::create_dir_all(developer).expect("developer directory");
         std::fs::write(
             developer.join("dependency.c"),
             "__declspec(dllexport) int dependency(void) { return 7; }",
@@ -641,7 +661,7 @@ int main(void) {
         ] {
             let result = std::process::Command::new("cl")
                 .args(arguments)
-                .current_dir(&developer)
+                .current_dir(developer)
                 .output()
                 .expect("initialized MSVC toolchain");
             assert!(
@@ -650,6 +670,49 @@ int main(void) {
                 String::from_utf8_lossy(&result.stdout)
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_doctor_runs_with_local_dlls_at_multiple_path_depths() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let temporary = tempfile::TempDir::new().expect("tempdir");
+        let developer = temporary.path().join("developer");
+        windows_doctor_fixture(&developer);
+        for (index, minimum_length, name) in [
+            (0, 0, "short"),
+            (1, 280, "nested"),
+            (2, 360, "space and 目录"),
+        ] {
+            let mut payload = temporary.path().join(name);
+            while payload.as_os_str().encode_wide().count() < minimum_length {
+                payload.push("nested-0123456789");
+            }
+            std::fs::create_dir_all(&payload).expect("payload directory");
+            let entry = payload.join("probe.exe");
+            for name in ["probe.exe", "developer.dll"] {
+                std::fs::copy(developer.join(name), payload.join(name)).expect("package file");
+            }
+            if minimum_length > 0 {
+                assert!(entry.as_os_str().encode_wide().count() > 260);
+            }
+            let scratch = temporary.path().join(format!("private-{index}"));
+            assert!(
+                staged_doctor(&entry, &scratch).is_ok(),
+                "isolated native doctor at depth case {index}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_doctor_rejects_dlls_available_only_on_parent_path() {
+        let temporary = tempfile::TempDir::new().expect("tempdir");
+        let developer = temporary.path().join("developer");
+        let payload = temporary.path().join("payload");
+        windows_doctor_fixture(&developer);
+        std::fs::create_dir_all(&payload).expect("payload directory");
         let entry = payload.join("probe.exe");
         std::fs::rename(developer.join("probe.exe"), &entry).expect("stage EXE without DLL");
         let mut paths = vec![developer.clone()];
