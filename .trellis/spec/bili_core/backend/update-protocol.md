@@ -138,13 +138,13 @@ Absent keys keep these defaults, so older settings files stay valid. The root ob
 
 ### GUI integration
 
-This section defines the future GUI's shared protocol, not a claim of GUI package or updater implementation. GUI entrypoint mapping and the headless validation invocation must be defined and qualified with the GUI package; existing CLI acceptance cannot substitute for them.
+The native GUI implements this shared protocol, including its own headless validation entry and versioned package. Native Windows package/runtime acceptance is recorded in the [GUI update integration specification](../../gui/backend/update-protocol.md); CLI acceptance does not substitute for that evidence. Linux GUI window/runtime qualification remains separate.
 
 The GUI uses this same `Updater` with a compile-time `Identity(Product::Gui, target, version)`; a CLI-only release never authorizes installing a CLI package into a GUI installation. Missing GUI descriptors produce the same no-compatible outcome, not a CLI fallback. The GUI owns async scheduling, check/result presentation and its `auto_update` preference, not discovery or installation logic. Explicit channel choice overrides saved `allow_pre_release` for that operation.
 
 Before activation, the GUI supplies its own headless staged-payload validator: check candidate product/target/version and the packaged native closure without opening a window or invoking the CLI. GUI acceptance must exercise that validator and failure preservation; the CLI doctor is not a substitute.
 
-The shared catalog, descriptors, identity/channel rules and pre-activation failure preservation apply across shells. Platform activation is separate: Linux GUI integration must validate its own package against the core transaction; Windows exit coordination and in-use-file replacement still need their own design and acceptance. No Windows installer, BAT/helper handoff or post-activation automatic rollback is selected by this contract. Do not infer that Linux activation semantics alone qualify Windows updates.
+The shared catalog, descriptors, identity/channel rules and pre-activation failure preservation apply across shells. Windows GUI activation selects a separately validated version without overwriting the current EXE/DLLs. Restart first joins the backend and update workers, then launches the stable entry with the original arguments. No BAT/helper handoff or post-activation automatic rollback is used. Linux GUI package inspection does not establish native window/runtime qualification.
 
 ### Installation layout
 

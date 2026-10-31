@@ -288,47 +288,51 @@ def main():
             "under licenses/windows-redist/ and the Windows section of THIRD_PARTY_NOTICES.txt.\n"
         )
     (stage / "USAGE.txt").write_text(usage, encoding="utf-8")
-    doctor_home = work / "doctor-home"
-    doctor_state = work / "doctor-state"
-    doctor_config = work / "doctor-config"
-    doctor_data = work / "doctor-data"
-    doctor_roaming = doctor_home / "AppData" / "Roaming"
-    doctor_local = doctor_home / "AppData" / "Local"
-    doctor_cache = work / "doctor-cache"
-    for private_dir in (doctor_home, doctor_state, doctor_config, doctor_data, doctor_cache):
-        private_dir.mkdir(mode=0o700)
-    if kind == "windows":
-        doctor_roaming.mkdir(mode=0o700, parents=True)
-        doctor_local.mkdir(mode=0o700, parents=True)
-    doctor_env = os.environ.copy()
-    for name in ("LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"):
-        doctor_env.pop(name, None)
-    doctor_env.update({
-        "HOME": str(doctor_home), "USERPROFILE": str(doctor_home),
-        "APPDATA": str(doctor_config), "LOCALAPPDATA": str(doctor_data),
-        "XDG_CONFIG_HOME": str(doctor_config), "XDG_DATA_HOME": str(doctor_data),
-        "XDG_CACHE_HOME": str(doctor_cache),
-    })
-    if kind == "windows":
-        system_root = (doctor_env.get("SystemRoot") or doctor_env.get("SYSTEMROOT")
-                       or doctor_env.get("WINDIR"))
-        if not system_root:
-            raise SystemExit("Windows doctor requires SYSTEMROOT for its isolated PATH")
+    # Extended paths are needed for package filesystem operations, but the
+    # real doctor's Windows profile/state must use ordinary OS-temp paths.
+    with tempfile.TemporaryDirectory(prefix="bili-package-doctor-") as doctor_temporary:
+        doctor_root = Path(doctor_temporary)
+        doctor_home = doctor_root / "home"
+        doctor_state = doctor_root / "state"
+        doctor_config = doctor_root / "config"
+        doctor_data = doctor_root / "data"
+        doctor_roaming = doctor_home / "AppData" / "Roaming"
+        doctor_local = doctor_home / "AppData" / "Local"
+        doctor_cache = doctor_root / "cache"
+        for private_dir in (doctor_home, doctor_state, doctor_config, doctor_data, doctor_cache):
+            private_dir.mkdir(mode=0o700)
+        if kind == "windows":
+            doctor_roaming.mkdir(mode=0o700, parents=True)
+            doctor_local.mkdir(mode=0o700, parents=True)
+        doctor_env = os.environ.copy()
+        for name in ("LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"):
+            doctor_env.pop(name, None)
         doctor_env.update({
-            "APPDATA": str(doctor_roaming),
-            "LOCALAPPDATA": str(doctor_local),
-            "PATH": str(Path(system_root) / "System32"),
+            "HOME": str(doctor_home), "USERPROFILE": str(doctor_home),
+            "APPDATA": str(doctor_config), "LOCALAPPDATA": str(doctor_data),
+            "XDG_CONFIG_HOME": str(doctor_config), "XDG_DATA_HOME": str(doctor_data),
+            "XDG_CACHE_HOME": str(doctor_cache),
         })
-    version_output = subprocess.run(
-        [str(package_app), "--version"], check=True, capture_output=True,
-        text=True, env=doctor_env).stdout.strip()
-    doctor_output = subprocess.run(
-        [str(package_app), "--state-dir", str(doctor_state), "--json", "doctor"],
-        check=True, capture_output=True, text=True, encoding="utf-8", env=doctor_env).stdout
-    try:
-        app_version = parse_doctor_identity(doctor_output, version_output, args.target, args.product)
-    except ValueError as error:
-        raise SystemExit(str(error)) from error
+        if kind == "windows":
+            system_root = (doctor_env.get("SystemRoot") or doctor_env.get("SYSTEMROOT")
+                           or doctor_env.get("WINDIR"))
+            if not system_root:
+                raise SystemExit("Windows doctor requires SYSTEMROOT for its isolated PATH")
+            doctor_env.update({
+                "APPDATA": str(doctor_roaming),
+                "LOCALAPPDATA": str(doctor_local),
+                "PATH": str(Path(system_root) / "System32"),
+            })
+        version_output = subprocess.run(
+            [str(package_app), "--version"], check=True, capture_output=True,
+            text=True, env=doctor_env).stdout.strip()
+        doctor_output = subprocess.run(
+            [str(package_app), "--state-dir", str(doctor_state), "--json", "doctor"],
+            check=True, capture_output=True, text=True, encoding="utf-8", env=doctor_env).stdout
+        try:
+            app_version = parse_doctor_identity(doctor_output, version_output, args.target, args.product)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
     rustc = subprocess.run(["rustc", "-Vv"], check=True, capture_output=True, text=True).stdout
     metadata = {
         "schema_version": 1, "product": args.product, "target": args.target, "profile": args.profile,

@@ -11,6 +11,7 @@
 
 ### 🐞 Fixes
 
+- Keep packaging-time diagnostic profiles in an independent system temporary directory, so Windows extended staging paths do not make the CLI doctor reject its private profile.
 - Ignore a null or non-numeric top-level play URL quality when matching returned-address evidence, falling back to the direct segment quality as the representation parser already does.
 - Fill a missing `support_formats` description from the same-ID accepted-quality description instead of exposing a placeholder label; richer per-format descriptions still win.
 - Recheck the selected version under the installation lock to prevent stale updaters from activating an older payload; validate staged payloads against the candidate identity.
