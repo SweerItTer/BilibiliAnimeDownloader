@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Create a reproducible-layout CLI package and its matching source/SDK artifacts."""
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,19 +10,24 @@ import sys
 import tarfile
 import tempfile
 import zipfile
-from verify_package import has_forbidden_native_options, inspect_linux, inspect_windows, parse_windows_dependencies
+from package_metadata import (
+    assemble_install_root,
+    descriptor_document,
+    descriptor_name,
+    parse_doctor_identity,
+    sha256,
+    write_inventory,
+    TARGETS as PACKAGE_TARGETS,
+)
+from verify_package import (
+    has_forbidden_native_options, inspect_linux, inspect_linux_bootstrap,
+    inspect_windows, inspect_windows_bootstrap, parse_windows_dependencies,
+)
 from windows_redist import collect_windows_redist_notices
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = {"x86_64-unknown-linux-gnu": "linux", "x86_64-pc-windows-msvc": "windows"}
+TARGETS = {target: metadata[0] for target, metadata in PACKAGE_TARGETS.items()}
 
-
-def sha256(path):
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def copy_tree_files(src, dst, predicate):
@@ -151,7 +155,7 @@ def main():
     package_work = tempfile.TemporaryDirectory(prefix=".bili-package-", dir=out)
     work = Path(package_work.name)
     stem = f"bili-{args.target}-{args.profile}"
-    stage = work / stem
+    stage = work / "payload"
     stage.mkdir()
     native_source_asset = make_native_source_bundle(work, args.target, prefix, info_path, archive, lock)
     runtime_license_paths = []
@@ -251,8 +255,8 @@ def main():
     shutil.copy2(ROOT / "LICENSE", stage / "LICENSE")
     shutil.copy2(ROOT / "scripts/THIRD_PARTY_NOTICES.txt", stage / "THIRD_PARTY_NOTICES.txt")
     usage = (
-        "Bilibili CLI package\n\nRun bili --help for commands. Keep Linux bin/ and lib/ together; "
-        "on Windows keep bili.exe beside its runtime DLLs.\n"
+        "Bilibili CLI package\n\nRun bili --help for commands. Keep the installation directory intact; its stable entry launches "
+        "the payload selected by CURRENT under versions/.\n"
         "The application license is in LICENSE. FFmpeg is a separate replaceable LGPL shared library, "
         "not an executable; see THIRD_PARTY_NOTICES.txt and share/bili/native/source for source and "
         "replacement instructions.\n"
@@ -265,16 +269,53 @@ def main():
             "under licenses/windows-redist/ and the Windows section of THIRD_PARTY_NOTICES.txt.\n"
         )
     (stage / "USAGE.txt").write_text(usage, encoding="utf-8")
+    doctor_home = work / "doctor-home"
+    doctor_state = work / "doctor-state"
+    doctor_config = work / "doctor-config"
+    doctor_data = work / "doctor-data"
+    doctor_roaming = doctor_home / "AppData" / "Roaming"
+    doctor_local = doctor_home / "AppData" / "Local"
+    doctor_cache = work / "doctor-cache"
+    for private_dir in (doctor_home, doctor_state, doctor_config, doctor_data, doctor_cache):
+        private_dir.mkdir(mode=0o700)
+    if kind == "windows":
+        doctor_roaming.mkdir(mode=0o700, parents=True)
+        doctor_local.mkdir(mode=0o700, parents=True)
+    doctor_env = os.environ.copy()
+    for name in ("LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"):
+        doctor_env.pop(name, None)
+    doctor_env.update({
+        "HOME": str(doctor_home), "USERPROFILE": str(doctor_home),
+        "APPDATA": str(doctor_config), "LOCALAPPDATA": str(doctor_data),
+        "XDG_CONFIG_HOME": str(doctor_config), "XDG_DATA_HOME": str(doctor_data),
+        "XDG_CACHE_HOME": str(doctor_cache),
+    })
+    if kind == "windows":
+        system_root = (doctor_env.get("SystemRoot") or doctor_env.get("SYSTEMROOT")
+                       or doctor_env.get("WINDIR"))
+        if not system_root:
+            raise SystemExit("Windows doctor requires SYSTEMROOT for its isolated PATH")
+        doctor_env.update({
+            "APPDATA": str(doctor_roaming),
+            "LOCALAPPDATA": str(doctor_local),
+            "PATH": str(Path(system_root) / "System32"),
+        })
+    version_output = subprocess.run(
+        [str(package_app), "--version"], check=True, capture_output=True,
+        text=True, env=doctor_env).stdout.strip()
+    doctor_output = subprocess.run(
+        [str(package_app), "--state-dir", str(doctor_state), "--json", "doctor"],
+        check=True, capture_output=True, text=True, encoding="utf-8", env=doctor_env).stdout
+    try:
+        app_version = parse_doctor_identity(doctor_output, version_output, args.target)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     rustc = subprocess.run(["rustc", "-Vv"], check=True, capture_output=True, text=True).stdout
-    version_output = subprocess.run([str(package_app), "--version"], check=True,
-                                    capture_output=True, text=True).stdout.strip()
-    if not version_output.startswith("bili "):
-        raise SystemExit(f"cannot determine packaged CLI version from: {version_output!r}")
-    app_version = version_output.removeprefix("bili ")
     metadata = {
-        "schema_version": 1, "target": args.target, "profile": args.profile,
-        "app_version": app_version,
-        "rustc": rustc.strip(), "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
+        "schema_version": 1, "product": "cli", "target": args.target, "profile": args.profile,
+        "app_version": app_version, "update_protocol": 1, "layout_version": 1,
+        "bootstrap_protocol": 1, "rustc": rustc.strip(),
+        "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
         "native_build_info_sha256": sha256(info_path), "native_configure": effective,
         "app_sha256": sha256(package_app), "native_prefix_not_runtime_path": True,
     }
@@ -289,19 +330,32 @@ def main():
             {"name": path.name, "sha256": sha256(path)} for path in crt_payload_files
         ]
     (stage / "BUILD_INFO.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    sums = []
-    for path in sorted(p for p in stage.rglob("*") if p.is_file() and p.name != "SHA256SUMS"):
-        sums.append(f"{sha256(path)}  {path.relative_to(stage).as_posix()}")
-    (stage / "SHA256SUMS").write_text("\n".join(sums) + "\n", encoding="ascii")
+    write_inventory(stage)
+    bootstrap = ROOT / "target" / args.target / args.profile / (
+        "bili-bootstrap.exe" if kind == "windows" else "bili-bootstrap")
+    package_root = work / "install-root"
+    try:
+        assemble_install_root(package_root, stage, bootstrap, args.target)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
+    if kind == "windows":
+        inspect_windows_bootstrap(package_root, {"PATH": os.environ.get("PATH", "")})
+    else:
+        inspect_linux_bootstrap(package_root, {"PATH": "/usr/bin:/bin"})
     package = work / (stem + (".zip" if kind == "windows" else ".tar.gz"))
     if kind == "windows":
         with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as z:
-            for path in sorted(stage.rglob("*")):
+            for path in sorted(package_root.rglob("*")):
                 if path.is_file():
-                    z.write(path, (Path(stem) / path.relative_to(stage)).as_posix())
+                    z.write(path, (Path(stem) / path.relative_to(package_root)).as_posix())
     else:
         with tarfile.open(package, "w:gz") as tar:
-            tar.add(stage, arcname=stem, recursive=True)
+            tar.add(package_root, arcname=stem, recursive=True)
+    descriptor = work / descriptor_name(args.target)
+    descriptor.write_text(
+        json.dumps(descriptor_document(args.target, app_version, package), sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
     sdk_archives = []
     if not args.runtime_only:
         sdk_root = ROOT / "target/sdk" / args.target
@@ -309,19 +363,23 @@ def main():
             raise SystemExit(f"missing matched SDK output: {sdk_root}")
         for mode in ("rlib", "dylib"):
             sdk_archives.append(make_sdk_archive(sdk_root / mode, args.target, mode, work))
-    external_sums = [f"{sha256(package)}  {package.name}", f"{sha256(native_source_asset)}  {native_source_asset.name}"] + [
-        f"{sha256(path)}  {path.name}" for path in sdk_archives
-    ]
+    external_sums = [
+        f"{sha256(package)}  {package.name}",
+        f"{sha256(native_source_asset)}  {native_source_asset.name}",
+        f"{sha256(descriptor)}  {descriptor.name}",
+    ] + [f"{sha256(path)}  {path.name}" for path in sdk_archives]
     sums_file = work / "SHA256SUMS"
     sums_file.write_text("\n".join(external_sums) + "\n", encoding="ascii")
-    for artifact in (native_source_asset, package, *sdk_archives, sums_file):
+    for artifact in (native_source_asset, package, descriptor, *sdk_archives, sums_file):
         os.replace(artifact, out / artifact.name)
     package = out / package.name
     native_source_asset = out / native_source_asset.name
+    descriptor = out / descriptor.name
     sdk_archives = [out / path.name for path in sdk_archives]
     package_work.cleanup()
     print(f"Package: {package}")
     print(f"Native source: {native_source_asset}")
+    print(f"Update descriptor: {descriptor}")
     for path in sdk_archives:
         print(f"SDK: {path}")
 

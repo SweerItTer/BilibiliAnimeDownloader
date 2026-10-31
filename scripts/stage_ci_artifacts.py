@@ -7,12 +7,15 @@ import re
 import shutil
 import tempfile
 
+from package_metadata import descriptor_name, load_descriptor
 from package import ROOT, TARGETS, make_sdk_archive, sha256
 
 
 def stage_artifacts(root, target):
     suffix = ".zip" if TARGETS[target] == "windows" else ".tar.gz"
-    names = {f"bili-{target}-release{suffix}", f"bili-native-source-{target}.tar.gz"}
+    runtime_name = f"bili-{target}-release{suffix}"
+    descriptor = descriptor_name(target)
+    names = {runtime_name, f"bili-native-source-{target}.tar.gz", descriptor}
     packages = root / "target/packages" / target
     sums = packages / "SHA256SUMS"
     recorded = {}
@@ -22,10 +25,14 @@ def stage_artifacts(root, target):
             raise SystemExit("invalid product SHA256SUMS")
         recorded[match[2]] = match[1]
     if set(recorded) != names:
-        raise SystemExit("product checksums must cover only the CLI and matching native source")
+        raise SystemExit("product checksums must cover only the CLI, descriptor and matching native source")
     for name, expected in recorded.items():
         if not (packages / name).is_file() or sha256(packages / name) != expected:
             raise SystemExit(f"product checksum mismatch: {name}")
+    try:
+        load_descriptor(packages / descriptor, target, None, packages / runtime_name)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
 
     sdk = root / "target/sdk" / target / "dylib"
     metadata = json.loads((sdk / "build-info.json").read_text(encoding="utf-8"))

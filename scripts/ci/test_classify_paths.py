@@ -19,6 +19,13 @@ class ClassifyPathsTests(unittest.TestCase):
         self.assertEqual(classify_paths(("core-cli/src/main.rs",))["scope"], "cli")
         self.assertEqual(classify_paths(("gui/src/main.rs",))["scope"], "gui")
 
+    def test_core_bootstrap_uses_the_existing_cli_route(self):
+        self.assertEqual(classify_paths(("core-bootstrap/src/main.rs",))["scope"], "cli")
+        self.assertEqual(
+            classify_paths(("core-cli/src/main.rs", "core-bootstrap/src/main.rs"))["scope"],
+            "cli",
+        )
+
     def test_documentation_does_not_widen_a_single_package_route(self):
         self.assertEqual(classify_paths(("README.md", "gui/src/main.rs"))["scope"], "gui")
         self.assertEqual(classify_paths(("README.md", "core-cli/src/main.rs"))["scope"], "cli")

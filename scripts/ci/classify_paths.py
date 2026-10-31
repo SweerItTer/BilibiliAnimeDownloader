@@ -39,7 +39,7 @@ def classify_paths(paths):
         scope = "docs"
     elif code_paths and all(path.startswith("gui/") for path in code_paths):
         scope = "gui"
-    elif code_paths and all(path.startswith("core-cli/") for path in code_paths):
+    elif code_paths and all(path.startswith(("core-cli/", "core-bootstrap/")) for path in code_paths):
         scope = "cli"
     else:
         scope = "full"

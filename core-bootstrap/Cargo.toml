@@ -1,0 +1,16 @@
+[package]
+name = "core-bootstrap"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Dependency-free installation entry that starts the payload named by CURRENT"
+
+[features]
+# Shipping builds enforce the independent installation entry contract.
+packaged = []
+
+[dependencies]
+
+[[bin]]
+name = "bili-bootstrap"
+path = "src/main.rs"
