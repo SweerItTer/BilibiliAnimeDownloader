@@ -73,6 +73,58 @@ fn catalog_keeps_requirements_descriptions_and_url_evidence_independent() {
 }
 
 #[test]
+fn known_description_wins_over_a_placeholder_for_the_same_advertised_quality() {
+    let raw = json!({"code":0,"data":{
+        "accept_quality":[116,80],"accept_description":["1080P60","1080P 高清"],
+        "support_formats":[
+            {"quality":116,"new_description":"1080P60 高码率"},
+            {"quality":80}
+        ]
+    }});
+    let catalog = parse_catalog(part(), &raw).unwrap();
+    assert_eq!(catalog.advertised.len(), 2);
+    let label = |id: u32| {
+        catalog
+            .advertised
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap()
+            .label
+            .as_str()
+    };
+    assert_eq!(label(80), "1080P 高清");
+    assert_eq!(label(116), "1080P60 高码率");
+}
+
+#[test]
+fn direct_stream_url_evidence_matches_the_returned_quality_without_a_usable_outer_quality() {
+    for outer_quality in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::Value::String("80".into())),
+    ] {
+        let mut data = json!({
+            "support_formats":[{"quality":80,"description":"1080P 高清"}],
+            "durl":[{"quality":80,"url":"https://v.bilivideo.com/video","size":1,"length":1000}]
+        });
+        if let Some(quality) = outer_quality {
+            data["quality"] = quality;
+        }
+        let payload = json!({"code":0,"data":data});
+        let catalog = parse_catalog(part(), &payload).unwrap();
+        let video = catalog.representations.iter().find(|r| !r.audio).unwrap();
+        assert_eq!((video.id, video.quality), (80, 80));
+        let advertised = catalog.advertised.iter().find(|e| e.id == 80).unwrap();
+        assert!(
+            advertised.has_video_url,
+            "outer quality {:?} must not hide the direct stream URL",
+            payload["data"]["quality"]
+        );
+        assert_eq!(advertised.availability, Availability::Obtainable);
+    }
+}
+
+#[test]
 fn returned_lower_quality_address_is_not_evidence_for_the_requested_higher_quality() {
     let raw = json!({"code":0,"data":{"quality":32,
         "support_formats":[{"quality":116,"new_description":"1080P60"},{"quality":32,"new_description":"480P"}],

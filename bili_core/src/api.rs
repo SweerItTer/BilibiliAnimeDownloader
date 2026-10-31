@@ -957,6 +957,20 @@ fn select_video_part(mut item: MediaItem, ordinal: Option<u32>) -> Result<MediaI
     Ok(item)
 }
 
+fn accepted_description(video_info: &Value, id: u32) -> Option<String> {
+    let index = video_info
+        .get("accept_quality")
+        .and_then(Value::as_array)?
+        .iter()
+        .position(|quality| quality.as_u64() == Some(u64::from(id)))?;
+    text(
+        video_info
+            .get("accept_description")
+            .and_then(Value::as_array)
+            .and_then(|descriptions| descriptions.get(index)),
+    )
+}
+
 fn parse_catalog(part: PartRef, value: &Value) -> Result<QualityCatalog> {
     api_result(value, "read quality catalog")?;
     let play = play_info(value);
@@ -992,6 +1006,7 @@ fn parse_catalog(part: PartRef, value: &Value) -> Result<QualityCatalog> {
         let label = text(f.get("new_description"))
             .or_else(|| text(f.get("description")))
             .or_else(|| text(f.get("display_desc")))
+            .or_else(|| accepted_description(video_info, id))
             .unwrap_or_else(|| format!("Quality {id}"));
         if !advertised.iter().any(|e| e.id == id) {
             advertised.push(QualityEntry {
@@ -1192,8 +1207,8 @@ fn returned_video_qualities(info: &Value) -> std::collections::BTreeSet<u32> {
         if stream_url(stream).ok().flatten().is_some() {
             if let Some(id) = info
                 .get("quality")
-                .or_else(|| stream.get("quality"))
                 .and_then(Value::as_u64)
+                .or_else(|| stream.get("quality").and_then(Value::as_u64))
                 .and_then(|n| u32::try_from(n).ok())
             {
                 returned.insert(id);

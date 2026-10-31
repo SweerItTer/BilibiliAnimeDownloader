@@ -6,6 +6,11 @@
 
 - Add `download --list-resolutions` and readable `qualities` output: one table per part retains descriptions, dimensions, frame rate and codecs, with separate login/VIP requirements and returned-address evidence. Queries create no download jobs and keep machine-readable JSON output.
 
+### 🐞 Fixes
+
+- Ignore a null or non-numeric top-level play URL quality when matching returned-address evidence, falling back to the direct segment quality as the representation parser already does.
+- Fill a missing `support_formats` description from the same-ID accepted-quality description instead of exposing a placeholder label; richer per-format descriptions still win.
+
 ### 📝 Documentation
 
 - Add community conduct, contribution, security and accessibility guidance, plus issue forms and a pull request template.
