@@ -16,10 +16,37 @@ Replace `KEYWORD` with a search term and `VIDEO_ID` with an ID from the results 
 
 ```sh
 ./bin/bili search "KEYWORD" --type video --page 1 --auth anonymous
+./bin/bili download VIDEO_ID --list-resolutions --parts all --auth anonymous
 ./bin/bili download VIDEO_ID --parts all --output "$HOME/Videos/Bilibili" --auth anonymous
 ```
 
+Use `--list-resolutions` to view each part's quality IDs, actual dimensions, frame rate, codec and access status without starting a download. Select a listed Quality ID with `download VIDEO_ID --quality QUALITY_ID`; dimensions and Stream IDs are different values. Missing metadata or access reasons appear as unknown. Use `--parts 1,3-5` to choose parts, or `qualities VIDEO_ID --part 3` for one part. Add `--json` for machine-readable output. On Windows, use `.\bili.exe` in PowerShell with the same arguments.
+
 The CLI prints completed file paths. It does not install or launch a video player. Use `./bin/bili --help` for other commands and options.
+
+## Checking and installing updates
+
+A CLI **built from this branch** supports checking and manually installing updates from a compatible versioned package. Use isolated installations for this unreleased updater. The published `2.0.0-alpha.6` package has no `update` subcommand:
+
+```sh
+./bin/bili update --check
+./bin/bili update
+```
+
+Checks read a fixed HTTPS static index; archives download directly from the matching tagged GitHub Release. The client does not call the Releases API or require an API key. `--pre-release` also considers pre-release versions for that one command (`--pre-release=false` forces the stable channel even when the settings file opts in).
+
+The updater uses the same versioned installation protocol on Linux and native Windows. In Windows PowerShell, run:
+
+```powershell
+.\bili.exe update --check
+.\bili.exe update
+```
+
+For the first compatible package, extract the complete tree into a writable installation directory. Later updates locate that directory from the running executable, prepare and validate a separate version, then switch `CURRENT`; they do not overwrite the running payload or delete the previous version. Windows retains the canonical executable path when checking and starting deeply installed payloads, including paths with spaces or non-ASCII names. Filesystem path and component limits still apply.
+
+`2.0.0-alpha.6` predates this protocol and cannot update itself: extract the first compatible package into a new directory by hand.
+
+The shared protocol, descriptor format, configuration keys, verification results and known limits are documented in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). `auto_update` there is a GUI-only preference; the CLI only ever checks unless you run `bili update` yourself.
 
 ## Login and privacy
 

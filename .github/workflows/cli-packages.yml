@@ -106,11 +106,13 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             product_artifact: linux-cli
+            gui_artifact: gui-internal-x86_64-unknown-linux-gnu
             cache_identity: ci-linux-d0a49ac4973ad80ba287c4043585fe09a418c9605ecaa6c12ce5f7a71e31f62e
             container_image: ghcr.io/sweeritter/bilibilianimedownloader/ci-linux@sha256:d0a49ac4973ad80ba287c4043585fe09a418c9605ecaa6c12ce5f7a71e31f62e
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             product_artifact: windows-cli
+            gui_artifact: windows-gui
             cache_identity: windows-2022-vs2022
             container_image: ''
     runs-on: ${{ matrix.os }}
@@ -250,7 +252,7 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check CLI Rust formatting
         if: needs.scope.outputs.scope == 'cli'
-        run: cargo fmt -p core-cli -- --check
+        run: cargo fmt -p core-cli -p core-bootstrap -- --check
       - name: Check GUI Rust formatting
         if: needs.scope.outputs.scope == 'gui'
         run: cargo fmt -p gui -- --check
@@ -259,7 +261,7 @@ jobs:
         run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
       - name: Check locked CLI package
         if: needs.scope.outputs.scope == 'cli'
-        run: cargo check -p core-cli -p bili_core --all-targets --locked --target ${{ matrix.target }}
+        run: cargo check -p core-cli -p bili_core -p core-bootstrap --all-targets --locked --target ${{ matrix.target }}
       - name: Check locked GUI package
         if: needs.scope.outputs.scope == 'gui'
         run: cargo check -p gui --all-targets --locked --target ${{ matrix.target }}
@@ -268,7 +270,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked --target ${{ matrix.target }} -- -D warnings
       - name: Lint locked CLI package
         if: needs.scope.outputs.scope == 'cli'
-        run: cargo clippy -p core-cli -p bili_core --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy -p core-cli -p bili_core -p core-bootstrap --all-targets --locked --target ${{ matrix.target }} -- -D warnings
       - name: Lint locked GUI package
         if: needs.scope.outputs.scope == 'gui'
         run: cargo clippy -p gui --all-targets --locked --target ${{ matrix.target }} -- -D warnings
@@ -277,7 +279,7 @@ jobs:
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.target }}
       - name: Run locked CLI package tests
         if: needs.scope.outputs.scope == 'cli'
-        run: cargo test -p core-cli -p bili_core --all-targets --locked --target ${{ matrix.target }}
+        run: cargo test -p core-cli -p bili_core -p core-bootstrap --all-targets --locked --target ${{ matrix.target }}
       - name: Run locked GUI package tests
         if: needs.scope.outputs.scope == 'gui'
         run: cargo test -p gui --all-targets --locked --target ${{ matrix.target }}
@@ -287,6 +289,12 @@ jobs:
       - name: Build CLI
         if: needs.scope.outputs.run_cli == 'true'
         run: cargo build -p core-cli --release --locked --target ${{ matrix.target }}
+      - name: Build Linux installation bootstrap
+        if: needs.scope.outputs.run_cli == 'true' && runner.os == 'Linux'
+        run: cargo build -p core-bootstrap --bin bili-bootstrap --features packaged --release --locked --target ${{ matrix.target }}
+      - name: Build Windows installation bootstrap with static CRT
+        if: needs.scope.outputs.run_cli == 'true' && runner.os == 'Windows'
+        run: cargo rustc -p core-bootstrap --bin bili-bootstrap --features packaged --release --locked --target ${{ matrix.target }} -- -C target-feature=+crt-static
       - name: Produce reusable rlib SDK
         if: needs.scope.outputs.run_cli == 'true'
         run: python scripts/verify_core_linkage.py --mode rlib --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}"
@@ -326,6 +334,12 @@ jobs:
       - name: Build GUI
         if: needs.scope.outputs.run_gui == 'true'
         run: cargo build -p gui --release --locked --target ${{ matrix.target }}
+      - name: Build Linux GUI installation bootstrap
+        if: needs.scope.outputs.run_gui == 'true' && runner.os == 'Linux'
+        run: cargo build -p core-bootstrap --bin bili-bootstrap --features packaged,gui --release --locked --target ${{ matrix.target }}
+      - name: Build Windows GUI installation bootstrap without a console
+        if: needs.scope.outputs.run_gui == 'true' && runner.os == 'Windows'
+        run: cargo rustc -p core-bootstrap --bin bili-bootstrap --features packaged,gui --release --locked --target ${{ matrix.target }} -- -C target-feature=+crt-static
       - name: Package GUI with update descriptor (Linux)
         if: ${{ needs.scope.outputs.run_gui == 'true' && runner.os == 'Linux' }}
         run: python3 scripts/package.py --product gui --target "${{ matrix.target }}" --profile release --native-prefix "target/native/${{ matrix.target }}" --runtime-only
@@ -336,7 +350,7 @@ jobs:
         if: needs.scope.outputs.run_gui == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: gui-product-${{ matrix.target }}
+          name: ${{ matrix.gui_artifact }}
           path: target/packages/${{ matrix.target }}/gui
           if-no-files-found: error
           retention-days: 30
@@ -414,7 +428,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
   gui-smoke:
-    name: Verify ${{ matrix.target }} GUI package
+    name: Inspect ${{ matrix.target }} GUI package
     needs: [scope, build]
     if: ${{ needs.scope.outputs.run_gui == 'true' && needs.build.result == 'success' && !cancelled() }}
     strategy:
@@ -423,8 +437,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
+            gui_artifact: gui-internal-x86_64-unknown-linux-gnu
           - target: x86_64-pc-windows-msvc
             os: windows-2022
+            gui_artifact: windows-gui
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -433,21 +449,29 @@ jobs:
           python-version: '3.13'
       - uses: actions/download-artifact@v4
         with:
-          name: gui-product-${{ matrix.target }}
+          name: ${{ matrix.gui_artifact }}
           path: gui
+      - name: Install Linux package inspection tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y binutils patchelf
+      - name: Initialize MSVC inspection tools
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       - name: Verify GUI package (Linux)
         if: runner.os == 'Linux'
         run: |
           cd gui
           sha256sum -c SHA256SUMS
-          python3 "$GITHUB_WORKSPACE/scripts/verify_gui_package.py" "bili-gui-${{ matrix.target }}-release.tar.gz" "bili-update-gui-${{ matrix.target }}.json" --target "${{ matrix.target }}" --report gui-report.json
+          python3 "$GITHUB_WORKSPACE/scripts/verify_package.py" "bili-gui-${{ matrix.target }}-release.tar.gz" --product gui --native-source "bili-native-source-${{ matrix.target }}.tar.gz" --target "${{ matrix.target }}" --report gui-report.json
       - name: Verify GUI package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Set-Location gui
           Get-Content SHA256SUMS | ForEach-Object { $parts = $_ -split '  ', 2; if ((Get-FileHash $parts[1] -Algorithm SHA256).Hash.ToLower() -ne $parts[0]) { throw "Checksum mismatch: $($parts[1])" } }
-          python "$env:GITHUB_WORKSPACE/scripts/verify_gui_package.py" "bili-gui-${{ matrix.target }}-release.zip" "bili-update-gui-${{ matrix.target }}.json" --target "${{ matrix.target }}" --report gui-report.json
+          python "$env:GITHUB_WORKSPACE/scripts/verify_package.py" "bili-gui-${{ matrix.target }}-release.zip" --product gui --native-source "bili-native-source-${{ matrix.target }}.tar.gz" --target "${{ matrix.target }}" --report gui-report.json
       - name: Upload GUI verification evidence
         if: always()
         uses: actions/upload-artifact@v4

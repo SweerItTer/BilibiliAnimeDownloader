@@ -152,6 +152,7 @@ pub struct App {
     scale_draft: f32,
     confirming_close: bool,
     updates: UpdateState,
+    restart: Option<std::sync::mpsc::Sender<PathBuf>>,
     app_icon: Option<egui::TextureHandle>,
     font_missing: bool,
     closing: bool,
@@ -213,6 +214,7 @@ impl App {
             scale_draft,
             confirming_close: false,
             updates: UpdateState::default(),
+            restart: None,
             app_icon: None,
             font_missing,
             closing: false,
@@ -224,6 +226,15 @@ impl App {
 
     fn touch_prefs(&mut self) {
         self.prefs_dirty = true;
+    }
+
+    pub fn attach_updates(
+        &mut self,
+        updates: UpdateState,
+        restart: std::sync::mpsc::Sender<PathBuf>,
+    ) {
+        self.updates = updates;
+        self.restart = Some(restart);
     }
 
     fn raise(&mut self, banner: impl Into<Banner>) {
@@ -1336,7 +1347,7 @@ impl App {
                         }
                         UpdateStatus::Ready { version } => {
                             ui.label(
-                                RichText::new(format!("v{version} 已下载，重启后生效"))
+                                RichText::new(format!("v{version} 已安装，重启后生效"))
                                     .color(theme::GREEN),
                             );
                         }
@@ -1361,7 +1372,7 @@ impl App {
                     };
                     let extra = match &status {
                         UpdateStatus::Available(_) => Some(("下载并安装", Icon::Download)),
-                        UpdateStatus::Ready { .. } => Some(("立即重启并更新", Icon::Refresh)),
+                        UpdateStatus::Ready { .. } => Some(("重启使用新版本", Icon::Refresh)),
                         _ => None,
                     };
                     let mut row_width = theme::button_width_for(ui, check_label);
@@ -1381,7 +1392,7 @@ impl App {
                         .clicked()
                             && !status.is_checking()
                         {
-                            self.updates.start(self.prefs.update_channel);
+                            self.updates.start(self.prefs.update_channel());
                         }
                         match (&status, extra) {
                             (UpdateStatus::Available(_), Some((label, symbol))) => {
@@ -1418,7 +1429,7 @@ impl App {
                         ui.set_width(ui.available_width());
                         theme::muted(
                             ui,
-                            "只查询 GitHub Releases 的公开信息，不上传账号、Cookie 或下载记录。下载后按发布清单校验大小与 SHA-256，确认重启后才替换当前版本。",
+                            "从静态更新目录检查新版本，不上传账号、Cookie 或下载记录。安装包通过大小、SHA-256、身份和运行库检查后，安装到独立版本目录；当前任务继续运行，重启后使用新版本。",
                         );
                         ui.label(
                             RichText::new(format!(
@@ -1435,15 +1446,17 @@ impl App {
     }
 
     fn restart_for_update(&mut self, ctx: &egui::Context) {
-        let Some(staged) = self.updates.staged().cloned() else {
+        if !matches!(self.updates.status(), UpdateStatus::Ready { .. }) {
             return;
-        };
-        match update::spawn_helper(&staged) {
-            Ok(()) => {
-                self.allow_close = true;
-                self.confirming_close = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+        }
+        match update::restart_entry().and_then(|entry| {
+            self.restart
+                .as_ref()
+                .ok_or_else(|| "无法请求重启，请关闭后手动打开应用。".to_owned())?
+                .send(entry)
+                .map_err(|_| "无法请求重启，请关闭后手动打开应用。".to_owned())
+        }) {
+            Ok(()) => self.begin_close(ctx),
             Err(error) => self.raise(error),
         }
     }
@@ -1454,19 +1467,19 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new("更新设置").size(18.0).strong());
                 if ui
-                    .checkbox(&mut self.prefs.auto_check, "自动检查更新（每天最多一次）")
+                    .checkbox(&mut self.prefs.update.check_updates, "自动检查更新（每天最多一次）")
                     .changed()
                 {
                     self.touch_prefs();
-                    if self.prefs.auto_check && !self.updates.status().is_checking() {
-                        self.updates.start(self.prefs.update_channel);
+                    if self.prefs.update.check_updates && !self.updates.status().is_checking() {
+                        self.updates.automatic(self.prefs.update_channel());
                     }
                 }
                 ui.add_space(8.0);
                 if ui
                     .checkbox(
-                        &mut self.prefs.auto_update,
-                        "自动下载更新（重启应用时完成替换）",
+                        &mut self.prefs.update.auto_update,
+                        "自动安装更新（重启应用后生效）",
                     )
                     .changed()
                 {
@@ -1475,7 +1488,7 @@ impl App {
                 theme::hint_indented(
                     ui,
                     "hint-auto-update",
-                    "发现新版本后自动下载并按发布清单校验；仍需重启应用才会替换当前版本。",
+                    "发现新版本后自动下载并校验，校验通过后安装到独立版本目录。当前任务继续运行，下次启动使用新版本。",
                 );
                 ui.add_space(6.0);
                 theme::muted(ui, "更新通道决定检查稳定版还是包含预发布的 Beta。");
@@ -1485,7 +1498,7 @@ impl App {
                         (UpdateChannel::Stable, "稳定版"),
                         (UpdateChannel::Beta, "Beta"),
                     ] {
-                        let selected = self.prefs.update_channel == channel;
+                        let selected = self.prefs.update_channel() == channel;
                         if theme::button(
                             ui,
                             name,
@@ -1500,7 +1513,7 @@ impl App {
                         .clicked()
                             && !selected
                         {
-                            self.prefs.update_channel = channel;
+                            self.prefs.update.allow_pre_release = channel == UpdateChannel::Beta;
                             self.touch_prefs();
                         }
                     }
@@ -1851,9 +1864,9 @@ impl eframe::App for App {
                 UpdateStatus::Available(release) => {
                     self.prefs.last_check = now_epoch();
                     self.touch_prefs();
-                    if self.prefs.auto_update {
+                    if self.prefs.update.auto_update {
                         self.updates.install();
-                    } else {
+                    } else if self.updates.should_notify() {
                         self.inform(Notice {
                             text: format!("发现新版本 {}", release.tag),
                             open_about: true,
@@ -1866,7 +1879,7 @@ impl eframe::App for App {
                 }
                 UpdateStatus::Ready { version } => {
                     self.inform(Notice {
-                        text: format!("新版本 {version} 已下载，重启后生效。"),
+                        text: format!("新版本 {version} 已安装，重启后生效。"),
                         open_about: true,
                     });
                 }
@@ -1874,11 +1887,8 @@ impl eframe::App for App {
                 _ => {}
             }
         }
-        if self.prefs.auto_check
-            && now_epoch().saturating_sub(self.prefs.last_check) > 24 * 60 * 60
-            && matches!(self.updates.status(), UpdateStatus::Idle)
-        {
-            self.updates.start(self.prefs.update_channel);
+        if self.prefs.update.check_updates && !self.closing && self.updates.automatic_due() {
+            self.updates.automatic(self.prefs.update_channel());
         }
         let maximized = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
         window::resize_edges(ctx, maximized);

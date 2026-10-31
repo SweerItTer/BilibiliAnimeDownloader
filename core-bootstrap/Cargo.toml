@@ -1,0 +1,18 @@
+[package]
+name = "core-bootstrap"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Dependency-free installation entry that starts the payload named by CURRENT"
+
+[features]
+# Shipping builds enforce the independent installation entry contract.
+packaged = []
+# Native GUI installations must not keep a console window beside the GUI.
+gui = []
+
+[dependencies]
+
+[[bin]]
+name = "bili-bootstrap"
+path = "src/main.rs"

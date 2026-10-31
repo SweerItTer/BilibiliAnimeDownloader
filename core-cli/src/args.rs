@@ -84,6 +84,20 @@ pub enum Command {
     },
     /// Report local permissions and linked native capabilities; no network request.
     Doctor,
+    /// Check for a newer release, or install it from a packaged installation.
+    Update {
+        /// Report the matching release without downloading or installing it.
+        #[arg(long)]
+        check: bool,
+        /// Accept pre-release versions for this invocation; `--pre-release=false` forces stable.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
+        pre_release: Option<bool>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -143,6 +157,9 @@ pub enum Danmaku {
 pub struct Download {
     #[arg(required = true)]
     pub inputs: Vec<String>,
+    /// List video resolutions and access status without creating download jobs.
+    #[arg(long, conflicts_with_all = ["output", "quality", "video_repr", "audio_repr", "codec", "hdr", "subtitles", "danmaku", "merge", "jobs", "keep_temp"])]
+    pub list_resolutions: bool,
     /// all or comma-separated 1-based ordinals/ranges, for example 1,3-5.
     #[arg(long, default_value = "all")]
     pub parts: String,

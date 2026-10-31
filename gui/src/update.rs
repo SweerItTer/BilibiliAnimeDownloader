@@ -1,985 +1,745 @@
-//! GUI update flow. Follows the shared protocol: a product descriptor pins the
-//! archive name, size and SHA-256, semver precedence picks the candidate, and a
-//! staged copy replaces the installation only after this process exits.
+//! GUI scheduling and headless validation over the shared core update protocol.
 use crate::prefs::UpdateChannel;
-use semver::Version;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use bili_core::install::{self, InstallError, InstallRoot, Staged};
+use bili_core::update::{
+    Channel, CheckOutcome, CheckPermit, Identity, Product, ReminderStore, Target, UpdateCandidate,
+    Updater, CHECK_INTERVAL_SECS, PROTOCOL,
+};
+use serde_json::{json, Value};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc as async_mpsc, watch};
 
 pub const REPO_URL: &str = "https://github.com/SweerItTer/BilibiliAnimeDownloader";
 pub const ISSUES_URL: &str = "https://github.com/SweerItTer/BilibiliAnimeDownloader/issues/new";
-const API: &str = "https://api.github.com/repos/SweerItTer/BilibiliAnimeDownloader";
-const MAX_PAGES: usize = 10;
-const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
-const MAX_DESCRIPTOR: u64 = 64 * 1024;
-const MAX_EXTRACTED: u64 = 1024 * 1024 * 1024;
-const MARKER_FILE: &str = "staged-update.json";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const PRODUCT: &str = "gui";
-pub const TARGET: &str = if cfg!(all(
-    target_arch = "x86_64",
-    target_os = "windows",
-    target_env = "msvc"
-)) {
-    "x86_64-pc-windows-msvc"
-} else if cfg!(all(
-    target_arch = "x86_64",
-    target_os = "linux",
-    target_env = "gnu"
-)) {
-    "x86_64-unknown-linux-gnu"
-} else {
-    "unsupported"
-};
+const MAX_DOCTOR_BYTES: u64 = 256 * 1024;
+const DOCTOR_BUDGET: Duration = Duration::from_secs(15);
+
+pub fn identity() -> Result<Identity, String> {
+    let target = if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "windows",
+        target_env = "msvc"
+    )) {
+        Target::WindowsX86_64Msvc
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_env = "gnu"
+    )) {
+        Target::LinuxX86_64Gnu
+    } else {
+        return Err("当前平台不支持更新。".into());
+    };
+    Identity::new(Product::Gui, target, VERSION).map_err(|_| "当前版本号无效。".into())
+}
+
+/// Runs before preferences, authentication, a runtime or a native window exist.
+pub fn doctor() -> bili_core::Result<Value> {
+    let identity = identity().map_err(|_| {
+        bili_core::CoreError::new(bili_core::ErrorCode::InvalidInput, "GUI build identity")
+    })?;
+    let native = bili_core::remux::diagnostics()?;
+    Ok(json!({
+        "schema_version": 1, "type": "doctor", "data": {
+            "version": VERSION,
+            "build_identity": {
+                "product": identity.product().as_str(), "target": identity.target().triple(),
+                "version": VERSION, "update_protocol": PROTOCOL
+            },
+            "native": native
+        }
+    }))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release {
     pub tag: String,
     pub version: String,
-    pub archive_name: String,
-    pub archive_url: String,
-    pub sha256: String,
-    pub size: u64,
-    pub page_url: String,
+    candidate: UpdateCandidate,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+impl From<UpdateCandidate> for Release {
+    fn from(candidate: UpdateCandidate) -> Self {
+        Self {
+            tag: candidate.tag.clone(),
+            version: candidate.version.to_string(),
+            candidate,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum Status {
+    #[default]
     Idle,
     Checking,
     UpToDate,
     NoCompatibleRelease,
     Available(Release),
     Downloading(Release),
-    Ready { version: String },
+    Ready {
+        version: String,
+    },
     Error(String),
 }
 
 impl Status {
     pub fn is_checking(&self) -> bool {
-        matches!(self, Status::Checking | Status::Downloading(_))
+        matches!(self, Self::Checking | Self::Downloading(_))
     }
 }
 
-#[derive(Clone)]
-pub struct StagedUpdate {
-    pub version: String,
-    pub root: PathBuf,
-    pub install_root: PathBuf,
+enum Request {
+    Check {
+        channel: UpdateChannel,
+        automatic: bool,
+    },
+    Install(Box<Release>),
 }
 
-enum Outcome {
-    Checked(Status),
-    Staged(StagedUpdate),
-}
-
-pub struct UpdateState {
+struct Outcome {
     status: Status,
-    pending: Option<Receiver<Result<Outcome, String>>>,
-    staged: Option<StagedUpdate>,
+    notify: bool,
 }
 
-impl Default for UpdateState {
-    fn default() -> Self {
-        Self {
-            status: Status::Idle,
-            pending: None,
-            staged: None,
+/// The host retains and joins this owner before dropping its one runtime.
+pub struct Owner {
+    worker: tokio::task::JoinHandle<()>,
+    stop: watch::Sender<bool>,
+}
+
+impl Owner {
+    pub async fn finish(self) {
+        self.stop.send_replace(true);
+        if self.worker.await.is_err() {
+            eprintln!("GUI update worker failed.");
         }
     }
+}
+
+#[derive(Default)]
+pub struct UpdateState {
+    status: Status,
+    commands: Option<async_mpsc::Sender<Request>>,
+    results: Option<Receiver<Result<Outcome, String>>>,
+    notify: bool,
+    last_automatic: Option<Instant>,
 }
 
 impl UpdateState {
+    pub fn connected(runtime: &tokio::runtime::Handle) -> (Self, Owner) {
+        let (commands, receiver) = async_mpsc::channel(1);
+        let (results_tx, results) = mpsc::channel();
+        let (stop, stopped) = watch::channel(false);
+        let worker = runtime.spawn(serve(receiver, results_tx, stopped));
+        (
+            Self {
+                commands: Some(commands),
+                results: Some(results),
+                ..Self::default()
+            },
+            Owner { worker, stop },
+        )
+    }
+
     pub fn status(&self) -> &Status {
         &self.status
     }
+    pub fn should_notify(&self) -> bool {
+        self.notify
+    }
 
-    pub fn staged(&self) -> Option<&StagedUpdate> {
-        self.staged.as_ref()
+    pub fn automatic_due(&self) -> bool {
+        self.automatic_due_at(Instant::now())
+    }
+
+    fn automatic_due_at(&self, now: Instant) -> bool {
+        self.commands.is_some()
+            && matches!(
+                self.status,
+                Status::Idle
+                    | Status::UpToDate
+                    | Status::NoCompatibleRelease
+                    | Status::Available(_)
+                    | Status::Error(_)
+            )
+            && self.last_automatic.is_none_or(|time| {
+                now.saturating_duration_since(time).as_secs() >= CHECK_INTERVAL_SECS
+            })
     }
 
     pub fn start(&mut self, channel: UpdateChannel) {
-        if self.pending.is_some() {
+        self.check(channel, false);
+    }
+    pub fn automatic(&mut self, channel: UpdateChannel) {
+        self.check(channel, true);
+    }
+
+    fn check(&mut self, channel: UpdateChannel, automatic: bool) {
+        if self.status.is_checking() {
             return;
         }
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(check(channel).map(Outcome::Checked));
-        });
-        self.pending = Some(rx);
-        self.status = Status::Checking;
+        self.last_automatic = Some(Instant::now());
+        if self.send(Request::Check { channel, automatic }) {
+            self.status = Status::Checking;
+        }
     }
 
     pub fn install(&mut self) {
         let Status::Available(release) = self.status.clone() else {
             return;
         };
-        if self.pending.is_some() {
-            return;
+        if self.send(Request::Install(Box::new(release.clone()))) {
+            self.status = Status::Downloading(release);
         }
-        let worker_release = release.clone();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(stage(&worker_release).map(Outcome::Staged));
-        });
-        self.pending = Some(rx);
-        self.status = Status::Downloading(release);
     }
 
-    /// Returns true once a check, download, or failure was applied.
+    fn send(&mut self, request: Request) -> bool {
+        if self
+            .commands
+            .as_ref()
+            .is_some_and(|commands| commands.try_send(request).is_ok())
+        {
+            true
+        } else {
+            self.status = Status::Error("更新后台不可用，请关闭并重新打开应用。".into());
+            false
+        }
+    }
+
     pub fn poll(&mut self) -> bool {
-        let Some(rx) = &self.pending else {
+        let Some(results) = &self.results else {
             return false;
         };
-        match rx.try_recv() {
-            Ok(Ok(Outcome::Checked(status))) => {
-                self.status = status;
-                self.pending = None;
-                true
-            }
-            Ok(Ok(Outcome::Staged(staged))) => {
-                self.status = Status::Ready {
-                    version: staged.version.clone(),
-                };
-                self.staged = Some(staged);
-                self.pending = None;
+        match results.try_recv() {
+            Ok(Ok(outcome)) => {
+                self.status = outcome.status;
+                self.notify = outcome.notify;
                 true
             }
             Ok(Err(error)) => {
                 self.status = Status::Error(error);
-                self.pending = None;
                 true
             }
             Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => {
+            Err(TryRecvError::Disconnected) if self.status.is_checking() => {
                 self.status = Status::Error("更新操作中断，请稍后重试。".into());
-                self.pending = None;
                 true
             }
+            Err(TryRecvError::Disconnected) => false,
         }
     }
 }
 
-struct Asset {
-    name: String,
-    url: String,
-    size: u64,
-}
-
-struct Candidate {
-    version: Version,
-    tag: String,
-    page_url: String,
-    assets: Vec<Asset>,
-}
-
-struct ArchiveRef {
-    name: String,
-    sha256: String,
-    size: u64,
-}
-
-fn client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent(format!("Bili-GUI/{VERSION}"))
-        .build()
-        .map_err(|_| "无法创建更新请求。".to_owned())
-}
-
-fn checked(response: reqwest::blocking::Response) -> Result<reqwest::blocking::Response, String> {
-    match response.status().as_u16() {
-        200..=299 => Ok(response),
-        403 | 429 => Err("更新服务暂时限流，请稍后再试。".into()),
-        _ => Err("无法获取更新信息，请检查网络。".into()),
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    if !*stop.borrow() {
+        let _ = stop.changed().await;
     }
 }
 
-fn check(channel: UpdateChannel) -> Result<Status, String> {
-    let current = Version::parse(VERSION).map_err(|_| "当前版本号无效。".to_owned())?;
-    let client = client()?;
-    let mut candidates = Vec::new();
-    for page in 1..=MAX_PAGES {
-        let response = client
-            .get(format!("{API}/releases?per_page=100&page={page}"))
-            .send()
-            .map_err(|_| "无法获取更新信息，请检查网络。".to_owned())?;
-        let response = checked(response)?;
-        let rows: Value = response
-            .json()
-            .map_err(|_| "更新服务返回了无法解析的内容。".to_owned())?;
-        let rows = rows
-            .as_array()
-            .ok_or_else(|| "更新服务返回了无法解析的内容。".to_owned())?;
-        if rows.is_empty() {
+async fn serve(
+    mut commands: async_mpsc::Receiver<Request>,
+    results: mpsc::Sender<Result<Outcome, String>>,
+    mut stop: watch::Receiver<bool>,
+) {
+    loop {
+        let request = tokio::select! {
+            biased;
+            _ = stopped(&mut stop) => break,
+            request = commands.recv() => match request { Some(request) => request, None => break },
+        };
+        let result = match request {
+            Request::Check { channel, automatic } => tokio::select! {
+                biased;
+                _ = stopped(&mut stop) => break,
+                result = check(channel, automatic) => match result {
+                    Err(_) if automatic => Ok(Outcome { status: Status::Idle, notify: false }),
+                    result => result,
+                },
+            },
+            Request::Install(release) => install(&release, &mut stop).await,
+        };
+        if results.send(result).is_err() || *stop.borrow() {
             break;
         }
-        for row in rows {
-            if row.get("draft").and_then(Value::as_bool).unwrap_or(false) {
-                continue;
-            }
-            let Some(tag) = row.get("tag_name").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(version) = canonical_version(tag) else {
-                continue;
-            };
-            let flagged = row
-                .get("prerelease")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if flagged != !version.pre.is_empty() {
-                continue;
-            }
-            if channel == UpdateChannel::Stable && !version.pre.is_empty() {
-                continue;
-            }
-            if version.cmp_precedence(&current) != std::cmp::Ordering::Greater {
-                continue;
-            }
-            let page_url = row
-                .get("html_url")
-                .and_then(Value::as_str)
-                .unwrap_or(REPO_URL)
-                .to_owned();
-            let assets = row
-                .get("assets")
-                .and_then(Value::as_array)
-                .map(|assets| {
-                    assets
-                        .iter()
-                        .filter_map(|asset| {
-                            Some(Asset {
-                                name: asset.get("name")?.as_str()?.to_owned(),
-                                url: asset.get("browser_download_url")?.as_str()?.to_owned(),
-                                size: asset.get("size").and_then(Value::as_u64)?,
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            candidates.push(Candidate {
-                version,
-                tag: tag.to_owned(),
-                page_url,
-                assets,
+    }
+}
+
+fn selected_channel(channel: UpdateChannel) -> Channel {
+    match channel {
+        UpdateChannel::Stable => Channel::Stable,
+        UpdateChannel::Beta => Channel::PreRelease,
+    }
+}
+
+fn reminders(identity: &Identity, channel: Channel) -> Result<ReminderStore, String> {
+    let project = directories::ProjectDirs::from("", "", "bili")
+        .ok_or_else(|| "无法定位更新设置目录。".to_owned())?;
+    Ok(ReminderStore::new(
+        project
+            .cache_dir()
+            .join("update")
+            .join("gui")
+            .join(identity.target().triple())
+            .join(match channel {
+                Channel::Stable => "stable",
+                Channel::PreRelease => "pre-release",
+            }),
+    ))
+}
+
+async fn check(channel: UpdateChannel, automatic: bool) -> Result<Outcome, String> {
+    let identity = identity()?;
+    let channel = selected_channel(channel);
+    let store = reminders(&identity, channel)?;
+    if automatic {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|t| t.as_secs())
+            .unwrap_or(0);
+        if store
+            .begin_check(now, CHECK_INTERVAL_SECS)
+            .map_err(|_| "无法读取更新检查记录。")?
+            != CheckPermit::Due
+        {
+            return Ok(Outcome {
+                status: Status::Idle,
+                notify: false,
             });
         }
-        if rows.len() < 100 {
-            break;
-        }
-        if page == MAX_PAGES {
-            return Err("更新列表过长，无法完成检查。".into());
-        }
     }
-
-    candidates.sort_by(|a, b| b.version.cmp_precedence(&a.version));
-    let mut skipped = false;
-    for candidate in candidates {
-        let Some(descriptor) = target_descriptor(&candidate.assets, TARGET)? else {
-            skipped = true;
-            continue;
-        };
-        let text = text_body(&client, &descriptor.url, MAX_DESCRIPTOR)?;
-        let archive = parse_descriptor(&text, &candidate.tag)?;
-        let mut matches = candidate
-            .assets
-            .iter()
-            .filter(|asset| asset.name == archive.name);
-        let Some(asset) = matches.next() else {
-            return Err("发布清单缺少对应的安装包。".into());
-        };
-        if matches.next().is_some() {
-            return Err("发布清单中的安装包不唯一。".into());
-        }
-        if asset.size != archive.size {
-            return Err("安装包大小与发布清单不一致。".into());
-        }
-        return Ok(Status::Available(Release {
-            tag: candidate.tag,
-            version: candidate.version.to_string(),
-            archive_name: archive.name,
-            archive_url: asset.url.clone(),
-            sha256: archive.sha256,
-            size: archive.size,
-            page_url: candidate.page_url,
-        }));
-    }
-    if skipped {
-        return Ok(Status::NoCompatibleRelease);
-    }
-    Ok(Status::UpToDate)
-}
-
-fn target_descriptor<'a>(assets: &'a [Asset], target: &str) -> Result<Option<&'a Asset>, String> {
-    let name = format!("bili-update-{PRODUCT}-{target}.json");
-    let mut matches = assets.iter().filter(|asset| asset.name == name);
-    let descriptor = matches.next();
-    if matches.next().is_some() {
-        return Err("发布清单中的更新描述不唯一。".into());
-    }
-    Ok(descriptor)
-}
-
-fn text_body(client: &reqwest::blocking::Client, url: &str, limit: u64) -> Result<String, String> {
-    let response = client
-        .get(url)
-        .send()
-        .map_err(|_| "无法下载更新描述。".to_owned())?;
-    let response = checked(response)?;
-    if response.content_length().unwrap_or(0) > limit {
-        return Err("更新描述超出大小限制。".into());
-    }
-    let mut text = String::new();
-    response
-        .take(limit + 1)
-        .read_to_string(&mut text)
-        .map_err(|_| "无法读取更新描述。".to_owned())?;
-    if text.len() as u64 > limit {
-        return Err("更新描述超出大小限制。".into());
-    }
-    Ok(text)
-}
-
-fn canonical_version(tag: &str) -> Option<Version> {
-    let rest = tag.strip_prefix('v')?;
-    let version = Version::parse(rest).ok()?;
-    (format!("v{version}") == tag).then_some(version)
-}
-
-fn parse_descriptor(text: &str, expected_tag: &str) -> Result<ArchiveRef, String> {
-    let value: Value =
-        serde_json::from_str(text).map_err(|_| "更新描述不是有效的 JSON。".to_owned())?;
-    if value.get("schema_version").and_then(Value::as_u64) != Some(1) {
-        return Err("更新描述版本不受支持。".into());
-    }
-    if value.get("product").and_then(Value::as_str) != Some(PRODUCT) {
-        return Err("更新描述属于其他产品。".into());
-    }
-    if value.get("target").and_then(Value::as_str) != Some(TARGET) {
-        return Err("更新描述属于其他平台。".into());
-    }
-    let Some(version) = value.get("version").and_then(Value::as_str) else {
-        return Err("更新描述缺少版本号。".into());
+    let outcome = Updater::new()
+        .map_err(|_| "无法创建更新请求。")?
+        .check(&identity, channel)
+        .await
+        .map_err(|_| "无法获取更新信息，请稍后重试。")?;
+    let notify = match &outcome {
+        CheckOutcome::Available(candidate) if automatic => store
+            .record_notification(channel, &candidate.version)
+            .map_err(|_| "无法保存更新通知记录。")?,
+        _ => true,
     };
-    let Some(tag_version) = canonical_version(expected_tag) else {
-        return Err("发布标签不是规范版本号。".into());
+    let status = match outcome {
+        CheckOutcome::Available(candidate) => Status::Available(candidate.into()),
+        CheckOutcome::UpToDate { .. } => Status::UpToDate,
+        CheckOutcome::NoCompatibleRelease { .. } => Status::NoCompatibleRelease,
     };
-    if version != tag_version.to_string() {
-        return Err("更新描述与发布标签不一致。".into());
-    }
-    let archive = value
-        .get("archive")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "更新描述缺少安装包信息。".to_owned())?;
-    let name = archive
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "更新描述缺少安装包名称。".to_owned())?;
-    if !safe_archive_name(name) {
-        return Err("更新描述的安装包名称不安全。".into());
-    }
-    let expected_suffix = if TARGET.contains("windows") {
-        ".zip"
-    } else {
-        ".tar.gz"
+    Ok(Outcome { status, notify })
+}
+
+async fn install(release: &Release, stop: &mut watch::Receiver<bool>) -> Result<Outcome, String> {
+    let identity = identity()?;
+    let executable = std::env::current_exe().map_err(|_| "无法定位当前安装。")?;
+    InstallRoot::discover(&executable).map_err(install_error)?;
+    let scratch = tempfile::Builder::new()
+        .prefix("bili-gui-update-")
+        .tempdir()
+        .map_err(|_| "无法创建更新临时目录。")?;
+    let archive = scratch
+        .path()
+        .join(&release.candidate.descriptor.archive.name);
+    let updater = Updater::new().map_err(|_| "无法创建更新请求。")?;
+    tokio::select! {
+        biased;
+        _ = stopped(stop) => return Err("更新已取消。".into()),
+        result = updater.download(&release.candidate, &archive) => result.map_err(|_| "下载或校验更新失败，请稍后重试。")?,
     };
-    if !name.starts_with(&format!("bili-gui-{TARGET}-")) || !name.ends_with(expected_suffix) {
-        return Err("更新描述的安装包不是当前平台的 GUI 包。".into());
-    }
-    let format = archive.get("format").and_then(Value::as_str);
-    let expected_format = if TARGET.contains("windows") {
-        "zip"
-    } else {
-        "tar.gz"
-    };
-    if format != Some(expected_format) {
-        return Err("更新描述的安装包格式不受支持。".into());
-    }
-    let sha256 = archive
-        .get("sha256")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "更新描述缺少 SHA-256。".to_owned())?;
-    if sha256.len() != 64
-        || !sha256
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err("更新描述的 SHA-256 无效。".into());
-    }
-    let size = archive
-        .get("size")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "更新描述缺少安装包大小。".to_owned())?;
-    if size == 0 || size > MAX_ARCHIVE {
-        return Err("更新描述的安装包大小无效。".into());
-    }
-    Ok(ArchiveRef {
-        name: name.to_owned(),
-        sha256: sha256.to_owned(),
-        size,
-    })
-}
-
-fn safe_archive_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && !name.starts_with('.')
-        && !name.contains(['/', '\\', ':'])
-        && !name.contains("..")
-}
-
-fn stage(release: &Release) -> Result<StagedUpdate, String> {
-    let updates = updates_dir()?;
-    let work = updates.join(&release.version);
-    if work.exists() {
-        fs::remove_dir_all(&work).map_err(|_| "无法清理旧的更新缓存。".to_owned())?;
-    }
-    fs::create_dir_all(&work).map_err(|_| "无法创建更新目录。".to_owned())?;
-    let archive = work.join(&release.archive_name);
-    download(release, &archive)?;
-    let extracted = work.join("package");
-    extract(&archive, &extracted)?;
-    let Some(root) = package_root(&extracted) else {
-        return Err("更新包缺少可执行文件。".into());
-    };
-    let executable = root.join(executable_rel());
-    let reported = std::process::Command::new(&executable)
-        .arg("--version")
-        .output()
-        .map_err(|_| "更新包无法运行。".to_owned())?;
-    if !reported.status.success() {
-        return Err("更新包自检失败。".into());
-    }
-    let reported = String::from_utf8_lossy(&reported.stdout);
-    let Some(version) = reported.trim().strip_prefix("Bili ") else {
-        return Err("更新包自检失败。".into());
-    };
-    if version != release.version {
-        return Err("更新包版本与发布清单不一致。".into());
-    }
-    let install_root = install_root()?;
-    let marker = serde_json::json!({
-        "version": release.version,
-        "root": root,
-        "install_root": install_root,
-    });
-    fs::write(
-        work.join(MARKER_FILE),
-        serde_json::to_vec_pretty(&marker).map_err(|_| "无法记录待安装更新。".to_owned())?,
-    )
-    .map_err(|_| "无法记录待安装更新。".to_owned())?;
-    Ok(StagedUpdate {
-        version: release.version.clone(),
-        root,
-        install_root,
-    })
-}
-
-fn download(release: &Release, destination: &Path) -> Result<(), String> {
-    let client = client()?;
-    let response = client
-        .get(&release.archive_url)
-        .send()
-        .map_err(|_| "无法下载更新包。".to_owned())?;
-    let mut response = checked(response)?;
-    if let Some(length) = response.content_length() {
-        if length != release.size {
-            return Err("更新包大小与发布清单不一致。".into());
-        }
-    }
-    let mut file = File::create(destination).map_err(|_| "无法写入更新包。".to_owned())?;
-    let mut hasher = Sha256::new();
-    let mut total = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = response
-            .read(&mut buffer)
-            .map_err(|_| "下载更新包时连接中断。".to_owned())?;
-        if read == 0 {
-            break;
-        }
-        total += read as u64;
-        if total > release.size {
-            return Err("更新包超过发布清单记录的大小。".into());
-        }
-        hasher.update(&buffer[..read]);
-        file.write_all(&buffer[..read])
-            .map_err(|_| "无法写入更新包。".to_owned())?;
-    }
-    if total != release.size {
-        return Err("更新包下载不完整。".into());
-    }
-    let digest = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    if digest != release.sha256 {
-        return Err("更新包校验失败，已停止安装。".into());
-    }
-    Ok(())
-}
-
-fn updates_dir() -> Result<PathBuf, String> {
-    directories::ProjectDirs::from("", "", "bili")
-        .map(|dirs| dirs.data_local_dir().join("updates"))
-        .ok_or_else(|| "无法定位更新目录。".to_owned())
-}
-
-fn executable_rel() -> &'static str {
-    if cfg!(windows) {
-        "gui.exe"
-    } else {
-        "bin/gui"
-    }
-}
-
-fn package_root(root: &Path) -> Option<PathBuf> {
-    if root.join(executable_rel()).is_file() {
-        return Some(root.to_path_buf());
-    }
-    let entries = fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() && path.join(executable_rel()).is_file() {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn install_root() -> Result<PathBuf, String> {
-    let executable = std::env::current_exe().map_err(|_| "无法定位当前程序。".to_owned())?;
-    let directory = executable
-        .parent()
-        .ok_or_else(|| "无法定位安装目录。".to_owned())?;
-    if directory.file_name().is_some_and(|name| name == "bin") {
-        directory
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| "无法定位安装目录。".to_owned())
-    } else {
-        Ok(directory.to_path_buf())
-    }
-}
-
-#[cfg(windows)]
-fn extract(archive: &Path, destination: &Path) -> Result<(), String> {
-    let file = File::open(archive).map_err(|_| "无法打开更新包。".to_owned())?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|_| "更新包格式无效。".to_owned())?;
-    let mut total = 0_u64;
-    for index in 0..zip.len() {
-        let mut entry = zip
-            .by_index(index)
-            .map_err(|_| "更新包内容损坏。".to_owned())?;
-        let Some(relative) = entry.enclosed_name() else {
-            return Err("更新包包含不安全的路径。".into());
-        };
-        let target = destination.join(relative);
-        if entry.is_dir() {
-            fs::create_dir_all(&target).map_err(|_| "无法展开更新包。".to_owned())?;
-            continue;
-        }
-        total = total.saturating_add(entry.size());
-        if total > MAX_EXTRACTED {
-            return Err("更新包展开后超出大小限制。".into());
-        }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|_| "无法展开更新包。".to_owned())?;
-        }
-        let mut output = File::create(&target).map_err(|_| "无法展开更新包。".to_owned())?;
-        std::io::copy(&mut entry, &mut output).map_err(|_| "无法展开更新包。".to_owned())?;
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn extract(archive: &Path, destination: &Path) -> Result<(), String> {
-    use std::path::Component;
-    let file = File::open(archive).map_err(|_| "无法打开更新包。".to_owned())?;
-    let decoder = flate2::read::GzDecoder::new(file);
-    let mut tar = tar::Archive::new(decoder);
-    let entries = tar.entries().map_err(|_| "更新包格式无效。".to_owned())?;
-    let mut total = 0_u64;
-    for entry in entries {
-        let mut entry = entry.map_err(|_| "更新包内容损坏。".to_owned())?;
-        let path = entry
-            .path()
-            .map_err(|_| "更新包包含不安全的路径。".to_owned())?;
-        if path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        }) {
-            return Err("更新包包含不安全的路径。".into());
-        }
-        let target = destination.join(&path);
-        if entry.header().entry_type().is_dir() {
-            fs::create_dir_all(&target).map_err(|_| "无法展开更新包。".to_owned())?;
-            continue;
-        }
-        if entry.header().entry_type().is_symlink() {
-            let link = entry
-                .link_name()
-                .map_err(|_| "更新包包含不安全的链接。".to_owned())?
-                .ok_or_else(|| "更新包包含无效的链接。".to_owned())?;
-            if link.is_absolute()
-                || link.components().any(|component| {
-                    matches!(
-                        component,
-                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                    )
-                })
-            {
-                return Err("更新包包含不安全的链接。".into());
-            }
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|_| "无法展开更新包。".to_owned())?;
-            }
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&link, &target)
-                .map_err(|_| "无法展开更新包。".to_owned())?;
-            continue;
-        }
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-        total = total.saturating_add(entry.size());
-        if total > MAX_EXTRACTED {
-            return Err("更新包展开后超出大小限制。".into());
-        }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|_| "无法展开更新包。".to_owned())?;
-        }
-        let mut output = File::create(&target).map_err(|_| "无法展开更新包。".to_owned())?;
-        std::io::copy(&mut entry, &mut output).map_err(|_| "无法展开更新包。".to_owned())?;
-    }
-    Ok(())
-}
-
-/// Applies a staged update left by a previous session before the window opens.
-/// Returns true when a helper was started and this process should exit.
-pub fn apply_pending_update() -> bool {
-    let Ok(updates) = updates_dir() else {
-        return false;
-    };
-    let Ok(entries) = fs::read_dir(&updates) else {
-        return false;
-    };
-    let current = Version::parse(VERSION).ok();
-    for entry in entries.flatten() {
-        let marker_path = entry.path().join(MARKER_FILE);
-        let Ok(bytes) = fs::read(&marker_path) else {
-            continue;
-        };
-        let Ok(marker) = serde_json::from_slice::<Value>(&bytes) else {
-            continue;
-        };
-        let (Some(version), Some(root), Some(install_root)) = (
-            marker.get("version").and_then(Value::as_str),
-            marker.get("root").and_then(Value::as_str),
-            marker.get("install_root").and_then(Value::as_str),
-        ) else {
-            continue;
-        };
-        let Some(version) = Version::parse(version).ok() else {
-            continue;
-        };
-        if current.as_ref().is_some_and(|current| version <= *current) {
-            continue;
-        }
-        let executable = Path::new(root).join(executable_rel());
-        if !executable.is_file() {
-            continue;
-        }
-        let spawned = std::process::Command::new(&executable)
-            .arg("--apply-update")
-            .arg(install_root)
-            .arg(std::process::id().to_string())
-            .spawn();
-        return spawned.is_ok();
-    }
-    false
-}
-
-/// Spawns the staged build, which replaces the installation after this process exits.
-pub fn spawn_helper(staged: &StagedUpdate) -> Result<(), String> {
-    let executable = staged.root.join(executable_rel());
-    std::process::Command::new(&executable)
-        .arg("--apply-update")
-        .arg(&staged.install_root)
-        .arg(std::process::id().to_string())
-        .spawn()
-        .map_err(|_| "无法启动更新程序。".to_owned())?;
-    Ok(())
-}
-
-pub struct HelperRequest {
-    pub install_root: PathBuf,
-    pub parent_pid: u32,
-}
-
-pub fn helper_request() -> Option<HelperRequest> {
-    let mut args = std::env::args_os().skip(1);
-    if args.next()? != "--apply-update" {
-        return None;
-    }
-    let install_root = PathBuf::from(args.next()?);
-    let parent_pid = args.next()?.to_string_lossy().parse().ok()?;
-    Some(HelperRequest {
-        install_root,
-        parent_pid,
-    })
-}
-
-/// Runs inside the staged build after the old process exits.
-pub fn run_helper(request: HelperRequest) -> i32 {
-    wait_for_exit(request.parent_pid);
-    let Some(staged_root) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .and_then(|dir| {
-            if cfg!(windows) {
-                Some(dir)
-            } else {
-                dir.parent().map(Path::to_path_buf)
-            }
+    let candidate = release.candidate.clone();
+    let expected = Identity::new(Product::Gui, identity.target(), &release.version)
+        .map_err(|_| "更新版本号无效。")?;
+    // Once the transaction starts, shutdown joins it through this worker. Never
+    // abort a blocking installer and let it outlive the host runtime.
+    let installed = tokio::task::spawn_blocking(move || {
+        install::install_payload(&executable, &identity, &candidate, &archive, |staged| {
+            validate_staged(staged, &expected, scratch.path())
         })
-    else {
-        return 1;
-    };
-    if copy_tree(&staged_root, &request.install_root).is_err() {
-        return 1;
-    }
-    if let Some(staging) = staged_root.parent() {
-        let _ = fs::remove_file(staging.join(MARKER_FILE));
-    }
-    let executable = request.install_root.join(executable_rel());
-    let _ = std::process::Command::new(executable).spawn();
-    0
+    })
+    .await
+    .map_err(|_| "更新安装任务中断。")?
+    .map_err(install_error)?;
+    Ok(Outcome {
+        status: Status::Ready {
+            version: installed.version.to_string(),
+        },
+        notify: true,
+    })
 }
 
-fn wait_for_exit(pid: u32) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline && process_alive(pid) {
-        std::thread::sleep(Duration::from_millis(200));
+fn install_error(error: InstallError) -> String {
+    match error {
+        InstallError::NotPackaged => "当前为开发构建，只能检查更新；请先安装完整 GUI 包。".into(),
+        InstallError::Busy => "其他更新正在使用此安装，请稍后重试。".into(),
+        InstallError::Validator => "新版本未通过 GUI 身份或运行库检查，旧版本保持不变。".into(),
+        InstallError::Downgrade => "安装中已有相同或更新的版本，请重新检查更新。".into(),
+        _ => "更新安装或校验失败，旧版本保持不变。".into(),
     }
+}
+
+pub fn restart_entry() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|_| "无法定位当前安装。")?;
+    let root = InstallRoot::discover(&executable).map_err(install_error)?;
+    Ok(root.root().join(if cfg!(windows) {
+        "bili.exe"
+    } else {
+        "bin/bili"
+    }))
+}
+
+fn validate_staged(
+    staged: &Staged<'_>,
+    expected: &Identity,
+    scratch: &Path,
+) -> Result<(), InstallError> {
+    if staged.identity() != expected {
+        return Err(InstallError::Validator);
+    }
+    let bytes = staged_doctor(&staged.entry(), scratch)?;
+    validate_report(&bytes, expected)
+}
+
+fn validate_report(bytes: &[u8], expected: &Identity) -> Result<(), InstallError> {
+    if bytes.len() as u64 > MAX_DOCTOR_BYTES {
+        return Err(InstallError::Validator);
+    }
+    let report: Value = serde_json::from_slice(bytes).map_err(|_| InstallError::Validator)?;
+    let expected_build = json!({"product": expected.product().as_str(), "target": expected.target().triple(),
+        "version": expected.version().to_string(), "update_protocol": PROTOCOL});
+    if report.get("schema_version") != Some(&json!(1))
+        || report.get("type") != Some(&json!("doctor"))
+        || report.pointer("/data/build_identity") != Some(&expected_build)
+        || report.pointer("/data/version") != Some(&json!(expected.version().to_string()))
+        || !report.pointer("/data/native").is_some_and(Value::is_object)
+    {
+        return Err(InstallError::Validator);
+    }
+    Ok(())
+}
+
+fn staged_doctor(entry: &Path, scratch: &Path) -> Result<Vec<u8>, InstallError> {
+    let home = scratch.join("home");
+    let roaming = home.join("AppData/Roaming");
+    let local = home.join("AppData/Local");
+    for directory in [
+        &roaming,
+        &local,
+        &home.join("config"),
+        &home.join("data"),
+        &home.join("cache"),
+        &scratch.join("tmp"),
+    ] {
+        std::fs::create_dir_all(directory).map_err(|_| InstallError::Filesystem)?;
+    }
+    #[cfg(windows)]
+    let entry = std::fs::canonicalize(entry).map_err(|_| InstallError::Validator)?;
+    let mut command = std::process::Command::new(entry);
+    command
+        .args(["--json", "doctor"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .env_clear()
+        .current_dir(scratch)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("APPDATA", &roaming)
+        .env("LOCALAPPDATA", &local)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("TEMP", scratch.join("tmp"))
+        .env("TMP", scratch.join("tmp"))
+        .env("TMPDIR", scratch.join("tmp"));
+    #[cfg(windows)]
+    {
+        let (windows, system) = windows_directories()?;
+        let path =
+            std::env::join_paths([system, windows.clone()]).map_err(|_| InstallError::Validator)?;
+        command
+            .env("SystemRoot", &windows)
+            .env("WINDIR", &windows)
+            .env("PATH", path);
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW: validation never opens a console/window.
+    }
+    let mut child = command.spawn().map_err(|_| InstallError::Validator)?;
+    let stdout = child.stdout.take().ok_or(InstallError::Validator)?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.take(MAX_DOCTOR_BYTES + 1).read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + DOCTOR_BUDGET;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            _ => break None,
+        }
+    };
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let bytes = reader.join().map_err(|_| InstallError::Validator)?;
+    if !status.is_some_and(|status| status.success()) || bytes.len() as u64 > MAX_DOCTOR_BYTES {
+        return Err(InstallError::Validator);
+    }
+    Ok(bytes)
 }
 
 #[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
-    const SYNCHRONIZE: u32 = 0x0010_0000;
-    unsafe {
-        let handle = OpenProcess(SYNCHRONIZE, 0, pid);
-        if handle.is_null() {
-            return false;
-        }
-        let state = WaitForSingleObject(handle, 0);
-        CloseHandle(handle);
-        state != WAIT_OBJECT_0
+fn windows_directories() -> Result<(PathBuf, PathBuf), InstallError> {
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemWindowsDirectoryW(buffer: *mut u16, size: u32) -> u32;
+        fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
     }
-}
-
-#[cfg(target_os = "linux")]
-fn process_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
-fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let target = destination.join(entry.file_name());
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else if kind.is_file() {
-            fs::copy(entry.path(), target)?;
-        } else if kind.is_symlink() {
-            #[cfg(unix)]
-            {
-                let link = fs::read_link(entry.path())?;
-                if link.is_relative()
-                    && !link.components().any(|component| {
-                        matches!(
-                            component,
-                            std::path::Component::ParentDir
-                                | std::path::Component::RootDir
-                                | std::path::Component::Prefix(_)
-                        )
-                    })
-                {
-                    let _ = fs::remove_file(&target);
-                    std::os::unix::fs::symlink(link, &target)?;
-                }
-            }
+    let read = |get: unsafe extern "system" fn(*mut u16, u32) -> u32| {
+        let mut buffer = vec![0u16; 32768];
+        // SAFETY: the live writable buffer has exactly the supplied capacity.
+        let length = unsafe { get(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        if length == 0 || length >= buffer.len() {
+            return Err(InstallError::Validator);
         }
-    }
-    Ok(())
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]));
+        if !path.is_absolute() {
+            return Err(InstallError::Validator);
+        }
+        Ok(path)
+    };
+    Ok((
+        read(GetSystemWindowsDirectoryW)?,
+        read(GetSystemDirectoryW)?,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn gui_archive_name(target: &str) -> String {
-        format!(
-            "bili-gui-{target}-release.{}",
-            if target.contains("windows") {
-                "zip"
-            } else {
-                "tar.gz"
-            }
-        )
-    }
-
-    fn asset(name: &str) -> Asset {
-        Asset {
-            name: name.to_owned(),
-            url: String::new(),
-            size: 1,
-        }
-    }
-
-    fn descriptor(version: &str, target: &str, name: &str, size: u64) -> String {
-        format!(
-            r#"{{"schema_version":1,"product":"gui","target":"{target}","version":"{version}",
-            "archive":{{"name":"{name}","format":"{}","sha256":"{}","size":{size}}}}}"#,
-            if target.contains("windows") {
-                "zip"
-            } else {
-                "tar.gz"
-            },
-            "a".repeat(64)
-        )
-    }
-
     #[test]
-    fn canonical_tags_reject_prefixes_and_build_metadata() {
-        assert_eq!(
-            canonical_version("v2.0.0-alpha.6"),
-            Some(Version::parse("2.0.0-alpha.6").unwrap())
-        );
-        assert_eq!(canonical_version("2.0.0"), None);
-        assert_eq!(canonical_version("v02.0.0"), None);
-        let build = canonical_version("v2.0.0+build").unwrap();
-        assert_eq!(
-            build.cmp_precedence(&Version::parse("2.0.0").unwrap()),
-            std::cmp::Ordering::Equal
-        );
-    }
-
-    #[test]
-    fn descriptor_pins_product_target_and_archive() {
-        let name = gui_archive_name(TARGET);
-        let text = descriptor("2.0.0-alpha.7", TARGET, &name, 1024);
-        let archive = parse_descriptor(&text, "v2.0.0-alpha.7").expect("valid descriptor");
-        assert_eq!(archive.size, 1024);
-
-        let wrong_product = text.replace(r#""product":"gui""#, r#""product":"cli""#);
-        assert!(parse_descriptor(&wrong_product, "v2.0.0-alpha.7").is_err());
-        let wrong_tag = parse_descriptor(&text, "v2.0.0-alpha.8");
-        assert!(wrong_tag.is_err());
-        let unsafe_name = text.replace(&name, "../gui.zip");
-        assert!(parse_descriptor(&unsafe_name, "v2.0.0-alpha.7").is_err());
-        let cli_package = text.replace(
-            &name,
-            &format!(
-                "bili-{TARGET}-release.{}",
-                if TARGET.contains("windows") {
-                    "zip"
-                } else {
-                    "tar.gz"
-                }
-            ),
-        );
-        assert!(parse_descriptor(&cli_package, "v2.0.0-alpha.7").is_err());
-    }
-
-    #[test]
-    fn releases_without_this_platforms_gui_package_are_skipped() {
-        let linux_cli = [
-            asset("bili-x86_64-unknown-linux-gnu-release.tar.gz"),
-            asset("bili-native-source-x86_64-unknown-linux-gnu.tar.gz"),
-            asset("bili-update-cli-x86_64-unknown-linux-gnu.json"),
-            asset("SHA256SUMS"),
-        ];
-        assert!(target_descriptor(&linux_cli, "x86_64-pc-windows-msvc")
-            .unwrap()
-            .is_none());
-        assert!(target_descriptor(&linux_cli, "x86_64-unknown-linux-gnu")
-            .unwrap()
-            .is_none());
-
-        let windows_gui = [
-            asset("bili-gui-x86_64-pc-windows-msvc-release.zip"),
-            asset("bili-update-gui-x86_64-pc-windows-msvc.json"),
-            asset("SHA256SUMS"),
-        ];
-        assert!(target_descriptor(&windows_gui, "x86_64-pc-windows-msvc")
-            .unwrap()
-            .is_some());
-        assert!(target_descriptor(&windows_gui, "x86_64-unknown-linux-gnu")
-            .unwrap()
-            .is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tar_extraction_keeps_relative_symlinks() {
-        let base = std::env::temp_dir().join(format!("bili-update-extract-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        let archive = base.join("package.tar.gz");
-        {
-            let encoder = flate2::write::GzEncoder::new(
-                File::create(&archive).unwrap(),
-                flate2::Compression::default(),
+    fn headless_report_requires_gui_candidate_identity_and_complete_envelope() {
+        let identity = Identity::new(Product::Gui, Target::WindowsX86_64Msvc, "2.0.0").unwrap();
+        let report = json!({"schema_version": 1, "type": "doctor", "data": {
+            "version": "2.0.0", "build_identity": {"product": "gui", "target": "x86_64-pc-windows-msvc",
+            "version": "2.0.0", "update_protocol": 1}, "native": {"ffmpeg_version": "8.0.3"}}});
+        let valid = serde_json::to_vec(&report).unwrap();
+        assert_eq!(validate_report(&valid, &identity), Ok(()));
+        for pointer in [
+            "/schema_version",
+            "/type",
+            "/data/version",
+            "/data/build_identity/product",
+            "/data/build_identity/target",
+            "/data/build_identity/version",
+            "/data/build_identity/update_protocol",
+            "/data/native",
+        ] {
+            let mut wrong = report.clone();
+            *wrong.pointer_mut(pointer).unwrap() = Value::Null;
+            assert_eq!(
+                validate_report(&serde_json::to_vec(&wrong).unwrap(), &identity),
+                Err(InstallError::Validator)
             );
-            let mut builder = tar::Builder::new(encoder);
-            let mut file = tar::Header::new_gnu();
-            file.set_size(3);
-            file.set_mode(0o644);
-            file.set_cksum();
-            builder
-                .append_data(&mut file, "pkg/lib/libav.so.62.0", &b"abc"[..])
-                .unwrap();
-            let mut link = tar::Header::new_gnu();
-            link.set_entry_type(tar::EntryType::Symlink);
-            link.set_size(0);
-            link.set_mode(0o777);
-            link.set_link_name("libav.so.62.0").unwrap();
-            link.set_cksum();
-            builder
-                .append_data(&mut link, "pkg/lib/libav.so.62", std::io::empty())
-                .unwrap();
-            builder.into_inner().unwrap().finish().unwrap();
         }
-        let extracted = base.join("out");
-        extract(&archive, &extracted).unwrap();
-        let link = extracted.join("pkg/lib/libav.so.62");
-        assert_eq!(fs::read_link(&link).unwrap(), Path::new("libav.so.62.0"));
-        assert_eq!(fs::read(link).unwrap(), b"abc");
-        fs::remove_dir_all(&base).unwrap();
+        let mut oversized = valid.clone();
+        oversized.resize(MAX_DOCTOR_BYTES as usize + 1, b' ');
+        assert_eq!(
+            validate_report(&oversized, &identity),
+            Err(InstallError::Validator)
+        );
+        assert_eq!(
+            validate_report(&valid[..valid.len() - 1], &identity),
+            Err(InstallError::Validator)
+        );
     }
 
     #[test]
-    fn archive_names_stay_flat_and_short() {
-        assert!(safe_archive_name(
-            "bili-gui-x86_64-pc-windows-msvc-release.zip"
-        ));
-        assert!(!safe_archive_name("../gui.zip"));
-        assert!(!safe_archive_name("nested/gui.zip"));
-        assert!(!safe_archive_name(".hidden.zip"));
-        assert!(!safe_archive_name(&"a".repeat(129)));
+    fn gui_identity_and_channel_are_shell_owned() {
+        assert_eq!(identity().unwrap().product(), Product::Gui);
+        assert_eq!(selected_channel(UpdateChannel::Stable), Channel::Stable);
+        assert_eq!(selected_channel(UpdateChannel::Beta), Channel::PreRelease);
+    }
+
+    #[tokio::test]
+    async fn host_joins_the_idle_update_worker() {
+        let (mut state, owner) = UpdateState::connected(&tokio::runtime::Handle::current());
+        owner.finish().await;
+        assert!(!state.poll());
+        state.start(UpdateChannel::Stable);
+        assert!(matches!(state.status(), Status::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn available_candidate_is_checked_again_after_the_interval() {
+        let candidate: UpdateCandidate = serde_json::from_value(json!({
+            "tag": "v2.0.0", "version": "2.0.0", "channel": "stable", "descriptor": {
+                "schema_version": 1, "product": "gui", "target": "x86_64-pc-windows-msvc", "version": "2.0.0",
+                "archive": {"name": "gui.zip", "format": "zip", "sha256": "0".repeat(64), "size": 1}
+            }
+        })).unwrap();
+        let release = Release::from(candidate);
+        let (mut state, owner) = UpdateState::connected(&tokio::runtime::Handle::current());
+        let now = Instant::now();
+        state.status = Status::Available(release.clone());
+        state.last_automatic = Some(now);
+        assert!(!state.automatic_due_at(now));
+        let due = now + Duration::from_secs(CHECK_INTERVAL_SECS);
+        assert!(state.automatic_due_at(due));
+        for status in [
+            Status::Checking,
+            Status::Downloading(release),
+            Status::Ready {
+                version: "2.0.0".into(),
+            },
+        ] {
+            state.status = status;
+            assert!(!state.automatic_due_at(due));
+        }
+        owner.finish().await;
+    }
+
+    /// Native package acceptance. Inputs are locally source-built version A/B
+    /// packages, never a mocked report or a published test release.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires BILI_GUI_BASE_INSTALL, BILI_GUI_UPDATE_ARCHIVE and BILI_GUI_UPDATE_DESCRIPTOR"]
+    fn native_gui_packages_update_at_multiple_depths_and_preserve_failures() {
+        use bili_core::update::Descriptor;
+        use std::collections::BTreeMap;
+        use std::os::windows::ffi::OsStrExt;
+
+        fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+            fn visit(root: &Path, directory: &Path, output: &mut BTreeMap<PathBuf, Vec<u8>>) {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        visit(root, &entry.path(), output);
+                    } else {
+                        output.insert(
+                            entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                            std::fs::read(entry.path()).unwrap(),
+                        );
+                    }
+                }
+            }
+            let mut output = BTreeMap::new();
+            visit(root, root, &mut output);
+            output
+        }
+
+        let source = PathBuf::from(
+            std::env::var_os("BILI_GUI_BASE_INSTALL").expect("base GUI installation"),
+        );
+        let archive =
+            PathBuf::from(std::env::var_os("BILI_GUI_UPDATE_ARCHIVE").expect("candidate archive"));
+        let descriptor =
+            std::env::var_os("BILI_GUI_UPDATE_DESCRIPTOR").expect("candidate descriptor");
+        let descriptor: Descriptor =
+            serde_json::from_slice(&std::fs::read(descriptor).unwrap()).unwrap();
+        let candidate = UpdateCandidate {
+            tag: format!("v{}", descriptor.version),
+            version: descriptor.version.clone(),
+            channel: Channel::of(&descriptor.version),
+            descriptor,
+        };
+        let expected = Identity::new(
+            Product::Gui,
+            Target::WindowsX86_64Msvc,
+            &candidate.version.to_string(),
+        )
+        .unwrap();
+        let running = identity().unwrap();
+        let original = snapshot(&source);
+        let temporary = tempfile::tempdir().unwrap();
+        for depth in [0, 180, 300] {
+            let mut root = temporary.path().join(format!("安装 空格-{depth}"));
+            while root.as_os_str().encode_wide().count() < depth {
+                root = root.join("nested-installation-depth");
+            }
+            std::fs::create_dir_all(&root).unwrap();
+            for (relative, bytes) in &original {
+                let path = root.join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+            let sentinel = root.join("user-file.txt");
+            std::fs::write(&sentinel, b"preserve user data").unwrap();
+            let before = snapshot(&root);
+            let selected = InstallRoot::discover(&root.join("bili.exe"))
+                .unwrap()
+                .current()
+                .unwrap();
+            let executable = root
+                .join("versions")
+                .join(selected.as_str())
+                .join("bili.exe");
+            let scratch = temporary.path().join(format!("scratch-{depth}"));
+            std::fs::create_dir_all(&scratch).unwrap();
+            let baseline = staged_doctor(&root.join("bili.exe"), &scratch).unwrap();
+            validate_report(&baseline, &running).unwrap();
+
+            let rejected =
+                install::install_payload(&executable, &running, &candidate, &archive, |staged| {
+                    // Fault injection touches the inactive candidate only; the real
+                    // headless GUI validator must reject the missing runtime DLL.
+                    let library = std::fs::read_dir(staged.payload())
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .find(|p| {
+                            p.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .to_ascii_lowercase()
+                                .contains("avutil")
+                                && p.extension().is_some_and(|e| e == "dll")
+                        })
+                        .expect("packaged avutil DLL");
+                    std::fs::remove_file(library).unwrap();
+                    validate_staged(staged, &expected, &scratch)
+                });
+            assert_eq!(rejected, Err(InstallError::Validator));
+            for (relative, bytes) in &before {
+                assert_eq!(
+                    &std::fs::read(root.join(relative)).unwrap(),
+                    bytes,
+                    "failure changed {}",
+                    relative.display()
+                );
+            }
+            let installed =
+                install::install_payload(&executable, &running, &candidate, &archive, |staged| {
+                    validate_staged(staged, &expected, &scratch)
+                })
+                .expect("real GUI transaction");
+            assert_eq!(installed.version, candidate.version);
+            let report = staged_doctor(&root.join("bili.exe"), &scratch).unwrap();
+            validate_report(&report, &expected).unwrap();
+            for (relative, bytes) in &before {
+                if relative != Path::new("CURRENT") {
+                    assert_eq!(
+                        &std::fs::read(root.join(relative)).unwrap(),
+                        bytes,
+                        "update changed {}",
+                        relative.display()
+                    );
+                }
+            }
+            assert_eq!(
+                install::install_payload(&executable, &running, &candidate, &archive, |_| panic!(
+                    "repeat candidate must be rejected before validation"
+                )),
+                Err(InstallError::Downgrade)
+            );
+            eprintln!(
+                "GUI package activation and preservation passed at root length {} UTF-16 units",
+                root.as_os_str().encode_wide().count()
+            );
+        }
     }
 }

@@ -140,10 +140,8 @@ pub struct GuiPrefs {
     /// Opt-in marker only: the credential itself lives in the OS keyring.
     pub remember_login: bool,
     pub output: Option<PathBuf>,
-    pub auto_check: bool,
-    /// Download and stage a new GUI release; the swap still needs a restart.
-    pub auto_update: bool,
-    pub update_channel: UpdateChannel,
+    /// Shared protocol preferences; this file never contains account credentials.
+    pub update: bili_core::update::UpdateSettings,
     /// Unix seconds of the last successful or failed check. No credentials.
     pub last_check: u64,
 }
@@ -164,15 +162,21 @@ impl Default for GuiPrefs {
             confirm_close: true,
             remember_login: false,
             output: None,
-            auto_check: false,
-            auto_update: false,
-            update_channel: UpdateChannel::Stable,
+            update: bili_core::update::UpdateSettings::default(),
             last_check: 0,
         }
     }
 }
 
 impl GuiPrefs {
+    pub fn update_channel(&self) -> UpdateChannel {
+        if self.update.allow_pre_release {
+            UpdateChannel::Beta
+        } else {
+            UpdateChannel::Stable
+        }
+    }
+
     pub fn sanitized(mut self) -> Self {
         if THEMES.iter().all(|t| t.id != self.theme) {
             self.theme = THEMES[0].id.into();
@@ -272,5 +276,22 @@ mod tests {
         assert_eq!(back, prefs);
         assert!(!json.contains("cookie"));
         assert!(!json.contains("token"));
+    }
+
+    #[test]
+    fn update_settings_use_shared_keys_and_defaults() {
+        let prefs: GuiPrefs = serde_json::from_str("{}").unwrap();
+        assert!(prefs.update.check_updates);
+        assert!(!prefs.update.allow_pre_release);
+        assert!(!prefs.update.auto_update);
+        let opted_in: GuiPrefs =
+            serde_json::from_str(r#"{"update":{"allow_pre_release":true,"auto_update":true}}"#)
+                .unwrap();
+        assert_eq!(opted_in.update_channel(), UpdateChannel::Beta);
+        assert!(opted_in.update.check_updates);
+        assert!(opted_in.update.auto_update);
+        let value = serde_json::to_value(opted_in).unwrap();
+        assert_eq!(value["update"]["allow_pre_release"], true);
+        assert!(value.get("auto_check").is_none());
     }
 }

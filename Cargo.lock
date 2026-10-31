@@ -534,6 +534,7 @@ version = "0.1.0"
 dependencies = [
  "cookie",
  "ffmpeg-next",
+ "flate2",
  "fs2",
  "futures-util",
  "httpdate",
@@ -546,15 +547,18 @@ dependencies = [
  "rand 0.8.8",
  "reqwest",
  "same-file",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
  "uuid",
  "windows-sys 0.61.0",
+ "zip",
 ]
 
 [[package]]
@@ -979,6 +983,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-bootstrap"
+version = "0.1.0"
+
+[[package]]
 name = "core-cli"
 version = "2.0.0-alpha.6"
 dependencies = [
@@ -990,7 +998,9 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "unicode-width",
  "zeroize",
 ]
 
@@ -1634,7 +1644,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
 dependencies = [
  "futures-core",
- "futures-sink",
 ]
 
 [[package]]
@@ -1947,19 +1956,14 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
- "flate2",
  "image 0.24.9",
  "qrcode",
- "reqwest",
  "rfd",
- "semver",
  "serde",
  "serde_json",
- "sha2",
- "tar",
+ "tempfile",
  "tokio",
  "windows-sys 0.61.0",
- "zip",
 ]
 
 [[package]]
@@ -3778,7 +3782,6 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -4023,6 +4026,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"
@@ -4536,7 +4543,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

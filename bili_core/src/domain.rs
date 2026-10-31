@@ -282,6 +282,17 @@ pub struct QualityEntry {
     pub label: String,
     pub rank: u32,
     pub availability: Availability,
+    /// Explicit upstream requirements; absence is not equivalent to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_login: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_vip: Option<bool>,
+    /// This catalog response returned a valid video address for this quality.
+    /// Metadata and account requirements are independent of this evidence.
+    #[serde(default)]
+    pub has_video_url: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advertised_codecs: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityCatalog {

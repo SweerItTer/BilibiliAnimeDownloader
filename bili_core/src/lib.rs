@@ -9,10 +9,12 @@ pub mod auth;
 pub mod cookie;
 mod domain;
 mod download;
+pub mod install;
 pub mod remux;
 mod service;
 pub mod sidecar;
 mod state;
+pub mod update;
 
 pub use auth::{AuthAction, AuthSnapshot};
 pub use domain::*;
