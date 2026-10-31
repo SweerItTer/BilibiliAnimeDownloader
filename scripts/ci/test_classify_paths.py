@@ -16,8 +16,14 @@ class ClassifyPathsTests(unittest.TestCase):
         self.assertFalse(result["run_cli"])
 
     def test_cli_only_and_gui_only_routes(self):
-        self.assertEqual(classify_paths(("core-cli/src/main.rs",))["scope"], "cli")
-        self.assertEqual(classify_paths(("gui/src/main.rs",))["scope"], "gui")
+        cli = classify_paths(("core-cli/src/main.rs",))
+        gui = classify_paths(("gui/src/main.rs",))
+        self.assertEqual(cli["scope"], "cli")
+        self.assertEqual(gui["scope"], "gui")
+        self.assertTrue(cli["run_cli"])
+        self.assertFalse(cli["run_gui"])
+        self.assertFalse(gui["run_cli"])
+        self.assertTrue(gui["run_gui"])
 
     def test_core_bootstrap_uses_the_existing_cli_route(self):
         self.assertEqual(classify_paths(("core-bootstrap/src/main.rs",))["scope"], "cli")
@@ -49,7 +55,7 @@ class ClassifyPathsTests(unittest.TestCase):
         self.assertEqual(classify_paths(())["scope"], "full")
 
     def test_manual_dispatch_and_first_push_are_full(self):
-        expected = {"scope": "full", "docs_changed": False, "run_cli": True}
+        expected = {"scope": "full", "docs_changed": False, "run_cli": True, "run_gui": True}
         self.assertEqual(classify_event("workflow_dispatch", {}), expected)
         self.assertEqual(classify_event("push", {"before": "0" * 40, "after": "1" * 40}), expected)
 

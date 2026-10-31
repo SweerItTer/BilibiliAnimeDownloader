@@ -197,18 +197,26 @@ def source_files(crate_root, license_file):
         if not candidate.is_file() or not candidate.is_relative_to(crate_root):
             raise ValueError(f"Cargo license_file escapes crate root or is not a file: {license_file}")
         files.append(candidate)
-    for candidate in crate_root.iterdir():
+    for candidate in crate_root.rglob("*"):
         if not candidate.is_file():
             continue
         stem = candidate.name.casefold().split(".", 1)[0]
-        if stem in LICENSE_FILES or any(stem.startswith(name + "-") or stem.startswith(name + "_") for name in LICENSE_FILES):
+        if (stem in LICENSE_FILES
+                or any(stem.startswith(name + "-") or stem.startswith(name + "_")
+                       for name in LICENSE_FILES)
+                or stem in {"ofl", "ufl"}
+                or candidate.name.casefold().endswith(
+                    ("-license.txt", "-licence.txt", "_license.txt", "_licence.txt"))):
             resolved = candidate.resolve(strict=True)
             if not resolved.is_relative_to(crate_root):
                 raise ValueError(f"license text symlink escapes crate root: {candidate.name}")
             files.append(resolved)
-    files = sorted(set(files), key=lambda path: (path.name.casefold(), path.name))
-    if len({path.name.casefold() for path in files}) != len(files):
-        raise ValueError(f"case-insensitive license filename collision in {crate_root.name}")
+    def relative(path):
+        return path.relative_to(crate_root).as_posix()
+
+    files = sorted(set(files), key=lambda path: (relative(path).casefold(), relative(path)))
+    if len({relative(path).casefold() for path in files}) != len(files):
+        raise ValueError(f"case-insensitive license path collision in {crate_root.name}")
     return files
 
 
@@ -223,19 +231,22 @@ def copy_text(source, dest, output_root, provenance, data=None):
     return {"path": dest.relative_to(output_root).as_posix(), "sha256": hashlib.sha256(data).hexdigest(), "provenance": provenance}
 
 
-def pinned_declared_license(package, version, declaration, output_root):
+def find_pinned_source(package, version, declaration):
     lock = json.loads((ROOT / "scripts/dependency-license-lock.json").read_text(encoding="utf-8"))
     matches = [source for source in lock.get("sources", [])
                if source.get("package") == package and source.get("version") == version]
-    if len(matches) != 1 or matches[0].get("spdx") != declaration:
-        raise ValueError(f"no exact pinned full-text source for {package} {version} ({declaration})")
-    source = matches[0]
+    if len(matches) == 1 and matches[0].get("spdx") == declaration:
+        return matches[0]
+    return None
+
+
+def fetch_pinned_text(source, cache_key, output_root, provenance):
     if (not source.get("url", "").startswith("https://") or
             not re.fullmatch(r"[0-9a-f]{64}", source.get("sha256", "")) or
             Path(source.get("filename", "")).name != source.get("filename")):
-        raise ValueError(f"invalid pinned license source for {package} {version}")
+        raise ValueError(f"invalid pinned license source for {cache_key}")
     cache = ROOT / "target/license-cache"
-    cached = cache / f"{package}-{version}-{source['filename']}"
+    cached = cache / f"{cache_key}-{source['filename']}"
     if cached.exists():
         data = cached.read_bytes()
     else:
@@ -243,7 +254,7 @@ def pinned_declared_license(package, version, declaration, output_root):
         with urllib.request.urlopen(request, timeout=60) as response:
             data = response.read()
         if hashlib.sha256(data).hexdigest() != source["sha256"]:
-            raise ValueError(f"downloaded license source checksum mismatch for {package} {version}")
+            raise ValueError(f"downloaded license source checksum mismatch for {cache_key}")
         cache.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=f".{cached.name}.", dir=cache)
         try:
@@ -256,13 +267,59 @@ def pinned_declared_license(package, version, declaration, output_root):
         finally:
             Path(temporary).unlink(missing_ok=True)
     if hashlib.sha256(data).hexdigest() != source["sha256"]:
-        raise ValueError(f"cached license source checksum mismatch for {package} {version}")
-    destination = output_root / "licenses" / "crates" / f"{package}-{version}" / source["filename"]
-    text_record = copy_text(Path(source["filename"]), destination, output_root,
-                            f"pinned canonical SPDX license text: {source['url']}", data)
-    return text_record, {
+        raise ValueError(f"cached license source checksum mismatch for {cache_key}")
+    destination = output_root / "licenses" / "crates" / cache_key / source["filename"]
+    record = copy_text(Path(source["filename"]), destination, output_root, provenance, data)
+    return record, {
         "url": source["url"], "sha256": source["sha256"], "provenance": source["provenance"],
     }
+
+
+def pinned_declared_license(package, version, declaration, output_root):
+    source = find_pinned_source(package, version, declaration)
+    if source is None:
+        raise ValueError(f"no exact pinned full-text source for {package} {version} ({declaration})")
+    return fetch_pinned_text(
+        source, f"{package}-{version}", output_root,
+        f"pinned canonical SPDX license text: {source['url']}",
+    )
+
+
+def declared_license_ids(declaration):
+    identifiers = []
+    skip = False
+    for token in re.split(r"[()\s/]+", declaration):
+        if not token or token in {"AND", "OR"}:
+            continue
+        if token == "WITH":
+            skip = True
+            continue
+        if skip:
+            skip = False
+            continue
+        identifiers.append(token)
+    return identifiers
+
+
+def canonical_declared_licenses(package, version, declaration, output_root):
+    lock = json.loads((ROOT / "scripts/spdx-license-lock.json").read_text(encoding="utf-8"))
+    records = []
+    sources = []
+    for identifier in declared_license_ids(declaration):
+        if identifier.startswith("LicenseRef-"):
+            raise ValueError(
+                f"dependency {package} {version} declares {identifier} without shipping its text")
+        matches = [source for source in lock.get("sources", []) if source.get("spdx") == identifier]
+        if len(matches) != 1:
+            raise ValueError(f"no pinned canonical SPDX text for {identifier} ({package} {version})")
+        source = matches[0]
+        record, info = fetch_pinned_text(
+            source, f"{package}-{version}", output_root,
+            f"canonical SPDX text for {identifier} declared by {package} {version}",
+        )
+        records.append(record)
+        sources.append(info)
+    return records, sources
 
 
 def runtime_root(target):
@@ -314,21 +371,26 @@ def collect(args):
         declaration = package.get("license")
         if not declaration:
             raise ValueError(f"missing license declaration for {package['name']} {package['version']}")
-        try:
-            parse_expression(declaration)
-        except ValueError as error:
-            raise ValueError(
-                f"unsupported license declaration for {package['name']} {package['version']} "
-                f"({declaration!r}): {error}"
-            ) from error
         texts = source_files(crate_root, package.get("license_file"))
         if not texts:
-            text_record, license_source = pinned_declared_license(
-                package["name"], package["version"], declaration, output_root)
+            try:
+                parse_expression(declaration)
+            except ValueError as error:
+                raise ValueError(
+                    f"unsupported license declaration for {package['name']} {package['version']} "
+                    f"({declaration!r}): {error}"
+                ) from error
+            if find_pinned_source(package["name"], package["version"], declaration) is not None:
+                text_record, license_source = pinned_declared_license(
+                    package["name"], package["version"], declaration, output_root)
+                text_records, license_sources = [text_record], [license_source]
+            else:
+                text_records, license_sources = canonical_declared_licenses(
+                    package["name"], package["version"], declaration, output_root)
             records.append({
                 "package_id": package["id"], "name": package["name"], "version": package["version"],
                 "source": source, "checksum": checksum, "spdx": declaration,
-                "license_sources": [license_source], "texts": [text_record],
+                "license_sources": license_sources, "texts": text_records,
             })
             continue
         verified_texts = verify_archive_license_texts(archive, crate_root, package["name"], package["version"], texts)
@@ -336,7 +398,7 @@ def collect(args):
         records.append({
             "package_id": package["id"], "name": package["name"], "version": package["version"],
             "source": source, "checksum": checksum, "spdx": declaration,
-            "texts": [copy_text(path, output_root / prefix / path.name, output_root,
+            "texts": [copy_text(path, output_root / prefix / path.relative_to(crate_root), output_root,
                                 f"Cargo registry archive {path.relative_to(crate_root).as_posix()}",
                                 verified_texts[path]) for path in texts],
         })
@@ -376,7 +438,7 @@ def collect(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--package", choices=("core-cli", "bili_core"), required=True)
+    parser.add_argument("--package", choices=("core-cli", "bili_core", "gui"), required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rust-runtime", action="store_true")

@@ -1,11 +1,30 @@
 [package]
 name = "gui"
-version = "0.1.0"
+version = "2.0.0-alpha.6"
 edition = "2021"
 description = "egui + eframe desktop UI for the Bilibili download app"
 
 [dependencies]
 eframe = "0.29"
 egui = "0.29"
+image = { version = "0.24", features = ["png", "jpeg", "webp"] }
 bili_core = { path = "../bili_core" }
+directories = "6"
+qrcode = { version = "0.14", default-features = false }
+rfd = { version = "0.15", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.46", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+tempfile = "3"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }

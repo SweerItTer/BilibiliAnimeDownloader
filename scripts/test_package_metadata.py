@@ -10,6 +10,7 @@ from package_metadata import (
     current_id,
     descriptor_document,
     installation_payload,
+    parse_doctor_identity,
     validate_descriptor,
     write_inventory,
 )
@@ -18,6 +19,44 @@ from verify_package import check_checksums
 
 class PackageMetadataTests(unittest.TestCase):
     target = "x86_64-unknown-linux-gnu"
+
+    def test_gui_payload_is_versioned_and_cannot_be_opened_as_cli(self):
+        target = "x86_64-pc-windows-msvc"
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            payload = base / "payload"
+            payload.mkdir()
+            (payload / "bili.exe").write_bytes(b"native GUI payload")
+            digest = hashlib.sha256(b"native GUI payload").hexdigest()
+            (payload / "BUILD_INFO.json").write_text(json.dumps({
+                "product": "gui", "app_sha256": digest,
+                "update_protocol": 1, "layout_version": 1, "bootstrap_protocol": 1,
+            }), encoding="utf-8")
+            write_inventory(payload)
+            bootstrap = base / "bootstrap.exe"
+            bootstrap.write_bytes(b"stable bootstrap")
+            root = base / "install"
+            assembled = assemble_install_root(root, payload, bootstrap, target, "gui")
+            self.assertEqual(installation_payload(root, target, "gui"), assembled)
+            self.assertEqual((assembled / "bili.exe").read_bytes(), b"native GUI payload")
+            self.assertEqual((root / "bili.exe").read_bytes(), b"stable bootstrap")
+            check_checksums(root)
+            check_checksums(assembled)
+            with self.assertRaises(ValueError):
+                installation_payload(root, target, "cli")
+
+    def test_doctor_identity_rejects_cross_product_and_wrong_version(self):
+        target = "x86_64-pc-windows-msvc"
+        report = {"schema_version": 1, "type": "doctor", "data": {
+            "version": "2.0.0", "build_identity": {
+                "product": "gui", "target": target, "version": "2.0.0", "update_protocol": 1,
+            }, "native": {},
+        }}
+        text = json.dumps(report)
+        self.assertEqual(parse_doctor_identity(text, "bili 2.0.0", target, "gui"), "2.0.0")
+        for product, version in (("cli", "2.0.0"), ("gui", "2.0.1")):
+            with self.subTest(product=product, version=version), self.assertRaises(ValueError):
+                parse_doctor_identity(text, f"bili {version}", target, product)
 
     def test_versioned_install_root_has_nested_verified_inventories(self):
         with tempfile.TemporaryDirectory() as temporary:

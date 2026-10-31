@@ -33,8 +33,7 @@ The runtime package keeps the stable entry at `bin/bili` and the CLI plus native
 
 The release also publishes `bili-update-cli-<target>.json` beside the package archive; it is a separate Release asset, not a file inside the package, and it is covered by the same checksum file. The updater reads it to find the package. From a packaged build, `./bin/bili update --check` only reports a newer release; `./bin/bili update` installs one. An unpackaged developer build refuses to install, because it has no installation marker.
 
-The feature baseline passed Linux and Windows CI builds/tests, MSVC package inspection, and Ubuntu 22.04/24.04 package checks. Windows also passed a real GitHub download-and-install smoke. After fixing Linux archive links that precede their targets, the core installer successfully installed a cached official archive and ran the staged native doctor in a clean environment.
-That is not a complete live CLI update: the latest Linux attempt was blocked by GitHub's anonymous API quota. Keep self-update trials isolated until the remaining acceptance in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md) is complete. The published Alpha 6 package cannot self-update; install the first compatible package into a new directory manually.
+Historical Linux and Windows build, package and update results are recorded in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md), together with the later Windows path repair and its verification limits. Keep self-update trials isolated. The published Alpha 6 package cannot self-update; install the first compatible package into a new directory manually.
 
 ## Linux build environment image
 
@@ -89,9 +88,11 @@ The final product names are:
 |---|---|---|
 | `linux-cli` | Linux x86_64 CLI | Produced and verified |
 | `windows-cli` | Windows x86_64 CLI | Produced and verified |
-| `windows-gui` | Windows x86_64 GUI | Reserved; developed separately, no empty package uploaded |
+| `windows-gui` | Windows x86_64 GUI | GUI CI product on this branch; not an application release asset |
 
 Each CLI artifact contains its executable package (stable bootstrap and versioned CLI payload), the matching `bili-native-source-<target>.tar.gz`, `bili-update-cli-<target>.json`, and `SHA256SUMS` covering exactly those three assets. The source sidecar contains the pinned FFmpeg source, build recipe, and notices; keep it with the binary when redistributing. SDK hashes never enter the product checksum file.
+
+The GUI uses the same versioned layout and full package inspection with its own `gui` identity and descriptor. Build its Windows bootstrap with `--features packaged,gui` and static CRT; packaging rejects a console-subsystem GUI entry. The Windows artifact upload and download both use `windows-gui`. Linux GUI packages remain internal CI handoffs named `gui-internal-x86_64-unknown-linux-gnu`; their inspection does not establish GUI runtime qualification. See [the GUI build and update instructions](gui/README.md). This does not add GUI assets to the release workflow.
 
 SDK verification still runs in both modes. Only the dylib SDK is needed by downstream smoke jobs, so CI no longer creates or uploads the unused rlib SDK archive. CLI/source bundles and the SDK handoff are staged separately. Native replacements, the synthetic fixture, and verification receipts remain short-lived job handoffs while checks run.
 
@@ -103,7 +104,7 @@ Archive references and digests appear in that workflow's step summary. Use the e
 
 ## Windows x86_64
 
-Use an initialized Visual Studio x64 MSVC developer environment, MSYS2 Bash/make/NASM, and the pinned Rust toolchain with the `x86_64-pc-windows-msvc` target. FFmpeg is built with MSVC, not MinGW. In PowerShell from the repository root:
+Use an initialized Visual Studio 2022 x64 MSVC developer environment, MSYS2 Bash/make/NASM, and the pinned Rust toolchain with the `x86_64-pc-windows-msvc` target. The package recipe uses its VC143 redistributables and matching notices. On a localized installation, include the English language resources and set `$env:VSLANG = "1033"` before building: FFmpeg's configure probes expect the English compiler version banner. FFmpeg is built with MSVC, not MinGW. In PowerShell from the repository root:
 
 ```powershell
 $env:FFMPEG_DIR = "$PWD\target\native\x86_64-pc-windows-msvc"
@@ -113,6 +114,19 @@ cargo rustc -p core-bootstrap --bin bili-bootstrap --features packaged --release
 ```
 
 No Windows CLI package has been published. Ordinary workspace checks use the development bootstrap; shipping builds enable `packaged`, which rejects Windows builds without `crt-static`. Package inspection also checks actual DLL imports. The installer entry is statically linked to the C runtime; runtime DLLs remain inside the selected `versions/<id>/` payload.
+
+Windows staged validation and the stable entry retain the executable's canonical verbatim path. This lets process creation use a deep installation or staging path without changing the installation layout, skipping the native doctor, or replacing a running EXE/DLL. Existing filesystem path limits still apply. To check a compatible packaged installation in PowerShell, run `.\bili.exe update --check`; `.\bili.exe update` installs an available compatible update.
+
+The offline package acceptance test needs an extracted baseline matching the CLI version under test, a newer descriptor and its exact ZIP. It copies the baseline into several directory depths, including spaces and Chinese names; the original remains untouched:
+
+```powershell
+$env:BILI_TEST_UPDATE_BASELINE = 'C:\path\to\extracted-baseline'
+$env:BILI_TEST_UPDATE_DESCRIPTOR = 'C:\path\to\bili-update-cli-x86_64-pc-windows-msvc.json'
+$env:BILI_TEST_UPDATE_ARCHIVE = 'C:\path\to\newer-package.zip'
+cargo test -p core-cli --locked --target x86_64-pc-windows-msvc update::package_tests::offline_windows_packages_update_at_multiple_depths -- --ignored --exact --nocapture
+```
+
+Use source-built isolated fixtures, never a live installation. The test runs the real staged doctor, checks failure preservation, activates the candidate and runs the new outer entry's version/native doctor. It also rejects a stale retry. This is an offline installation test; it does not publish a release or exercise a new public download.
 
 ## Local checks
 

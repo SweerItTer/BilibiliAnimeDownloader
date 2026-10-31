@@ -24,11 +24,13 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def parse_doctor_identity(doctor_output, version_output, target):
+def parse_doctor_identity(doctor_output, version_output, target, product=PRODUCT):
+    if product not in PRODUCTS:
+        raise ValueError(f"unsupported package product: {product}")
     try:
         version_line = version_output.strip()
         if not version_line.startswith("bili ") or not version_line[5:]:
-            raise ValueError("invalid CLI version output")
+            raise ValueError("invalid application version output")
         version = version_line[5:]
         lines = [line for line in doctor_output.splitlines() if line.strip()]
         if len(lines) != 1:
@@ -38,13 +40,13 @@ def parse_doctor_identity(doctor_output, version_output, target):
         identity = data.get("build_identity") if isinstance(data, dict) else None
         if (envelope.get("schema_version") != 1 or envelope.get("type") != "doctor"
                 or not isinstance(identity, dict)
-                or identity != {"product": PRODUCT, "target": target,
+                or identity != {"product": product, "target": target,
                                 "version": version, "update_protocol": PROTOCOL}
                 or data.get("version") != version):
             raise ValueError("doctor build identity disagrees with the built executable")
         return version
     except (AttributeError, json.JSONDecodeError, TypeError) as error:
-        raise ValueError("cannot validate CLI doctor build identity") from error
+        raise ValueError("cannot validate application doctor build identity") from error
 
 
 def descriptor_name(target, product=PRODUCT):
@@ -149,15 +151,17 @@ def write_inventory(root):
     return inventory
 
 
-def assemble_install_root(root, payload, bootstrap, target):
+def assemble_install_root(root, payload, bootstrap, target, product=PRODUCT):
     if target not in TARGETS:
         raise ValueError(f"unsupported package target: {target}")
+    if product not in PRODUCTS:
+        raise ValueError(f"unsupported package product: {product}")
     root, payload, bootstrap = map(Path, (root, payload, bootstrap))
     if not payload.is_dir() or payload.is_symlink() or not bootstrap.is_file() or bootstrap.is_symlink():
         raise ValueError("payload or bootstrap input is missing or unsafe")
     build_info = json.loads((payload / "BUILD_INFO.json").read_text(encoding="utf-8"))
     app_sha = build_info.get("app_sha256")
-    if (build_info.get("product") != PRODUCT
+    if (build_info.get("product") != product
             or any(build_info.get(key) != PROTOCOL
                    for key in ("update_protocol", "layout_version", "bootstrap_protocol"))
             or not isinstance(app_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", app_sha)):
@@ -177,7 +181,7 @@ def assemble_install_root(root, payload, bootstrap, target):
         "schema_version": PROTOCOL,
         "layout_version": PROTOCOL,
         "bootstrap_protocol": PROTOCOL,
-        "product": PRODUCT,
+        "product": product,
         "target": target,
     }
     (root / ".bili-install.json").write_text(
@@ -203,23 +207,23 @@ def current_id(raw):
     return value
 
 
-def validate_marker(marker, target):
+def validate_marker(marker, target, product=PRODUCT):
     if (not isinstance(marker, dict)
             or set(marker) != {"schema_version", "layout_version", "bootstrap_protocol", "product", "target"}
             or any(type(marker[key]) is not int or marker[key] != 1
                    for key in ("schema_version", "layout_version", "bootstrap_protocol"))
-            or marker["product"] != PRODUCT or marker["target"] != target):
+            or product not in PRODUCTS or marker["product"] != product or marker["target"] != target):
         raise ValueError("installation marker identity/schema mismatch")
     return marker
 
 
-def installation_payload(root, target):
+def installation_payload(root, target, product=PRODUCT):
     root = Path(root)
     marker_path = root / ".bili-install.json"
     current_path = root / "CURRENT"
     if root.is_symlink() or marker_path.is_symlink() or current_path.is_symlink():
         raise ValueError("installation marker or pointer is unsafe")
-    marker = validate_marker(json.loads(marker_path.read_text(encoding="utf-8")), target)
+    validate_marker(json.loads(marker_path.read_text(encoding="utf-8")), target, product)
     current = current_id(current_path.read_bytes())
     bootstrap = root / ("bin/bili" if TARGETS[target][0] == "linux" else "bili.exe")
     versions = root / "versions"

@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
+
 //! Installation entry that starts the payload named by `CURRENT`.
 //!
 //! This binary is the stable, dependency-free door of a packaged installation.
@@ -136,9 +138,14 @@ fn launch(payload: &Path, arguments: &[OsString]) -> ! {
 
 #[cfg(windows)]
 fn launch(payload: &Path, arguments: &[OsString]) -> ! {
-    let status = Command::new(payload)
-        .args(arguments.iter().skip(1))
-        .status();
+    // Retain Windows' verbatim path spelling when starting a deeply installed
+    // payload. Filesystem lookup accepts longer paths than process creation
+    // does with the ordinary drive-letter spelling.
+    let status = fs::canonicalize(payload).and_then(|payload| {
+        Command::new(payload)
+            .args(arguments.iter().skip(1))
+            .status()
+    });
     match status {
         Ok(status) => std::process::exit(forwarded(status)),
         Err(error) => {
@@ -230,5 +237,50 @@ mod tests {
             start(&entry).err(),
             Some("installation pointer names a payload that is not installed")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_launch_starts_a_deep_unicode_payload_and_forwards_its_exit() {
+        let root = scratch("deep-launch");
+        let mut directory = root.join("installed space-目录");
+        while directory.as_os_str().to_string_lossy().len() < 320 {
+            directory.push("nested-0123456789");
+        }
+        fs::create_dir_all(&directory).expect("deep payload directory");
+        let payload = directory.join("payload.exe");
+        fs::copy(std::env::current_exe().expect("test executable"), &payload)
+            .expect("copy native payload");
+        let result = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "tests::windows_launch_probe"])
+            .env("BILI_TEST_BOOTSTRAP_PAYLOAD", &payload)
+            .output()
+            .expect("launch isolated bootstrap probe");
+        assert_eq!(result.status.code(), Some(23), "{result:?}");
+        fs::remove_dir_all(root).expect("remove owned test tree");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_launch_probe() {
+        let Some(payload) = std::env::var_os("BILI_TEST_BOOTSTRAP_PAYLOAD") else {
+            return;
+        };
+        launch(
+            Path::new(&payload),
+            &[
+                OsString::from("bili.exe"),
+                OsString::from("--exact"),
+                OsString::from("tests::windows_payload_probe"),
+            ],
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_payload_probe() {
+        if std::env::var_os("BILI_TEST_BOOTSTRAP_PAYLOAD").is_some() {
+            std::process::exit(23);
+        }
     }
 }

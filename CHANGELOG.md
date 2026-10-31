@@ -4,16 +4,19 @@
 
 ### ✨ Features
 
+- Add the native GUI, including search, queues, session login and appearance settings. GUI updating now uses the shared static catalog, GUI identity, headless native validation and core installation transaction.
 - Add `download --list-resolutions` and readable `qualities` output: one table per part retains descriptions, dimensions, frame rate and codecs, with separate login/VIP requirements and returned-address evidence. Queries create no download jobs and keep machine-readable JSON output.
 - Add a shared update protocol in `bili_core` and the `bili update [--check] [--pre-release[=true|false]]` command on top of it: per-product release descriptors, SemVer-precedence selection across stable and pre-release channels, verified archive download, a versioned install layout with an atomic `CURRENT` pointer, and a throttled reminder that announces each available version at most once per channel.
 - Discover updates through one bounded static HTTPS catalog shared by CLI, GUI and TUI; retain product/target isolation and stable/pre-release SemVer precedence without client Releases API calls or API keys.
 
 ### 🐞 Fixes
 
+- Keep packaging-time diagnostic profiles in an independent system temporary directory, so Windows extended staging paths do not make the CLI doctor reject its private profile.
 - Ignore a null or non-numeric top-level play URL quality when matching returned-address evidence, falling back to the direct segment quality as the representation parser already does.
 - Fill a missing `support_formats` description from the same-ID accepted-quality description instead of exposing a placeholder label; richer per-format descriptions still win.
 - Recheck the selected version under the installation lock to prevent stale updaters from activating an older payload; validate staged payloads against the candidate identity.
 - Isolate staged doctor checks from the developer working directory and DLL search path.
+- Keep canonical Windows executable paths when validating staged updates and starting installed payloads, so deeply nested directories do not fail at process creation. Retain complete package/native checks and preserve the old version before activation.
 - Restore ordinary Windows workspace checks while retaining static CRT enforcement for shipping bootstraps; correct cross-platform bootstrap tests and updater Clippy failures.
 - Accept Linux update archives whose file symlinks precede their targets; retain final checks for missing, cyclic, directory and out-of-tree link targets.
 
@@ -24,12 +27,15 @@
 ### 📝 Documentation
 
 - Add community conduct, contribution, security and accessibility guidance, plus issue forms and a pull request template.
-- Document qualified Linux CLI updates and the future GUI's shared static protocol, product isolation and headless validation; defer Windows self-update design and acceptance while retaining its unresolved test evidence.
+- Document the shared CLI update protocol, Windows path handling and reproducible offline package acceptance; retain historical Linux/Windows results and the GUI's implemented product isolation and headless validation contract.
 
 ### 📦 Build/Packaging
 
+- Limit GUI Tokio features to required runtime operations so full Windows workspace builds keep the core Rust dylib within MSVC's import-library object limit.
+- Package the GUI with the shared versioned layout, a product-specific descriptor and a static GUI-subsystem bootstrap. Inspect the actual PE subsystem, GUI system dependencies and full source/license/native closure; preserve long Windows font/license paths during staging and cleanup.
+- Fingerprint native compiler version output as bytes so localized MSVC diagnostics do not fail the FFmpeg source build when their encoding differs from Python's locale.
 - Narrow Tokio features while keeping `rt-multi-thread` enabled for the `bili_core` SDK consumer; move only test-only `net` to dev-dependencies. Remove unused GUI `image` and Tokio dependencies while retaining JPEG, PNG, WebP, GIF, and eframe backends. This removes 21 lockfile packages with no dependency upgrades.
-- Stage Linux and Windows CLI downloads with their matching FFmpeg source and product-only checksums; leave the separately developed Windows GUI unmodified and unpublished.
+- Stage Linux and Windows CLI downloads with their matching FFmpeg source and product-only checksums; keep GUI release publication unchanged.
 - Emit a `bili-update-cli-<target>.json` descriptor beside each CLI package, check it against the packaged CLI's own `--json doctor` identity, and cover it in the product checksums.
 
 ### 👷 CI/CD

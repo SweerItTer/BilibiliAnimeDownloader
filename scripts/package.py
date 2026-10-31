@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a reproducible-layout CLI package and its matching source/SDK artifacts."""
+"""Create a reproducible-layout CLI or GUI package with matching source artifacts."""
 import argparse
 import json
 import os
@@ -44,11 +44,11 @@ def copy_tree_files(src, dst, predicate):
                 count += 1
     return count
 
-def collect_dependency_licenses(stage, work, target, runtime_license_paths=()):
-    output = work / "core-cli-license-output"
+def collect_dependency_licenses(stage, work, target, runtime_license_paths=(), product="core-cli"):
+    output = work / f"{product}-license-output"
     command = [
         sys.executable, str(ROOT / "scripts/collect_licenses.py"),
-        "--package", "core-cli", "--target", target, "--output", str(output), "--rust-runtime",
+        "--package", product, "--target", target, "--output", str(output), "--rust-runtime",
     ]
     for path in runtime_license_paths:
         command.extend(("--runtime-license", str(path)))
@@ -105,11 +105,13 @@ def make_sdk_archive(sdk, target, mode, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--product", choices=("cli", "gui"), default="cli",
+                        help="package the CLI or the native GUI")
     parser.add_argument("--target", choices=TARGETS, required=True)
     parser.add_argument("--profile", choices=("debug", "release"), required=True)
     parser.add_argument("--native-prefix", type=Path)
     parser.add_argument("--runtime-only", action="store_true",
-                        help="create only the CLI and matching native-source assets; omit Rust SDKs")
+                        help="create only the product and matching native-source assets; omit Rust SDKs")
     args = parser.parse_args()
     kind = TARGETS[args.target]
     if (kind == "windows") != (sys.platform == "win32") or (kind == "linux") != (sys.platform == "linux"):
@@ -147,14 +149,25 @@ def main():
         raise SystemExit("native build enables a forbidden GPL/nonfree/v3/static/program component")
     if sha256(recipe) != native.get("recipe_sha256"):
         raise SystemExit("native build recipe changed since the recorded build")
-    app = ROOT / "target" / args.target / args.profile / ("bili.exe" if kind == "windows" else "bili")
+    gui = args.product == "gui"
+    binary = ("gui.exe" if kind == "windows" else "gui") if gui else ("bili.exe" if kind == "windows" else "bili")
+    app = ROOT / "target" / args.target / args.profile / binary
     if not app.is_file():
-        raise SystemExit(f"missing built CLI executable: {app}")
+        raise SystemExit(f"missing built {'GUI' if gui else 'CLI'} executable: {app}")
     out = ROOT / "target/packages" / args.target
+    if gui:
+        out = out / "gui"
     out.mkdir(parents=True, exist_ok=True)
+    if kind == "windows":
+        # Font/license paths inside a versioned payload can exceed MAX_PATH.
+        # Keep filesystem operations and TemporaryDirectory cleanup lossless.
+        absolute = str(out.resolve())
+        if not absolute.startswith("\\\\?\\"):
+            absolute = "\\\\?\\UNC\\" + absolute[2:] if absolute.startswith("\\\\") else "\\\\?\\" + absolute
+        out = Path(absolute)
     package_work = tempfile.TemporaryDirectory(prefix=".bili-package-", dir=out)
     work = Path(package_work.name)
-    stem = f"bili-{args.target}-{args.profile}"
+    stem = f"bili-gui-{args.target}-{args.profile}" if gui else f"bili-{args.target}-{args.profile}"
     stage = work / "payload"
     stage.mkdir()
     native_source_asset = make_native_source_bundle(work, args.target, prefix, info_path, archive, lock)
@@ -201,7 +214,7 @@ def main():
             path for path in stage.glob("*.dll")
             if path.name.lower().startswith(("vcruntime", "msvcp", "concrt"))
         )
-        inspect_windows(stage, os.environ.copy())
+        inspect_windows(stage, os.environ.copy(), product=args.product)
         if crt_payload_files:
             runtime_license_paths = collect_windows_redist_notices(stage / "licenses/windows-redist")
     else:
@@ -226,7 +239,8 @@ def main():
             if not native_lib.is_symlink():
                 subprocess.run([patchelf, "--set-rpath", "$ORIGIN", str(native_lib)], check=True)
         inspect_linux(stage, {"PATH": "/usr/bin:/bin"})
-    collect_dependency_licenses(stage, work, args.target, runtime_license_paths)
+    collect_dependency_licenses(stage, work, args.target, runtime_license_paths,
+                                "gui" if gui else "core-cli")
     native_dir = stage / "share/bili/native"
     native_dir.mkdir(parents=True)
     shutil.copy2(info_path, native_dir / "build-info.json")
@@ -255,8 +269,13 @@ def main():
     shutil.copy2(ROOT / "LICENSE", stage / "LICENSE")
     shutil.copy2(ROOT / "scripts/THIRD_PARTY_NOTICES.txt", stage / "THIRD_PARTY_NOTICES.txt")
     usage = (
-        "Bilibili CLI package\n\nRun bili --help for commands. Keep the installation directory intact; its stable entry launches "
-        "the payload selected by CURRENT under versions/.\n"
+        "Bilibili GUI package\n\nRun bili.exe to open the native desktop on Windows, or bin/bili on Linux. "
+        "Keep the installation intact; CURRENT selects the complete payload under versions/.\n"
+        if gui else
+        "Bilibili CLI package\n\nRun bili --help for commands. Keep the installation intact; CURRENT selects "
+        "the complete payload under versions/.\n"
+    )
+    usage += (
         "The application license is in LICENSE. FFmpeg is a separate replaceable LGPL shared library, "
         "not an executable; see THIRD_PARTY_NOTICES.txt and share/bili/native/source for source and "
         "replacement instructions.\n"
@@ -269,50 +288,54 @@ def main():
             "under licenses/windows-redist/ and the Windows section of THIRD_PARTY_NOTICES.txt.\n"
         )
     (stage / "USAGE.txt").write_text(usage, encoding="utf-8")
-    doctor_home = work / "doctor-home"
-    doctor_state = work / "doctor-state"
-    doctor_config = work / "doctor-config"
-    doctor_data = work / "doctor-data"
-    doctor_roaming = doctor_home / "AppData" / "Roaming"
-    doctor_local = doctor_home / "AppData" / "Local"
-    doctor_cache = work / "doctor-cache"
-    for private_dir in (doctor_home, doctor_state, doctor_config, doctor_data, doctor_cache):
-        private_dir.mkdir(mode=0o700)
-    if kind == "windows":
-        doctor_roaming.mkdir(mode=0o700, parents=True)
-        doctor_local.mkdir(mode=0o700, parents=True)
-    doctor_env = os.environ.copy()
-    for name in ("LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"):
-        doctor_env.pop(name, None)
-    doctor_env.update({
-        "HOME": str(doctor_home), "USERPROFILE": str(doctor_home),
-        "APPDATA": str(doctor_config), "LOCALAPPDATA": str(doctor_data),
-        "XDG_CONFIG_HOME": str(doctor_config), "XDG_DATA_HOME": str(doctor_data),
-        "XDG_CACHE_HOME": str(doctor_cache),
-    })
-    if kind == "windows":
-        system_root = (doctor_env.get("SystemRoot") or doctor_env.get("SYSTEMROOT")
-                       or doctor_env.get("WINDIR"))
-        if not system_root:
-            raise SystemExit("Windows doctor requires SYSTEMROOT for its isolated PATH")
+    # Extended paths are needed for package filesystem operations, but the
+    # real doctor's Windows profile/state must use ordinary OS-temp paths.
+    with tempfile.TemporaryDirectory(prefix="bili-package-doctor-") as doctor_temporary:
+        doctor_root = Path(doctor_temporary)
+        doctor_home = doctor_root / "home"
+        doctor_state = doctor_root / "state"
+        doctor_config = doctor_root / "config"
+        doctor_data = doctor_root / "data"
+        doctor_roaming = doctor_home / "AppData" / "Roaming"
+        doctor_local = doctor_home / "AppData" / "Local"
+        doctor_cache = doctor_root / "cache"
+        for private_dir in (doctor_home, doctor_state, doctor_config, doctor_data, doctor_cache):
+            private_dir.mkdir(mode=0o700)
+        if kind == "windows":
+            doctor_roaming.mkdir(mode=0o700, parents=True)
+            doctor_local.mkdir(mode=0o700, parents=True)
+        doctor_env = os.environ.copy()
+        for name in ("LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"):
+            doctor_env.pop(name, None)
         doctor_env.update({
-            "APPDATA": str(doctor_roaming),
-            "LOCALAPPDATA": str(doctor_local),
-            "PATH": str(Path(system_root) / "System32"),
+            "HOME": str(doctor_home), "USERPROFILE": str(doctor_home),
+            "APPDATA": str(doctor_config), "LOCALAPPDATA": str(doctor_data),
+            "XDG_CONFIG_HOME": str(doctor_config), "XDG_DATA_HOME": str(doctor_data),
+            "XDG_CACHE_HOME": str(doctor_cache),
         })
-    version_output = subprocess.run(
-        [str(package_app), "--version"], check=True, capture_output=True,
-        text=True, env=doctor_env).stdout.strip()
-    doctor_output = subprocess.run(
-        [str(package_app), "--state-dir", str(doctor_state), "--json", "doctor"],
-        check=True, capture_output=True, text=True, encoding="utf-8", env=doctor_env).stdout
-    try:
-        app_version = parse_doctor_identity(doctor_output, version_output, args.target)
-    except ValueError as error:
-        raise SystemExit(str(error)) from error
+        if kind == "windows":
+            system_root = (doctor_env.get("SystemRoot") or doctor_env.get("SYSTEMROOT")
+                           or doctor_env.get("WINDIR"))
+            if not system_root:
+                raise SystemExit("Windows doctor requires SYSTEMROOT for its isolated PATH")
+            doctor_env.update({
+                "APPDATA": str(doctor_roaming),
+                "LOCALAPPDATA": str(doctor_local),
+                "PATH": str(Path(system_root) / "System32"),
+            })
+        version_output = subprocess.run(
+            [str(package_app), "--version"], check=True, capture_output=True,
+            text=True, env=doctor_env).stdout.strip()
+        doctor_output = subprocess.run(
+            [str(package_app), "--state-dir", str(doctor_state), "--json", "doctor"],
+            check=True, capture_output=True, text=True, encoding="utf-8", env=doctor_env).stdout
+        try:
+            app_version = parse_doctor_identity(doctor_output, version_output, args.target, args.product)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
     rustc = subprocess.run(["rustc", "-Vv"], check=True, capture_output=True, text=True).stdout
     metadata = {
-        "schema_version": 1, "product": "cli", "target": args.target, "profile": args.profile,
+        "schema_version": 1, "product": args.product, "target": args.target, "profile": args.profile,
         "app_version": app_version, "update_protocol": 1, "layout_version": 1,
         "bootstrap_protocol": 1, "rustc": rustc.strip(),
         "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
@@ -335,11 +358,11 @@ def main():
         "bili-bootstrap.exe" if kind == "windows" else "bili-bootstrap")
     package_root = work / "install-root"
     try:
-        assemble_install_root(package_root, stage, bootstrap, args.target)
+        assemble_install_root(package_root, stage, bootstrap, args.target, args.product)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise SystemExit(str(error)) from error
     if kind == "windows":
-        inspect_windows_bootstrap(package_root, {"PATH": os.environ.get("PATH", "")})
+        inspect_windows_bootstrap(package_root, {"PATH": os.environ.get("PATH", "")}, args.product)
     else:
         inspect_linux_bootstrap(package_root, {"PATH": "/usr/bin:/bin"})
     package = work / (stem + (".zip" if kind == "windows" else ".tar.gz"))
@@ -351,9 +374,9 @@ def main():
     else:
         with tarfile.open(package, "w:gz") as tar:
             tar.add(package_root, arcname=stem, recursive=True)
-    descriptor = work / descriptor_name(args.target)
+    descriptor = work / descriptor_name(args.target, args.product)
     descriptor.write_text(
-        json.dumps(descriptor_document(args.target, app_version, package), sort_keys=True, indent=2) + "\n",
+        json.dumps(descriptor_document(args.target, app_version, package, args.product), sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
     sdk_archives = []

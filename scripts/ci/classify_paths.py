@@ -47,6 +47,7 @@ def classify_paths(paths):
         "scope": scope,
         "docs_changed": docs_changed,
         "run_cli": scope in {"cli", "full"},
+        "run_gui": scope in {"gui", "full"},
     }
 
 
@@ -75,6 +76,7 @@ def classify_event(event_name, event):
         "scope": "full",
         "docs_changed": False,
         "run_cli": True,
+        "run_gui": True,
     }
 
 
