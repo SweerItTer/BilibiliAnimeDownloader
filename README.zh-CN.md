@@ -16,8 +16,11 @@
 
 ```sh
 ./bin/bili search "KEYWORD" --type video --page 1 --auth anonymous
+./bin/bili download VIDEO_ID --list-resolutions --parts all --auth anonymous
 ./bin/bili download VIDEO_ID --parts all --output "$HOME/Videos/Bilibili" --auth anonymous
 ```
+
+`--list-resolutions` 会按分 P 列出清晰度档位 ID、实际尺寸、帧率、编码和可用状态，不开始下载。选好后使用 `download VIDEO_ID --quality QUALITY_ID`；像素尺寸和 Stream ID 不是清晰度档位 ID。缺少元数据或权限原因时显示未知。用 `--parts 1,3-5` 选择分 P，或用 `qualities VIDEO_ID --part 3` 查询单个分 P。加 `--json` 可获得机器可读输出。在 Windows PowerShell 中将程序路径替换为 `.\bili.exe`，参数相同。
 
 CLI 会显示已完成文件的路径；不会安装或启动播放器。其他命令和选项请运行 `./bin/bili --help`。
 
