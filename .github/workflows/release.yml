@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,6 +12,7 @@ permissions:
 jobs:
   build-candidate:
     name: Build tagged Linux release candidate
+    if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     permissions:
@@ -122,6 +124,8 @@ jobs:
 
       - name: Build CLI
         run: cargo build -p core-cli --release --locked --target x86_64-unknown-linux-gnu
+      - name: Build stable installation bootstrap
+        run: cargo build -p core-bootstrap --bin bili-bootstrap --features packaged --release --locked --target x86_64-unknown-linux-gnu
 
       - name: Package runtime-only candidate
         run: python3 scripts/package.py --target x86_64-unknown-linux-gnu --profile release --native-prefix target/native/x86_64-unknown-linux-gnu --runtime-only
@@ -149,7 +153,9 @@ jobs:
 
           package = locate("bili-x86_64-unknown-linux-gnu-release.tar.gz")
           native = locate("bili-native-source-x86_64-unknown-linux-gnu.tar.gz")
+          descriptor = locate("bili-update-cli-x86_64-unknown-linux-gnu.json")
           shutil.copy2(package, Path("target/release-candidate/package") / package.name)
+          shutil.copy2(descriptor, Path("target/release-candidate/package") / descriptor.name)
           shutil.copy2(native, Path("target/release-candidate/native-source") / native.name)
           fixture = Path("target/media-fixtures/h264-aac.mp4")
           if not fixture.is_file():
@@ -266,16 +272,23 @@ jobs:
           import re
           import shutil
           import subprocess
+          import sys
           import tarfile
           import tomllib
           from pathlib import Path
 
+          sys.path.insert(0, "scripts")
+          from package_metadata import current_id, descriptor_name, load_descriptor, validate_marker
+
+          target = "x86_64-unknown-linux-gnu"
           root = Path("target/release-candidate")
-          package = next((root / "package").glob("bili-x86_64-unknown-linux-gnu-release.tar.gz"))
-          native = next((root / "native-source").glob("bili-native-source-x86_64-unknown-linux-gnu.tar.gz"))
+          package = next((root / "package").glob(f"bili-{target}-release.tar.gz"))
+          native = next((root / "native-source").glob(f"bili-native-source-{target}.tar.gz"))
+          descriptor_path = root / "package" / descriptor_name(target)
           report = json.loads(Path("target/release-verification/report.json").read_text())
           version = tomllib.loads(Path("core-cli/Cargo.toml").read_text())["package"]["version"]
           digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+          load_descriptor(descriptor_path, target, version, package)
           if (report.get("status") != "passed" or report.get("package_validation") != "passed"
                   or report.get("offline_merge_smoke") != "passed"
                   or report.get("public_media_input_provided") is not False
@@ -283,16 +296,28 @@ jobs:
                   or "public_media_id" not in report or report["public_media_id"] is not None
                   or "public_media_profile" not in report or report["public_media_profile"] is not None):
               raise SystemExit("verification receipt does not satisfy the offline release gate")
-          if report.get("package_sha256") != digest(package) or report.get("native_source_sha256") != digest(native):
-              raise SystemExit("verification receipt hashes do not match candidate archives")
+          if (report.get("package_sha256") != digest(package)
+                  or report.get("native_source_sha256") != digest(native)
+                  or report.get("descriptor_sha256") != digest(descriptor_path)):
+              raise SystemExit("verification receipt hashes do not match candidate assets")
 
+          package_root = f"bili-{target}-release/"
           with tarfile.open(package, "r:gz") as archive:
-              member = archive.extractfile("bili-x86_64-unknown-linux-gnu-release/BUILD_INFO.json")
-              if member is None:
-                  raise SystemExit("runtime archive omits BUILD_INFO.json")
-              build = json.load(member)
-          if (build.get("app_version") != version or build.get("target") != "x86_64-unknown-linux-gnu"
-                  or build.get("profile") != "release"
+              marker_member = archive.extractfile(package_root + ".bili-install.json")
+              current_member = archive.extractfile(package_root + "CURRENT")
+              if marker_member is None or current_member is None:
+                  raise SystemExit("runtime archive omits its installation marker or pointer")
+              validate_marker(json.load(marker_member), target)
+              payload_id = current_id(current_member.read())
+              build_member = archive.extractfile(
+                  package_root + f"versions/{payload_id}/BUILD_INFO.json")
+              if build_member is None:
+                  raise SystemExit("CURRENT payload omits BUILD_INFO.json")
+              build = json.load(build_member)
+          if (build.get("product") != "cli" or build.get("app_version") != version
+                  or build.get("target") != target or build.get("profile") != "release"
+                  or any(build.get(key) != 1
+                         for key in ("update_protocol", "layout_version", "bootstrap_protocol"))
                   or build.get("cargo_lock_sha256") != digest(Path("Cargo.lock"))):
               raise SystemExit("runtime build tuple does not match the tagged source")
 
@@ -308,9 +333,10 @@ jobs:
           public.mkdir(parents=True, exist_ok=True)
           shutil.copy2(package, public / package.name)
           shutil.copy2(native, public / native.name)
+          shutil.copy2(descriptor_path, public / descriptor_path.name)
           shutil.copy2("CHANGELOG.md", public / "CHANGELOG.md")
           shutil.copy2("target/release-verification/report.json", public / "verification.json")
-          files = [public / package.name, public / native.name,
+          files = [public / package.name, public / native.name, public / descriptor_path.name,
                    public / "CHANGELOG.md", public / "verification.json"]
           (public / "SHA256SUMS").write_text("".join(f"{digest(path)}  {path.name}\n" for path in files))
           subprocess.run(["sha256sum", "--check", "--strict", "SHA256SUMS"], cwd=public, check=True)
@@ -378,11 +404,12 @@ jobs:
           names = {
               "bili-x86_64-unknown-linux-gnu-release.tar.gz",
               "bili-native-source-x86_64-unknown-linux-gnu.tar.gz",
+              "bili-update-cli-x86_64-unknown-linux-gnu.json",
               "CHANGELOG.md", "verification.json", "SHA256SUMS",
           }
           root = Path("target/release-publish")
           if {p.name for p in root.iterdir()} != names or not all((root / n).is_file() for n in names):
-              raise SystemExit("qualified bundle does not contain the exact five-file release allowlist")
+              raise SystemExit("qualified bundle does not contain the exact six-file release allowlist")
           PY
 
       - name: Create draft release, upload, read back, and publish
@@ -419,6 +446,7 @@ jobs:
           files=(
             "$ASSET_DIR/bili-x86_64-unknown-linux-gnu-release.tar.gz"
             "$ASSET_DIR/bili-native-source-x86_64-unknown-linux-gnu.tar.gz"
+            "$ASSET_DIR/bili-update-cli-x86_64-unknown-linux-gnu.json"
             "$ASSET_DIR/CHANGELOG.md"
             "$ASSET_DIR/verification.json"
             "$ASSET_DIR/SHA256SUMS"
@@ -431,7 +459,7 @@ jobs:
           [[ "$actual" == "$expected" ]] || { echo "release asset names differ from allowlist" >&2; exit 1; }
           readback=$(mktemp -d "$RUNNER_TEMP/release-readback.XXXXXX")
           gh release download "$TAG" --repo "$REPO_SLUG" --dir "$readback"
-          [[ $(find "$readback" -maxdepth 1 -type f | wc -l) -eq 5 ]] || { echo "downloaded asset count differs from allowlist" >&2; exit 1; }
+          [[ $(find "$readback" -maxdepth 1 -type f | wc -l) -eq 6 ]] || { echo "downloaded asset count differs from allowlist" >&2; exit 1; }
           cmp "$ASSET_DIR/SHA256SUMS" "$readback/SHA256SUMS"
           (cd "$readback" && sha256sum -c --strict SHA256SUMS)
           draft=$(gh release view "$TAG" --repo "$REPO_SLUG" --json isDraft -q '.isDraft')
@@ -439,3 +467,47 @@ jobs:
           gh release edit "$TAG" --repo "$REPO_SLUG" --draft=false --prerelease="$PRERELEASE" --latest="$LATEST" --verify-tag
           state=$(gh release view "$TAG" --repo "$REPO_SLUG" --json isDraft,isPrerelease -q '[.isDraft,.isPrerelease] | @tsv')
           [[ "$state" == "$(printf 'false\t%s' "$PRERELEASE")" ]] || { echo "published release state is unexpected" >&2; exit 1; }
+
+  publish-update-index:
+    name: Publish complete static update index
+    needs: publish-release
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.publish-release.result == 'success') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: release-static-update-index
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO_SLUG: ${{ github.repository }}
+    steps:
+      - name: Checkout catalog publisher
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Rebuild complete static update catalog
+        shell: bash
+        run: python3 scripts/update_index.py --repository "$REPO_SLUG" --output target/pages
+
+      - name: Upload static update catalog
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/pages
+
+      - name: Deploy static update catalog
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -84,6 +84,20 @@ pub enum Command {
     },
     /// Report local permissions and linked native capabilities; no network request.
     Doctor,
+    /// Check for a newer release, or install it from a packaged installation.
+    Update {
+        /// Report the matching release without downloading or installing it.
+        #[arg(long)]
+        check: bool,
+        /// Accept pre-release versions for this invocation; `--pre-release=false` forces stable.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
+        pre_release: Option<bool>,
+    },
 }
 
 #[derive(Subcommand)]

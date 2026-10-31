@@ -24,6 +24,25 @@ Use `--list-resolutions` to view each part's quality IDs, actual dimensions, fra
 
 The CLI prints completed file paths. It does not install or launch a video player. Use `./bin/bili --help` for other commands and options.
 
+## Checking and installing updates
+
+A CLI **built from this branch** supports checking and manually installing updates from a compatible versioned package. Use isolated installations for this unreleased updater. The published `2.0.0-alpha.6` package has no `update` subcommand:
+
+```sh
+./bin/bili update --check
+./bin/bili update
+```
+
+Checks read a fixed HTTPS static index; archives download directly from the matching tagged GitHub Release. The client does not call the Releases API or require an API key. `--pre-release` also considers pre-release versions for that one command (`--pre-release=false` forces the stable channel even when the settings file opts in).
+
+This delivery covers Linux CLI updates. The public static catalog, real archive download, staged/native validation, activation and preservation of the old installation have passed. Windows self-update design and acceptance are deferred; its recorded failure is not a Linux delivery gate.
+
+For the first compatible Linux package, extract the complete tree into a writable installation directory. Later updates locate that directory from the running executable, prepare and validate a separate version, then switch `CURRENT`; they do not overwrite the running payload or delete the previous version.
+
+`2.0.0-alpha.6` predates this protocol and cannot update itself: extract the first compatible package into a new directory by hand.
+
+The shared protocol, descriptor format, configuration keys, verification results and known limits are documented in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). `auto_update` there is a GUI-only preference; the CLI only ever checks unless you run `bili update` yourself.
+
 ## Login and privacy
 
 Login is not saved by default. For a one-command QR login, use `--auth qr` on the command that needs it, such as `download`; the login ends when that command ends. To use a QR login in later commands, explicitly save it with `./bin/bili login qr --remember`, then use `--auth stored`. Secure OS storage is preferred; if unavailable, the CLI warns that saved login may be stored as plaintext in the local user configuration directory. Never save test-only credentials or put cookies in command text, logs, or reports.

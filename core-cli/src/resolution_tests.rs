@@ -110,7 +110,9 @@ fn query_arguments_keep_defaults_and_reject_explicit_download_options() {
     let ordinary = Cli::try_parse_from(["bili", "download", "av1"]).unwrap();
     assert!(monitors_jobs(&ordinary.command));
     assert_eq!(
-        configuration(&ordinary).unwrap().state_mode,
+        configuration(&ordinary, &Settings::default())
+            .unwrap()
+            .state_mode,
         StateMode::ReadWrite
     );
     for args in [
@@ -125,7 +127,7 @@ fn query_arguments_keep_defaults_and_reject_explicit_download_options() {
         vec!["bili", "qualities", "av1", "--auth", "anonymous"],
     ] {
         let cli = Cli::try_parse_from(args).unwrap();
-        let config = configuration(&cli).unwrap();
+        let config = configuration(&cli, &Settings::default()).unwrap();
         assert_eq!(config.state_mode, StateMode::ReadOnly);
         assert!(matches!(
             config.credential_store,
@@ -489,7 +491,7 @@ async fn readonly_query_core_leaves_state_and_output_untouched_even_with_existin
         std::ffi::OsStr::new("anonymous"),
     ])
     .unwrap();
-    let config = configuration(&cli).unwrap();
+    let config = configuration(&cli, &super::settings(&cli).unwrap()).unwrap();
     let core = Core::new(config.clone(), tokio::runtime::Handle::current()).unwrap();
     assert!(core.jobs().borrow().jobs.is_empty());
     core.shutdown(StopMode::Pause).await.unwrap();

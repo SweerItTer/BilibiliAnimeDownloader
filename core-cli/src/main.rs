@@ -4,6 +4,7 @@ mod output;
 mod resolution_tests;
 mod resolutions;
 mod secret_input;
+mod update;
 
 use args::{AuthMode, AuthOptions, Category, Cli, Command, Danmaku, Login, MergeMode};
 use bili_core::*;
@@ -27,6 +28,9 @@ struct Settings {
     connections: Option<usize>,
     #[serde(default = "allow_fallback")]
     allow_plaintext_fallback: bool,
+    /// Update preferences; absent in older configuration files.
+    #[serde(default)]
+    update: bili_core::update::UpdateSettings,
 }
 fn allow_fallback() -> bool {
     true
@@ -35,35 +39,43 @@ fn invalid(operation: &'static str) -> CoreError {
     CoreError::new(ErrorCode::InvalidInput, operation)
 }
 
-fn configuration(cli: &Cli) -> Result<CoreConfig> {
-    let project = directories::ProjectDirs::from("", "", "bili").ok_or_else(|| {
-        CoreError::new(ErrorCode::Filesystem, "locate private platform directories")
-    })?;
-    let settings = if let Some(path) = &cli.config {
-        let mut bytes = Vec::new();
-        std::fs::File::open(path)
-            .map_err(CoreError::io)?
-            .take(65_537)
-            .read_to_end(&mut bytes)
-            .map_err(CoreError::io)?;
-        if bytes.len() > 65_536 {
-            return Err(invalid("settings file exceeds 64 KiB"));
-        }
-        serde_json::from_slice::<Settings>(&bytes)
-            .map_err(|_| invalid("invalid settings JSON or unsupported field"))?
-    } else {
-        Settings {
+fn project_dirs() -> Result<directories::ProjectDirs> {
+    directories::ProjectDirs::from("", "", "bili")
+        .ok_or_else(|| CoreError::new(ErrorCode::Filesystem, "locate private platform directories"))
+}
+
+/// Read configuration exactly once per invocation. Only an explicit `--config`
+/// is consulted; there is no implicit settings file lookup.
+fn settings(cli: &Cli) -> Result<Settings> {
+    let Some(path) = &cli.config else {
+        return Ok(Settings {
             allow_plaintext_fallback: true,
             ..Settings::default()
-        }
+        });
     };
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(CoreError::io)?
+        .take(65_537)
+        .read_to_end(&mut bytes)
+        .map_err(CoreError::io)?;
+    if bytes.len() > 65_536 {
+        return Err(invalid("settings file exceeds 64 KiB"));
+    }
+    serde_json::from_slice::<Settings>(&bytes)
+        .map_err(|_| invalid("invalid settings JSON or unsupported field"))
+}
+
+fn configuration(cli: &Cli, settings: &Settings) -> Result<CoreConfig> {
+    let project = project_dirs()?;
     let output = settings
         .output_dir
+        .clone()
         .unwrap_or_else(|| project.data_local_dir().join("downloads"));
     let state = cli
         .state_dir
         .clone()
-        .or(settings.state_dir)
+        .or_else(|| settings.state_dir.clone())
         .unwrap_or_else(|| project.data_local_dir().join("state"));
     let mut config = CoreConfig::new(state, output);
     config.state_mode = match cli.command {
@@ -151,7 +163,17 @@ fn monitors_jobs(command: &Command) -> bool {
 }
 
 async fn run(cli: Cli) -> u8 {
-    let config = match configuration(&cli) {
+    let settings = match settings(&cli) {
+        Ok(settings) => settings,
+        Err(error) => {
+            output::error(&error, cli.json);
+            return output::exit_code(&error);
+        }
+    };
+    if let Command::Update { check, pre_release } = &cli.command {
+        return update::run(&cli, settings.update, *check, *pre_release).await;
+    }
+    let config = match configuration(&cli, &settings) {
         Ok(config) => config,
         Err(error) => {
             output::error(&error, cli.json);
@@ -214,13 +236,15 @@ async fn run(cli: Cli) -> u8 {
         return 130;
     }
     let shutdown = core.shutdown(StopMode::Pause).await;
-    match (result, shutdown) {
+    let code = match (result, shutdown) {
         (Ok(code), Ok(_)) => code,
         (Err(error), _) | (Ok(_), Err(error)) => {
             output::error(&error, cli.json);
             output::exit_code(&error)
         }
-    }
+    };
+    update::maybe_notify(&cli, settings.update).await;
+    code
 }
 
 async fn interrupt() -> std::io::Result<()> {
@@ -662,6 +686,10 @@ async fn execute(core: &Core, cli: &Cli, config: &CoreConfig) -> Result<u8> {
                 return Ok(4);
             }
         }
+        // `run` intercepts this command before the media core is constructed.
+        Command::Update { .. } => {
+            return Err(invalid("update runs before the media core starts"));
+        }
         Command::Doctor => {
             let native = bili_core::remux::diagnostics()?;
             output::result(
@@ -671,6 +699,7 @@ async fn execute(core: &Core, cli: &Cli, config: &CoreConfig) -> Result<u8> {
                     "state_dir": config.state_dir, "output_dir": config.output_dir,
                     "permissions": { "state": path_status(&config.state_dir), "output": path_status(&config.output_dir),
                         "settings": cli.config.as_ref().map(|p| path_status(p)) }, "native": native,
+                    "build_identity": build_identity(),
                     "native_integration": "replaceable shared libraries; no FFmpeg executable", "license": "MIT WITH COMMONS CLAUSE (app); FFmpeg LGPL-2.1-or-later",
                 }),
                 cli.json,
@@ -705,6 +734,27 @@ fn path_status(path: &std::path::Path) -> serde_json::Value {
         }
         Err(_) => serde_json::json!({"exists": null, "error": "metadata unavailable"}),
     }
+}
+fn build_identity() -> serde_json::Value {
+    serde_json::json!({
+        "product": bili_core::update::Product::Cli.as_str(),
+        "target": env!("BILI_TARGET"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "update_protocol": bili_core::update::PROTOCOL,
+    })
+}
+
+/// The typed identity the updater acts on. It reads the same two Cargo-provided
+/// values `build_identity` renders, so there is only one identity source.
+fn compiled_identity() -> Result<bili_core::update::Identity> {
+    let target = bili_core::update::Target::from_triple(env!("BILI_TARGET"))
+        .ok_or_else(|| invalid("this build target has no update channel"))?;
+    bili_core::update::Identity::new(
+        bili_core::update::Product::Cli,
+        target,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .map_err(|_| invalid("compiled version is not semantic versioning"))
 }
 
 async fn wait_jobs(core: &Core, ids: &[JobId], machine: bool) -> Result<u8> {
@@ -770,6 +820,30 @@ fn job_exit_code(job: &JobSnapshot) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_settings_keep_conservative_update_defaults() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"jobs":2}"#).expect("legacy settings parse");
+        assert_eq!(settings.jobs, Some(2));
+        assert!(settings.update.check_updates);
+        assert!(!settings.update.allow_pre_release);
+        assert!(!settings.update.auto_update);
+        // Older files keep the documented fallback permission.
+        assert!(settings.allow_plaintext_fallback);
+    }
+
+    #[test]
+    fn update_preferences_are_read_from_configuration() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"update":{"allow_pre_release":true,"check_updates":false}}"#)
+                .expect("update settings parse");
+        assert!(settings.update.allow_pre_release);
+        assert!(!settings.update.check_updates);
+        assert!(!settings.update.auto_update);
+        assert!(serde_json::from_str::<Settings>(r#"{"unknown_field":1}"#).is_err());
+    }
+
     fn part(ordinal: u32) -> Part {
         Part {
             reference: PartRef {
@@ -802,7 +876,9 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(argv).unwrap();
             assert!(matches!(
-                configuration(&cli).unwrap().credential_store,
+                configuration(&cli, &Settings::default())
+                    .unwrap()
+                    .credential_store,
                 bili_core::cookie::StorePolicy::MemoryOnly
             ));
         }

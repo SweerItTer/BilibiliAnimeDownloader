@@ -2,7 +2,6 @@
 """Safely extract and inspect a Bilibili package; optionally run opt-in public-media recovery smoke."""
 import atexit
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -19,6 +18,14 @@ import time
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
+
+from package_metadata import (
+    descriptor_name,
+    installation_payload,
+    load_descriptor,
+    parse_doctor_identity,
+    sha256,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SYSTEM_LINUX = re.compile(r"^(?:libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libutil\.so\.1|libresolv\.so\.2|ld-linux-x86-64\.so\.2)$")
@@ -42,12 +49,6 @@ def has_forbidden_native_options(text):
     ) is not None
 
 
-def sha256(path):
-    h = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def safe_member(name):
@@ -151,7 +152,7 @@ def check_checksums(root):
         if rel in expected:
             raise ValueError(f"duplicate checksum path: {rel}")
         expected[rel] = (member, digest)
-    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.name != "SHA256SUMS"}
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p != sums}
     if actual != set(expected):
         raise ValueError(f"checksum file set mismatch; unlisted={sorted(actual - set(expected))}, missing={sorted(set(expected) - actual)}")
     for rel, (member, digest) in expected.items():
@@ -366,6 +367,22 @@ def inspect_linux(root, env):
                 raise ValueError(f"library lacks own-directory RUNPATH: {file.name}")
 
 
+def inspect_linux_bootstrap(root, env):
+    entry = root / "bin/bili"
+    dynamic = run(["readelf", "-d", str(entry)], env, root)
+    needed = set(re.findall(r"Shared library: \[(.*?)\]", dynamic))
+    reject_dynamic_rust_core(needed)
+    if any(not SYSTEM_LINUX.fullmatch(name) for name in needed):
+        raise ValueError(f"bootstrap imports a non-system dependency: {sorted(needed)}")
+    ldd = run(["ldd", str(entry)], env, root)
+    if "not found" in ldd:
+        raise ValueError(f"bootstrap has an unresolved dependency: {ldd}")
+    for line in ldd.splitlines():
+        match = re.match(r"\s*(\S+)\s+=>\s+(\S+)", line)
+        if match and not SYSTEM_LINUX.fullmatch(match.group(1)):
+            raise ValueError(f"bootstrap imports a non-system dependency: {match.group(1)}")
+
+
 def parse_windows_dependencies(output):
     return re.findall(r"^\s*([A-Za-z0-9_.-]+\.dll)\s*$", output, re.M | re.I)
 
@@ -387,6 +404,19 @@ def inspect_windows(root, env):
         unresolved = {name for name in deps - bundled - WINDOWS_SYSTEM if not name.startswith(("api-ms-win-", "ext-ms-win-"))}
         if unresolved:
             raise ValueError(f"unbundled Windows dependency in {file.name}: {sorted(unresolved)}")
+
+
+def inspect_windows_bootstrap(root, env):
+    dumpbin = shutil.which("dumpbin")
+    if not dumpbin:
+        raise ValueError("dumpbin is required for Windows bootstrap import inspection")
+    entry = root / "bili.exe"
+    output = run([dumpbin, "/nologo", "/dependents", str(entry)], env, root)
+    deps = {name.lower() for name in parse_windows_dependencies(output)}
+    reject_dynamic_rust_core(deps)
+    unresolved = {name for name in deps - WINDOWS_SYSTEM if not name.startswith(("api-ms-win-", "ext-ms-win-"))}
+    if unresolved:
+        raise ValueError(f"bootstrap imports non-system Windows DLLs: {sorted(unresolved)}")
 
 
 def validate_replacement(prefix, root, target, env):
@@ -1389,23 +1419,35 @@ def main():
         extract(args.package.resolve(), extracted)
         root = package_root(extracted)
         check_checksums(root)
+        payload = installation_payload(root, args.target)
+        check_checksums(payload)
         source_asset = args.native_source.resolve()
         source_extract = base / "native-source"
-        native_info = inspect_native(root, args.target, source_asset, source_extract)
-        build_info = json.loads((root / "BUILD_INFO.json").read_text(encoding="utf-8"))
-        validate_dependency_licenses(root, args.target)
-        validate_windows_runtime(root, build_info, args.target)
-        if build_info.get("target") != args.target or build_info.get("profile") not in ("debug", "release"):
-            raise ValueError("application build tuple target/profile is invalid")
-        binary = root / ("bili.exe" if args.target == "x86_64-pc-windows-msvc" else "bin/bili")
+        native_info = inspect_native(payload, args.target, source_asset, source_extract)
+        build_info = json.loads((payload / "BUILD_INFO.json").read_text(encoding="utf-8"))
+        version = build_info.get("app_version")
+        descriptor_path = args.package.resolve().parent / descriptor_name(args.target)
+        load_descriptor(descriptor_path, args.target, version, args.package.resolve())
+        report["descriptor_sha256"] = sha256(descriptor_path)
+        validate_dependency_licenses(payload, args.target)
+        validate_windows_runtime(payload, build_info, args.target)
+        if (build_info.get("schema_version") != 1 or build_info.get("product") != "cli"
+                or build_info.get("target") != args.target or build_info.get("profile") not in ("debug", "release")
+                or any(build_info.get(key) != 1
+                       for key in ("update_protocol", "layout_version", "bootstrap_protocol"))):
+            raise ValueError("application build tuple target/profile/protocol is invalid")
+        binary = payload / ("bili.exe" if args.target == "x86_64-pc-windows-msvc" else "bin/bili")
         if sha256(binary) != build_info.get("app_sha256"):
             raise ValueError("application binary checksum differs from build tuple")
-        native_info_path = root / "share/bili/native/build-info.json"
+        if payload.name != f"v-{build_info['app_sha256'][:32]}":
+            raise ValueError("CURRENT version directory does not derive from the packaged CLI digest")
+        native_info_path = payload / "share/bili/native/build-info.json"
         if build_info.get("native_build_info_sha256") != sha256(native_info_path):
             raise ValueError("native build metadata checksum differs from application build tuple")
         if build_info.get("cargo_lock_sha256") != sha256(ROOT / "Cargo.lock"):
             raise ValueError("package Cargo.lock tuple differs from checked source")
         files = [path for path in root.rglob("*") if path.is_file()]
+        bootstrap = root / ("bili.exe" if args.target == "x86_64-pc-windows-msvc" else "bin/bili")
         bad = [path for path in files if path.name.lower() in FORBIDDEN_NAMES or
                (path.suffix.lower() == ".exe" and path.name.lower() != "bili.exe") or
                path.suffix.lower() in (".pdb", ".ilk", ".exp")]
@@ -1414,7 +1456,7 @@ def main():
         for path in files:
             with path.open("rb") as stream:
                 magic = stream.read(4)
-            if magic == bytes.fromhex("7f454c46") and path != binary and ".so" not in path.name:
+            if magic == bytes.fromhex("7f454c46") and path not in (binary, bootstrap) and ".so" not in path.name:
                 raise ValueError(f"unexpected ELF executable or non-library in package: {path}")
             if magic[:2] == b"MZ" and path.name.lower() != "bili.exe" and path.suffix.lower() != ".dll":
                 raise ValueError(f"unexpected Windows executable in package: {path}")
@@ -1433,15 +1475,18 @@ def main():
         for name in ("HOME", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"):
             Path(env[name]).mkdir(mode=0o700, parents=True, exist_ok=True)
         if args.target == "x86_64-unknown-linux-gnu":
-            inspect_linux(root, inspect_env)
-            executable = root / "bin/bili"
+            inspect_linux(payload, inspect_env)
+            inspect_linux_bootstrap(root, inspect_env)
         else:
-            inspect_windows(root, inspect_env)
-            executable = root / "bili.exe"
+            inspect_windows(payload, inspect_env)
+            inspect_windows_bootstrap(root, inspect_env)
+        executable = bootstrap
         run([str(executable), "--help"], env, base)
-        run([str(executable), "--version"], env, base)
+        version_output = run([str(executable), "--version"], env, base, encoding="utf-8")
         doctor = run([str(executable), "--state-dir", str(base / "doctor-state"), "--json", "doctor"], env, base, encoding="utf-8")
         report["native"] = {"doctor": validate_doctor(doctor)}
+        if parse_doctor_identity(doctor, version_output, args.target) != version:
+            raise ValueError("doctor version disagrees with package build metadata")
         report["package_validation"] = "passed"
         probe_helper = args.probe_helper.resolve() if args.probe_helper else None
         if args.offline_fixture:
@@ -1462,10 +1507,12 @@ def main():
                 probe_helper = find_probe_helper(args.sdk_artifact.resolve(), base / "sdk")
             if not probe_helper.is_file():
                 raise ValueError("matched SDK probe consumer is missing")
-            marker = validate_replacement(args.replacement_prefix.resolve(), root, args.target, inspect_env)
+            marker = validate_replacement(args.replacement_prefix.resolve(), payload, args.target, inspect_env)
             replacement_doctor = run([str(executable), "--state-dir", str(base / "replacement-doctor-state"),
                                       "--json", "doctor"], env, base, encoding="utf-8")
             report["native"]["replacement_doctor"] = validate_doctor(replacement_doctor, marker)
+            if parse_doctor_identity(replacement_doctor, version_output, args.target) != version:
+                raise ValueError("replacement-library doctor identity disagrees with the package")
             verify_replacement_remux(executable, base / "replacement-state",
                                      args.replacement_fixture.resolve(), base / "replacement-remux.mp4",
                                      probe_helper, env, base)
