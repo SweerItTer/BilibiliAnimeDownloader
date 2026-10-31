@@ -238,3 +238,33 @@ Actual Linux (WSL2) and native Windows CLI runs used the public static index and
 Windows isolation fixtures must create physical `USERPROFILE/AppData/Roaming` and `USERPROFILE/AppData/Local` directories. Setting `APPDATA`/`LOCALAPPDATA` alone did not satisfy `directories::ProjectDirs::from("", "", "bili")`: both A and B doctor failed with `locate private platform directories`; creating that directory tree restored B doctor with unchanged binaries and environment. This fixture error is separate from the unresolved deeper-installation failure.
 
 Additionally, the published `2.0.0-alpha.6` package predates this protocol: it contains no installation marker and no release descriptor, so it cannot update itself. The first compatible installation has to be installed manually.
+
+## 9. Draft Windows investigation and candidate changes
+
+**Draft only — not an approved Windows activation design or an implemented fix.** Tracks [issue #12](https://github.com/SweerItTer/BilibiliAnimeDownloader/issues/12). The qualified Linux contract and GUI product/validator boundary above remain unchanged.
+
+### First distinguish the failing stage
+
+The public CLI maps several installation errors to `Corruption`; that message does not identify a path-length failure. `install_payload` currently validates the extracted candidate, including the shell callback, before moving the payload into its final version directory. The temporary package tree can therefore be more nested than the eventual running payload.
+
+Use one separately authorized, isolated Windows replay of verified A/B inputs with the matching native/Rust toolchain. Prefer an offline installer replay so the deleted QA release and public catalog are not prerequisites:
+
+1. Create the physical isolated AppData directories described in §8. Keep archive bytes, identities, environment and validation policy fixed.
+2. Record only safe stage identifiers, the actual `InstallError` variant and numeric process/system codes. Do not dump environments, raw process errors, personal paths, URLs or credentials, or add a public debug API for this investigation.
+3. Determine whether the real staged validator is reached. If not, identify the rejected current/payload metadata, extraction, link, inventory or identity check before changing startup paths.
+4. If reached, distinguish process creation/exit, bounded doctor decoding, candidate identity and native-runtime validation. Compare the observed shallow/deeper contexts without weakening the actual validator. A diagnostic fixture must stop before activation rather than accept a fake successful callback.
+
+This is a proposed next diagnostic, not a claim that another Windows replay has been run or that the previous investigation budget has reset.
+
+### Conditional candidates, not a selected fix
+
+- **If runtime validation is proven sensitive to staging depth:** consider placing the already verified candidate into a compact, owned inactive location on the installation filesystem before running its real validator. Decide the exact staging/final-slot layout only after that evidence. Preserve exclusive installer ownership, no-clobber version directories, candidate identity and complete inventory checks; remove only the owned candidate on failure and commit `CURRENT` only after validation succeeds.
+- **If rejection happens earlier:** repair that specific metadata, extraction or integrity condition. Moving the executable or asking the user to shorten the install path would not establish a fix.
+
+Do not overwrite a running Windows EXE/DLL or select an installer, BAT/helper handoff, replacement-after-exit flow or post-activation rollback merely from this observation. Those are separate Windows delivery decisions, not substitutes for finding this failure.
+
+### Acceptance for a later implementation
+
+- Identify the exact failing stage/error with valid profiles and verified inputs; do not label the cause MAX_PATH solely because a shallower test passed.
+- Exercise the chosen Windows activation design on its supported installation paths, retaining real staged identity/native validation and successful next-start behavior.
+- Exercise failure before activation and prove unchanged old `CURRENT`, payload, bootstrap and user files; retain the accepted Linux behavior and future GUI isolation contract.
