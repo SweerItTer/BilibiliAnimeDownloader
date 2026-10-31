@@ -6,7 +6,7 @@ Every shell (CLI, GUI, TUI) updates through this one protocol. `bili_core::updat
 
 Read this before adding an update command, a release asset, a package layout or a GUI updater.
 
-**Status: static discovery is implemented and deployed; real Linux and Windows upgrades passed, but a deeper Windows installation still fails before activation.** This replaces client-side GitHub Releases API discovery, including for the future GUI. The unresolved Windows result and the verified installation boundaries are recorded in §8; do not generalize the successful installation to every path.
+**Status: Linux CLI update delivery is qualified; the static catalog is deployed.** The shared GUI protocol below is approved documentation, not an implemented GUI updater. Per the maintainer's 2026-10-31 scope decision, Windows self-update design and runtime acceptance are deferred; its unresolved evidence in §8 is retained but does not gate this Linux phase. Existing Windows build/package CI remains unchanged.
 
 ## 2. Signatures
 
@@ -138,9 +138,13 @@ Absent keys keep these defaults, so older settings files stay valid. The root ob
 
 ### GUI integration
 
+This section defines the future GUI's shared protocol, not a claim of GUI package or updater implementation. GUI entrypoint mapping and the headless validation invocation must be defined and qualified with the GUI package; existing CLI acceptance cannot substitute for them.
+
 The GUI uses this same `Updater` with a compile-time `Identity(Product::Gui, target, version)`; a CLI-only release never authorizes installing a CLI package into a GUI installation. Missing GUI descriptors produce the same no-compatible outcome, not a CLI fallback. The GUI owns async scheduling, check/result presentation and its `auto_update` preference, not discovery or installation logic. Explicit channel choice overrides saved `allow_pre_release` for that operation.
 
 Before activation, the GUI supplies its own headless staged-payload validator: check candidate product/target/version and the packaged native closure without opening a window or invoking the CLI. GUI acceptance must exercise that validator and failure preservation; the CLI doctor is not a substitute.
+
+The shared catalog, descriptors, identity/channel rules and pre-activation failure preservation apply across shells. Platform activation is separate: Linux GUI integration must validate its own package against the core transaction; Windows exit coordination and in-use-file replacement still need their own design and acceptance. No Windows installer, BAT/helper handoff or post-activation automatic rollback is selected by this contract. Do not infer that Linux activation semantics alone qualify Windows updates.
 
 ### Installation layout
 
@@ -229,7 +233,7 @@ Matching-source qualification passed for [A `9b483d3`](https://github.com/SweerI
 
 Actual Linux (WSL2) and native Windows CLI runs used the public static index and tagged GitHub archives to update A to `2.0.0-alpha.6.updater-test.20261031.1`. They verified channel/flag precedence, failure preservation under a held lock, archive installation and staged doctor, `CURRENT` activation, new version/native doctor, unchanged bootstrap/old payload/user file, and repeated no-op updates. Linux A was rebuilt locally with the existing locked source/native/package recipe; Windows A and both B packages came from matching-source CI. No developer loader override or Bilibili request was used. Local Linux execution is not glibc 2.35 qualification; that evidence comes from the independent Ubuntu 22.04 package check.
 
-**Known Windows failure:** the shallower isolated installation completed those checks; the deeper test installation still returned `Corruption` before activation after correcting its profile fixture. Its `CURRENT`, old payload, bootstrap and user file remained unchanged. The cause is not located; shallower-path success does not resolve this failure. Receipts and original errors are retained under ignored `target/update-checks/static-cutover-20261030/`.
+**Deferred Windows evidence, not a Linux acceptance gate:** the shallower isolated installation completed those checks; the deeper test installation still returned `Corruption` before activation after correcting its profile fixture. Its `CURRENT`, old payload, bootstrap and user file remained unchanged. The cause is not located; shallower-path success does not resolve this failure. The maintainer deferred Windows self-update design/qualification on 2026-10-31 rather than accepting this as a proven path-length limitation. Receipts and original errors are retained under ignored `target/update-checks/static-cutover-20261030/`.
 
 Windows isolation fixtures must create physical `USERPROFILE/AppData/Roaming` and `USERPROFILE/AppData/Local` directories. Setting `APPDATA`/`LOCALAPPDATA` alone did not satisfy `directories::ProjectDirs::from("", "", "bili")`: both A and B doctor failed with `locate private platform directories`; creating that directory tree restored B doctor with unchanged binaries and environment. This fixture error is separate from the unresolved deeper-installation failure.
 

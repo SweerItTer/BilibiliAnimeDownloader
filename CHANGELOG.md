@@ -21,7 +21,7 @@
 ### 📝 Documentation
 
 - Add community conduct, contribution, security and accessibility guidance, plus issue forms and a pull request template.
-- Document the shared static update protocol, GUI validation boundary, verified Linux/Windows upgrades and the unresolved deeper Windows installation failure.
+- Document qualified Linux CLI updates and the future GUI's shared static protocol, product isolation and headless validation; defer Windows self-update design and acceptance while retaining its unresolved test evidence.
 
 ### 📦 Build/Packaging
 

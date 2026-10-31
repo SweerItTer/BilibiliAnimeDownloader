@@ -32,7 +32,9 @@ A CLI **built from this branch** supports checking and manually installing updat
 
 Checks read a fixed HTTPS static index; archives download directly from the matching tagged GitHub Release. The client does not call the Releases API or require an API key. `--pre-release` also considers pre-release versions for that one command (`--pre-release=false` forces the stable channel even when the settings file opts in).
 
-The static index is deployed, and live Linux and Windows upgrades have passed in isolated installations. On Windows, the shallower test installation passed; the deeper one failed with `Corruption` before activation and preserved the old installation. The cause remains unresolved.
+This delivery covers Linux CLI updates. The public static catalog, real archive download, staged/native validation, activation and preservation of the old installation have passed. Windows self-update design and acceptance are deferred; its recorded failure is not a Linux delivery gate.
+
+For the first compatible Linux package, extract the complete tree into a writable installation directory. Later updates locate that directory from the running executable, prepare and validate a separate version, then switch `CURRENT`; they do not overwrite the running payload or delete the previous version.
 
 `2.0.0-alpha.6` predates this protocol and cannot update itself: extract the first compatible package into a new directory by hand.
 
