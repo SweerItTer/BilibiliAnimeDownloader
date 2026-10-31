@@ -4,11 +4,14 @@
 
 ### ✨ Features
 
+- Add `download --list-resolutions` and readable `qualities` output: one table per part retains descriptions, dimensions, frame rate and codecs, with separate login/VIP requirements and returned-address evidence. Queries create no download jobs and keep machine-readable JSON output.
 - Add a shared update protocol in `bili_core` and the `bili update [--check] [--pre-release[=true|false]]` command on top of it: per-product release descriptors, SemVer-precedence selection across stable and pre-release channels, verified archive download, a versioned install layout with an atomic `CURRENT` pointer, and a throttled reminder that announces each available version at most once per channel.
 - Discover updates through one bounded static HTTPS catalog shared by CLI, GUI and TUI; retain product/target isolation and stable/pre-release SemVer precedence without client Releases API calls or API keys.
 
 ### 🐞 Fixes
 
+- Ignore a null or non-numeric top-level play URL quality when matching returned-address evidence, falling back to the direct segment quality as the representation parser already does.
+- Fill a missing `support_formats` description from the same-ID accepted-quality description instead of exposing a placeholder label; richer per-format descriptions still win.
 - Recheck the selected version under the installation lock to prevent stale updaters from activating an older payload; validate staged payloads against the candidate identity.
 - Isolate staged doctor checks from the developer working directory and DLL search path.
 - Restore ordinary Windows workspace checks while retaining static CRT enforcement for shipping bootstraps; correct cross-platform bootstrap tests and updater Clippy failures.
@@ -37,6 +40,7 @@
 - Retry the pinned FFmpeg source download on transient connection failures; the SHA-256 pin still rejects any bad bytes.
 - Archive successful CI runs' non-product handoffs in GHCR with digest-pinned readback before deleting Actions copies. Use a trusted default-branch workflow; preserve failed-run inputs and both SDK verification modes without uploading the unused rlib SDK archive.
 - Rebuild and deploy the complete static update catalog after qualified release publication, with an index-only manual entry in the same workflow; preserve ordinary tag/main release gates and the six-asset release bundle.
+
 
 ## [2.0.0-alpha.6] - 2026-10-29
 

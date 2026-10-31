@@ -157,6 +157,9 @@ pub enum Danmaku {
 pub struct Download {
     #[arg(required = true)]
     pub inputs: Vec<String>,
+    /// List video resolutions and access status without creating download jobs.
+    #[arg(long, conflicts_with_all = ["output", "quality", "video_repr", "audio_repr", "codec", "hdr", "subtitles", "danmaku", "merge", "jobs", "keep_temp"])]
+    pub list_resolutions: bool,
     /// all or comma-separated 1-based ordinals/ranges, for example 1,3-5.
     #[arg(long, default_value = "all")]
     pub parts: String,
