@@ -35,9 +35,14 @@ A CLI **built from this branch** supports checking and manually installing updat
 
 Checks read a fixed HTTPS static index; archives download directly from the matching tagged GitHub Release. The client does not call the Releases API or require an API key. `--pre-release` also considers pre-release versions for that one command (`--pre-release=false` forces the stable channel even when the settings file opts in).
 
-This delivery covers Linux CLI updates. The public static catalog, real archive download, staged/native validation, activation and preservation of the old installation have passed. Windows self-update design and acceptance are deferred; its recorded failure is not a Linux delivery gate.
+The updater uses the same versioned installation protocol on Linux and native Windows. In Windows PowerShell, run:
 
-For the first compatible Linux package, extract the complete tree into a writable installation directory. Later updates locate that directory from the running executable, prepare and validate a separate version, then switch `CURRENT`; they do not overwrite the running payload or delete the previous version.
+```powershell
+.\bili.exe update --check
+.\bili.exe update
+```
+
+For the first compatible package, extract the complete tree into a writable installation directory. Later updates locate that directory from the running executable, prepare and validate a separate version, then switch `CURRENT`; they do not overwrite the running payload or delete the previous version. Windows retains the canonical executable path when checking and starting deeply installed payloads, including paths with spaces or non-ASCII names. Filesystem path and component limits still apply.
 
 `2.0.0-alpha.6` predates this protocol and cannot update itself: extract the first compatible package into a new directory by hand.
 

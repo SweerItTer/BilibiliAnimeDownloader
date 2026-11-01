@@ -170,7 +170,9 @@ def main():
     if windows:
         flags += ["--toolchain=msvc", "--arch=x86_64", "--target-os=win64", "--extra-cflags=-MD"]
     compiler = "cl" if windows else "cc"
-    compiler_info = subprocess.run([compiler] if windows else [compiler, "--version"], capture_output=True, text=True)
+    # Native diagnostic bytes can differ from Python's locale on Windows.
+    # Fingerprinting is byte-oriented and does not need to decode them.
+    compiler_info = subprocess.run([compiler] if windows else [compiler, "--version"], capture_output=True)
     compiler_path = shutil.which(compiler)
     configured_tools = []
     for command_part in shlex.split(os.environ.get("CC", compiler), posix=os.name != "nt"):
@@ -196,7 +198,7 @@ def main():
     compiler_identity = {
         "path_sha256": hash_text(str(Path(compiler_path).resolve())) if compiler_path else None,
         "binary_sha256": digest(Path(compiler_path).resolve()) if compiler_path and Path(compiler_path).is_file() else None,
-        "version_sha256": hash_text(compiler_info.stdout + compiler_info.stderr),
+        "version_sha256": hashlib.sha256(compiler_info.stdout + compiler_info.stderr).hexdigest(),
         "configured_tools": configured_tools,
         "build_tools": build_tools,
     }
@@ -213,7 +215,7 @@ def main():
         "source_archive": str(archive),
         "prefix": str(prefix),
         "configure": configure,
-        "compiler": (compiler_info.stdout + compiler_info.stderr).strip(),
+        "compiler": compiler_identity,
         "recipe_sha256": recipe_sha256,
         "license": lock["license"],
         "patches": [],

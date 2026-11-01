@@ -6,7 +6,7 @@ Every shell (CLI, GUI, TUI) updates through this one protocol. `bili_core::updat
 
 Read this before adding an update command, a release asset, a package layout or a GUI updater.
 
-**Status: Linux CLI update delivery is qualified; the static catalog is deployed.** The shared GUI protocol below is approved documentation, not an implemented GUI updater. Per the maintainer's 2026-10-31 scope decision, Windows self-update design and runtime acceptance are deferred; its unresolved evidence in §8 is retained but does not gate this Linux phase. Existing Windows build/package CI remains unchanged.
+**Status: Linux CLI update delivery is qualified; the static catalog is deployed. Native Windows CLI offline package acceptance passed on 2026-11-01.** Windows process startup retains canonical verbatim executable paths; §9 records the repair, actual package results and verification boundary. The shared GUI protocol below is approved documentation, not an implemented GUI updater on this CLI branch. Existing Windows build/package CI remains unchanged.
 
 ## 2. Signatures
 
@@ -157,6 +157,7 @@ The shared catalog, descriptors, identity/channel rules and pre-activation failu
 
 - The root is found by walking up at most five directories from the running executable. There is no install-prefix override and no marker search elsewhere.
 - `bin/bili` (Linux) or `bili.exe` (Windows) is the payload entry; the native library closure lives with it in the same version directory.
+- On Windows, runtime validation and stable-entry startup pass the existing executable's `fs::canonicalize` result to `Command`. Keep the verbatim path prefix: filesystem extraction and metadata can succeed for a normal path that Win32 process creation rejects. Do not shorten the test installation, relocate the candidate or strip the prefix as a substitute. This changes process invocation only; filesystem path/component limits remain in force.
 - The transaction verifies the archive's size, digest and layout, expands it into the private staging directory, checks every payload identity, runs the caller's `validate` callback, and only then replaces `CURRENT` with a single rename. A failure before that rename leaves the previous pointer untouched.
 - Tar file symlinks may precede their target entries. Extraction checks lexical containment and refuses writes through symlink parents; after the complete archive is extracted, `archive::check_links` must reject dangling, cyclic, directory and out-of-tree targets before inventory validation or the staged callback. Do not require a symlink target to exist while later archive entries are still pending.
 - Files outside the layout are never touched. No automatic rollback, no background daemon and no startup repair process is part of this protocol.
@@ -188,6 +189,8 @@ Automatic reminders are shell policy: human terminal only, never with machine-re
 | Validation callback rejected the staged payload | `InstallError::Validator` |
 
 Shells map these to their own exit codes; the CLI uses 2 only for local input and configuration errors, and 4 for remote, remote-metadata, lock, corruption and filesystem failures. Error text is static: no URL, header, body or credential ever reaches a message.
+
+CLI archive-layout, inventory, payload-identity and staged-runtime rejections have distinct static operation labels, all retaining exit 4. A generic `Corruption` envelope alone is not evidence of a path-length failure.
 
 ## 5. Good / base / bad
 
@@ -233,8 +236,32 @@ Matching-source qualification passed for [A `9b483d3`](https://github.com/SweerI
 
 Actual Linux (WSL2) and native Windows CLI runs used the public static index and tagged GitHub archives to update A to `2.0.0-alpha.6.updater-test.20261031.1`. They verified channel/flag precedence, failure preservation under a held lock, archive installation and staged doctor, `CURRENT` activation, new version/native doctor, unchanged bootstrap/old payload/user file, and repeated no-op updates. Linux A was rebuilt locally with the existing locked source/native/package recipe; Windows A and both B packages came from matching-source CI. No developer loader override or Bilibili request was used. Local Linux execution is not glibc 2.35 qualification; that evidence comes from the independent Ubuntu 22.04 package check.
 
-**Deferred Windows evidence, not a Linux acceptance gate:** the shallower isolated installation completed those checks; the deeper test installation still returned `Corruption` before activation after correcting its profile fixture. Its `CURRENT`, old payload, bootstrap and user file remained unchanged. The cause is not located; shallower-path success does not resolve this failure. The maintainer deferred Windows self-update design/qualification on 2026-10-31 rather than accepting this as a proven path-length limitation. Receipts and original errors are retained under ignored `target/update-checks/static-cutover-20261030/`.
+**Historical Windows failure (follow-up in §9):** the shallower isolated installation completed those checks; the deeper test installation returned `Corruption` before activation after correcting its profile fixture. Its `CURRENT`, old payload, bootstrap and user file remained unchanged. At that point the cause was not located; shallower-path success alone did not establish it. The maintainer deferred Windows self-update qualification on 2026-10-31. Original receipts were retained on that acceptance host under ignored `target/update-checks/static-cutover-20261030/`.
 
 Windows isolation fixtures must create physical `USERPROFILE/AppData/Roaming` and `USERPROFILE/AppData/Local` directories. Setting `APPDATA`/`LOCALAPPDATA` alone did not satisfy `directories::ProjectDirs::from("", "", "bili")`: both A and B doctor failed with `locate private platform directories`; creating that directory tree restored B doctor with unchanged binaries and environment. This fixture error is separate from the unresolved deeper-installation failure.
 
 Additionally, the published `2.0.0-alpha.6` package predates this protocol: it contains no installation marker and no release descriptor, so it cannot update itself. The first compatible installation has to be installed manually.
+
+## 9. Windows process-path repair
+
+Tracks [issue #12](https://github.com/SweerItTer/BilibiliAnimeDownloader/issues/12). The original coalesced error did not identify a cause. Native Windows probes on 2026-11-01 separated successful filesystem lookup from process creation: a Rust `Command` launched the same native EXE and its imported adjacent DLL with ordinary paths of 190 and 244 characters, but failed to spawn at 262, 280, 334 and 406 characters with Win32 error 3. `fs::canonicalize` succeeded at every depth; passing its verbatim path to `Command` ran that same EXE/DLL successfully through 410 characters including the prefix.
+
+The CLI staged doctor and Windows bootstrap now keep that canonical path. The installer still extracts into its private staging tree, checks every archive/inventory/identity condition and runs the real native validator before committing `CURRENT`. No candidate relocation, running-file replacement or helper is needed for this process-path fix. Linux process invocation is unchanged.
+
+Regression coverage:
+
+- `staged_doctor_runs_with_local_dlls_at_multiple_path_depths` compiles a real native EXE/DLL and runs the isolated doctor at short and over-260-character paths, including spaces and Chinese names. The existing missing-DLL control still rejects DLLs available only through the developer's inherited `PATH`.
+- `windows_launch_starts_a_deep_unicode_payload_and_forwards_its_exit` starts a real Rust payload through the bootstrap's launch function and checks exit forwarding. A standalone native regression run failed with the old launch and all six bootstrap tests passed with the repair.
+- Ignored `update::package_tests::offline_windows_packages_update_at_multiple_depths` requires explicit clean baseline/descriptor/archive fixtures and uses the actual core transaction and CLI validator. It measures ordinary-path spawn outcomes without requiring that every Windows configuration reject them, verifies preservation after a rejection following the real doctor, activates at several depths, runs the new outer entry's version/native doctor, and rejects a stale retry. `BUILDING.md` gives the fixture variables and command.
+
+Actual native Windows acceptance on 2026-11-01 used Windows 11 build 26200, Rust 1.98.1, VS 2022 MSVC 14.44 and locally source-built pinned FFmpeg 8.0.3. The generated baseline was `2.0.0-alpha.6`; the version-only controlled candidate was `2.0.0-alpha.6.windows-test.20261101.1`. Package inspection passed source, inventory, dependency-license, native DLL and isolated doctor checks.
+
+| Installation-root UTF-16 units | Staged EXE UTF-16 units | Ordinary-path process control | Repaired transaction |
+| --- | --- | --- | --- |
+| 37 | 175 | exit 0 | passed |
+| 180 | 318 | spawn error 3 | passed |
+| 312, with spaces/Chinese names | 450 | spawn error 3 | passed |
+
+Every case ran the real candidate doctor before an injected rejection, preserved all 418 original/user files, then activated successfully and ran the new outer entry's version/native doctor. A repeated candidate was rejected before validation. The deepest outer entry was invoked through an extended absolute path; this does not qualify every external shell's handling of an ordinary absolute path longer than 260 characters.
+
+The source checks passed formatting, targeted all-target Check/Clippy, 190 core/CLI/bootstrap behavioral tests and 44 Python tests. The real-package test passed separately. Safe receipts and exact archive hashes stay under ignored `target/update-checks/windows-20261101/`; generated QA versions are not committed or published. This proves offline Windows installation with real source-built packages, not a new public release download or a new Linux runtime acceptance. No Bilibili request or remembered credential was used.
