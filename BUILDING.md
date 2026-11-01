@@ -88,9 +88,11 @@ The final product names are:
 |---|---|---|
 | `linux-cli` | Linux x86_64 CLI | Produced and verified |
 | `windows-cli` | Windows x86_64 CLI | Produced and verified |
-| `windows-gui` | Windows x86_64 GUI | Reserved; developed separately, no empty package uploaded |
+| `windows-gui` | Windows x86_64 GUI | GUI CI product on this branch; not an application release asset |
 
 Each CLI artifact contains its executable package (stable bootstrap and versioned CLI payload), the matching `bili-native-source-<target>.tar.gz`, `bili-update-cli-<target>.json`, and `SHA256SUMS` covering exactly those three assets. The source sidecar contains the pinned FFmpeg source, build recipe, and notices; keep it with the binary when redistributing. SDK hashes never enter the product checksum file.
+
+The GUI uses the same versioned layout and full package inspection with its own `gui` identity and descriptor. Build its Windows bootstrap with `--features packaged,gui` and static CRT; packaging rejects a console-subsystem GUI entry. The Windows artifact upload and download both use `windows-gui`. Linux GUI packages remain internal CI handoffs named `gui-internal-x86_64-unknown-linux-gnu`; their inspection does not establish GUI runtime qualification. See [the GUI build and update instructions](gui/README.md). This does not add GUI assets to the release workflow.
 
 SDK verification still runs in both modes. Only the dylib SDK is needed by downstream smoke jobs, so CI no longer creates or uploads the unused rlib SDK archive. CLI/source bundles and the SDK handoff are staged separately. Native replacements, the synthetic fixture, and verification receipts remain short-lived job handoffs while checks run.
 

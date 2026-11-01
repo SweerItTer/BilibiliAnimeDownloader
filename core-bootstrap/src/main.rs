@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
+
 //! Installation entry that starts the payload named by `CURRENT`.
 //!
 //! This binary is the stable, dependency-free door of a packaged installation.

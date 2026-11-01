@@ -8,6 +8,8 @@ description = "Dependency-free installation entry that starts the payload named 
 [features]
 # Shipping builds enforce the independent installation entry contract.
 packaged = []
+# Native GUI installations must not keep a console window beside the GUI.
+gui = []
 
 [dependencies]
 

@@ -37,6 +37,7 @@ WINDOWS_SYSTEM = {
     "ucrtbase.dll", "shlwapi.dll", "combase.dll", "imm32.dll", "wintrust.dll", "psapi.dll", "userenv.dll",
     "profapi.dll", "cfgmgr32.dll", "rpcrt4.dll", "winhttp.dll", "dnsapi.dll",
 }
+WINDOWS_GUI_SYSTEM = {"dwmapi.dll", "opengl32.dll", "uiautomationcore.dll", "uxtheme.dll"}
 
 
 def has_forbidden_native_options(text):
@@ -160,13 +161,13 @@ def check_checksums(root):
             raise ValueError(f"checksum mismatch: {rel}")
 
 
-def validate_dependency_licenses(root, target):
+def validate_dependency_licenses(root, target, package="core-cli"):
     index_path = root / "DEPENDENCY_LICENSES.json"
     if not index_path.is_file():
         raise ValueError("package lacks its complete dependency-license index")
     index = json.loads(index_path.read_text(encoding="utf-8"))
     records = index.get("dependencies")
-    if index.get("format") != 1 or index.get("package") != "core-cli" or index.get("target") != target or not isinstance(records, list) or not records:
+    if index.get("format") != 1 or index.get("package") != package or index.get("target") != target or not isinstance(records, list) or not records:
         raise ValueError("dependency-license index has the wrong package/target or no dependency records")
     text_count = 0
     for record in records:
@@ -333,8 +334,8 @@ def run(command, env, cwd, *, encoding=None, deadline=None):
     return result.stdout + result.stderr
 
 
-def inspect_linux(root, env):
-    app = root / "bin/bili"
+def inspect_linux(root, env, executable="bin/bili"):
+    app = root / executable
     dynamic = run(["readelf", "-d", str(app)], env, root)
     if "$ORIGIN/../lib" not in dynamic:
         raise ValueError("Linux app lacks required app-relative RUNPATH")
@@ -387,36 +388,61 @@ def parse_windows_dependencies(output):
     return re.findall(r"^\s*([A-Za-z0-9_.-]+\.dll)\s*$", output, re.M | re.I)
 
 
-def inspect_windows(root, env):
+def inspect_windows(root, env, executable="bili.exe", product="cli"):
     dumpbin = shutil.which("dumpbin")
     if not dumpbin:
         raise ValueError("dumpbin is required for Windows import inspection")
-    files = [root / "bili.exe", *sorted(root.glob("*.dll"))]
+    files = [root / executable, *sorted(root.glob("*.dll"))]
     bundled = {p.name.lower() for p in root.glob("*.dll")}
+    system = WINDOWS_SYSTEM | (WINDOWS_GUI_SYSTEM if product == "gui" else set())
     names = bundled
     required = ({"avformat-62.dll", "libavformat-62.dll"}, {"avcodec-62.dll", "libavcodec-62.dll"}, {"avutil-60.dll", "libavutil-60.dll"})
     if not all(names & variants for variants in required):
-        raise ValueError("Windows package lacks required FFmpeg DLLs beside bili.exe")
+        raise ValueError(f"Windows package lacks required FFmpeg DLLs beside {executable}")
     for file in files:
         output = run([dumpbin, "/nologo", "/dependents", str(file)], env, root)
         deps = {name.lower() for name in parse_windows_dependencies(output)}
         reject_dynamic_rust_core(deps)
-        unresolved = {name for name in deps - bundled - WINDOWS_SYSTEM if not name.startswith(("api-ms-win-", "ext-ms-win-"))}
+        unresolved = {name for name in deps - bundled - system if not name.startswith(("api-ms-win-", "ext-ms-win-"))}
         if unresolved:
             raise ValueError(f"unbundled Windows dependency in {file.name}: {sorted(unresolved)}")
 
 
-def inspect_windows_bootstrap(root, env):
+def validate_windows_bootstrap_subsystem(entry, product="cli"):
+    expected = {"cli": 3, "gui": 2}.get(product)
+    if expected is None:
+        raise ValueError("unsupported Windows bootstrap product")
+    with Path(entry).open("rb") as stream:
+        dos = stream.read(64)
+        if len(dos) != 64 or dos[:2] != b"MZ":
+            raise ValueError("Windows bootstrap has an invalid DOS header")
+        stream.seek(int.from_bytes(dos[60:64], "little"))
+        header = stream.read(24)
+        if len(header) != 24 or header[:4] != b"PE\0\0" or header[4:6] != b"\x64\x86":
+            raise ValueError("Windows bootstrap is not an x86_64 PE executable")
+        optional_size = int.from_bytes(header[20:22], "little")
+        optional = stream.read(optional_size)
+        if optional_size < 70 or len(optional) != optional_size or optional[:2] != b"\x0b\x02":
+            raise ValueError("Windows bootstrap has an invalid PE32+ optional header")
+    subsystem = int.from_bytes(optional[68:70], "little")
+    if subsystem != expected:
+        raise ValueError("Windows bootstrap subsystem disagrees with the selected product")
+    return subsystem
+
+
+def inspect_windows_bootstrap(root, env, product="cli"):
+    entry = root / "bili.exe"
+    subsystem = validate_windows_bootstrap_subsystem(entry, product)
     dumpbin = shutil.which("dumpbin")
     if not dumpbin:
         raise ValueError("dumpbin is required for Windows bootstrap import inspection")
-    entry = root / "bili.exe"
     output = run([dumpbin, "/nologo", "/dependents", str(entry)], env, root)
     deps = {name.lower() for name in parse_windows_dependencies(output)}
     reject_dynamic_rust_core(deps)
     unresolved = {name for name in deps - WINDOWS_SYSTEM if not name.startswith(("api-ms-win-", "ext-ms-win-"))}
     if unresolved:
         raise ValueError(f"bootstrap imports non-system Windows DLLs: {sorted(unresolved)}")
+    return subsystem
 
 
 def validate_replacement(prefix, root, target, env):
@@ -1363,6 +1389,7 @@ def verify_live_media(executable, state_dir, output_dir, env, cwd, media_id, pro
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package", type=Path)
+    parser.add_argument("--product", choices=("cli", "gui"), default="cli")
     parser.add_argument("--target", required=True, choices=("x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"))
     parser.add_argument("--native-source", type=Path, required=True, help="matching separately packaged native-source archive")
     parser.add_argument("--probe-helper", type=Path, help="matched bili_core SDK probe consumer executable")
@@ -1376,6 +1403,8 @@ def main():
     parser.add_argument("--max-media-bytes", type=int, default=134217728)
     parser.add_argument("--report", type=Path, help="write an artifact-safe JSON record of actual verification outcomes")
     args = parser.parse_args()
+    if args.product == "gui" and any((args.public_media_id, args.offline_fixture, args.replacement_prefix)):
+        parser.error("media and remux acceptance options require --product cli")
     if args.live_timeout_seconds <= 0 or args.max_media_bytes <= 0:
         parser.error("--live-timeout-seconds and --max-media-bytes must be positive")
     if args.offline_fixture and not (args.probe_helper or args.sdk_artifact):
@@ -1394,6 +1423,7 @@ def main():
         "schema_version": 1,
         "status": "incomplete",
         "target": args.target,
+        "product": args.product,
         "public_media_profile": args.public_media_profile if args.public_media_id else None,
         "public_media_id": public_id,
         "media_path": f"https://www.bilibili.com/video/{public_id}" if public_id else None,
@@ -1419,19 +1449,20 @@ def main():
         extract(args.package.resolve(), extracted)
         root = package_root(extracted)
         check_checksums(root)
-        payload = installation_payload(root, args.target)
+        payload = installation_payload(root, args.target, args.product)
         check_checksums(payload)
         source_asset = args.native_source.resolve()
         source_extract = base / "native-source"
         native_info = inspect_native(payload, args.target, source_asset, source_extract)
         build_info = json.loads((payload / "BUILD_INFO.json").read_text(encoding="utf-8"))
         version = build_info.get("app_version")
-        descriptor_path = args.package.resolve().parent / descriptor_name(args.target)
-        load_descriptor(descriptor_path, args.target, version, args.package.resolve())
+        report["version"] = version
+        descriptor_path = args.package.resolve().parent / descriptor_name(args.target, args.product)
+        load_descriptor(descriptor_path, args.target, version, args.package.resolve(), args.product)
         report["descriptor_sha256"] = sha256(descriptor_path)
-        validate_dependency_licenses(payload, args.target)
+        validate_dependency_licenses(payload, args.target, "gui" if args.product == "gui" else "core-cli")
         validate_windows_runtime(payload, build_info, args.target)
-        if (build_info.get("schema_version") != 1 or build_info.get("product") != "cli"
+        if (build_info.get("schema_version") != 1 or build_info.get("product") != args.product
                 or build_info.get("target") != args.target or build_info.get("profile") not in ("debug", "release")
                 or any(build_info.get(key) != 1
                        for key in ("update_protocol", "layout_version", "bootstrap_protocol"))):
@@ -1478,14 +1509,14 @@ def main():
             inspect_linux(payload, inspect_env)
             inspect_linux_bootstrap(root, inspect_env)
         else:
-            inspect_windows(payload, inspect_env)
-            inspect_windows_bootstrap(root, inspect_env)
+            inspect_windows(payload, inspect_env, product=args.product)
+            report["bootstrap_subsystem"] = inspect_windows_bootstrap(root, inspect_env, args.product)
         executable = bootstrap
         run([str(executable), "--help"], env, base)
         version_output = run([str(executable), "--version"], env, base, encoding="utf-8")
         doctor = run([str(executable), "--state-dir", str(base / "doctor-state"), "--json", "doctor"], env, base, encoding="utf-8")
         report["native"] = {"doctor": validate_doctor(doctor)}
-        if parse_doctor_identity(doctor, version_output, args.target) != version:
+        if parse_doctor_identity(doctor, version_output, args.target, args.product) != version:
             raise ValueError("doctor version disagrees with package build metadata")
         report["package_validation"] = "passed"
         probe_helper = args.probe_helper.resolve() if args.probe_helper else None
@@ -1533,7 +1564,7 @@ def main():
                     probe_helper = find_probe_helper(args.sdk_artifact.resolve(), base / "sdk")
                 verify_live_media(executable, base / "state", base / "public-smoke", env, base,
                                   args.public_media_id, probe_helper, report)
-        print("Package extraction, checksums, source/configuration, dependency closure, and isolated CLI smoke passed.")
+        print(f"Package extraction, checksums, source/configuration, dependency closure, and isolated {args.product.upper()} smoke passed.")
         report["status"] = "passed"
         if args.replacement_prefix:
             print("Compatible-library replacement and synthetic managed-remux smoke passed.")

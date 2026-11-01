@@ -1,0 +1,46 @@
+{
+  "sources": [
+    {
+      "spdx": "MIT",
+      "url": "https://spdx.org/licenses/MIT.txt",
+      "sha256": "c3b1b78bc8bd3ea13aa4bc9778442d16560270afa235006d816e5e88cef24db4",
+      "filename": "MIT.txt",
+      "provenance": "Canonical SPDX License List text for MIT; included when a dependency declares this identifier but publishes no license file in its crate source."
+    },
+    {
+      "spdx": "Apache-2.0",
+      "url": "https://spdx.org/licenses/Apache-2.0.txt",
+      "sha256": "c274f80372d90c012937370f0e1f15087d22e308ef98b27cea5dc0d2d088366c",
+      "filename": "Apache-2.0.txt",
+      "provenance": "Canonical SPDX License List text for Apache-2.0; included when a dependency declares this identifier but publishes no license file in its crate source."
+    },
+    {
+      "spdx": "Zlib",
+      "url": "https://spdx.org/licenses/Zlib.txt",
+      "sha256": "e21f5c0f66a0103c75f120a8864ef885d2f5922862d8ce168709451a2964972b",
+      "filename": "Zlib.txt",
+      "provenance": "Canonical SPDX License List text for Zlib; included when a dependency declares this identifier but publishes no license file in its crate source."
+    },
+    {
+      "spdx": "BSL-1.0",
+      "url": "https://spdx.org/licenses/BSL-1.0.txt",
+      "sha256": "6f320cd63543c68dd7769b146459eac9608574db0abf480f68328ae85460fdf5",
+      "filename": "BSL-1.0.txt",
+      "provenance": "Canonical SPDX License List text for BSL-1.0; included when a dependency declares this identifier but publishes no license file in its crate source."
+    },
+    {
+      "spdx": "CC0-1.0",
+      "url": "https://spdx.org/licenses/CC0-1.0.txt",
+      "sha256": "e0456cbab4f7b5e7203e678faff37eadbdfef02e822db3b7a52a1dd9d3dc514a",
+      "filename": "CC0-1.0.txt",
+      "provenance": "Canonical SPDX License List text for CC0-1.0; included when a dependency declares this identifier but publishes no license file in its crate source."
+    },
+    {
+      "spdx": "WTFPL",
+      "url": "https://spdx.org/licenses/WTFPL.txt",
+      "sha256": "13d8825a59e5e546d41e8711405d0f335a9934362a47c04a3b4280fa7932dc4a",
+      "filename": "WTFPL.txt",
+      "provenance": "Canonical SPDX License List text for WTFPL; included when a dependency declares this identifier but publishes no license file in its crate source."
+    }
+  ]
+}
