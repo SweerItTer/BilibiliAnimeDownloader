@@ -10,6 +10,13 @@ use std::{
 };
 
 pub(crate) const SCHEMA: u32 = 1;
+pub(crate) fn admission_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ResourceRecord {
     pub name: String,
@@ -55,6 +62,7 @@ impl JobRecord {
                 skipped: false,
                 error: None,
                 components: Vec::new(),
+                created_at: Some(admission_time()),
             },
             resources: Vec::new(),
             completion: None,
@@ -332,6 +340,157 @@ impl Drop for Journal {
             let _ = FileExt::unlock(lock);
         }
     }
+}
+
+/// Inspect only an owned, verified completed output on a tracked blocking worker.
+pub(crate) fn output_info(record: &JobRecord) -> Result<OutputInfo> {
+    let output = record.snapshot.output.clone();
+    let media = if let Some(path) = output.as_ref() {
+        if !path.try_exists().map_err(CoreError::io)? {
+            return Ok(OutputInfo {
+                job: record.snapshot.id,
+                output,
+                media: None,
+                components: record.snapshot.components.clone(),
+            });
+        }
+        ensure_real_dir(
+            path.parent()
+                .ok_or_else(|| CoreError::new(ErrorCode::InvalidInput, "output parent missing"))?,
+        )?;
+        if !verify_completion_cancel(record, &tokio_util::sync::CancellationToken::new())? {
+            return Err(CoreError::new(
+                ErrorCode::Conflict,
+                "completed output ownership or content changed",
+            ));
+        }
+        Some(crate::remux::probe(path)?)
+    } else {
+        None
+    };
+    Ok(OutputInfo {
+        job: record.snapshot.id,
+        output,
+        media,
+        components: record.snapshot.components.clone(),
+    })
+}
+
+fn removal_files(record: &JobRecord) -> Result<Vec<PathBuf>> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut paths = Vec::new();
+    let output = record
+        .snapshot
+        .plan
+        .as_ref()
+        .map(|plan| &plan.destination)
+        .or_else(|| record.local.as_ref().map(|local| &local.output));
+    if let Some(path) = output {
+        reject_symlink(path)?;
+        if path.try_exists().map_err(CoreError::io)? {
+            ensure_real_dir(path.parent().ok_or_else(|| {
+                CoreError::new(ErrorCode::InvalidInput, "output parent missing")
+            })?)?;
+            if !verify_completion_cancel(record, &cancel)? {
+                return Err(CoreError::new(
+                    ErrorCode::Conflict,
+                    "refusing unowned or modified output removal",
+                ));
+            }
+            paths.push(path.clone());
+        }
+    }
+    for component in &record.snapshot.components {
+        if let Some(path) = &component.path {
+            reject_symlink(path)?;
+            if !path.try_exists().map_err(CoreError::io)? {
+                continue;
+            }
+            ensure_real_dir(path.parent().ok_or_else(|| {
+                CoreError::new(ErrorCode::InvalidInput, "component parent missing")
+            })?)?;
+            if !verify_component(path, &cancel)? {
+                return Err(CoreError::new(
+                    ErrorCode::Conflict,
+                    "refusing unowned component removal",
+                ));
+            }
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
+    }
+    Ok(paths)
+}
+
+pub(crate) fn recycle_outputs(records: &[JobRecord], recycle: RecycleBin) -> Result<RemovalReport> {
+    recycle_outputs_with(records, recycle.move_files)
+}
+fn recycle_outputs_with(
+    records: &[JobRecord],
+    recycle: impl FnMut(&[PathBuf]) -> Result<()>,
+) -> Result<RemovalReport> {
+    recycle_outputs_checked(records, recycle, |path| path.try_exists())
+}
+fn recycle_outputs_checked(
+    records: &[JobRecord],
+    mut recycle: impl FnMut(&[PathBuf]) -> Result<()>,
+    mut exists: impl FnMut(&Path) -> std::io::Result<bool>,
+) -> Result<RemovalReport> {
+    let mut report = RemovalReport::default();
+    for record in records {
+        if record.snapshot.phase.is_active() {
+            return Err(CoreError::new(
+                ErrorCode::Busy,
+                "stop job before file removal",
+            ));
+        }
+    }
+    for record in records {
+        let paths = match removal_files(record) {
+            Ok(paths) => paths,
+            Err(error) => {
+                report.errors.push(error);
+                continue;
+            }
+        };
+        let result = if paths.is_empty() {
+            Ok(())
+        } else {
+            recycle(&paths)
+        };
+        let succeeded = match result {
+            Ok(()) => true,
+            Err(error) => {
+                report.errors.push(error);
+                false
+            }
+        };
+        let mut all_missing = true;
+        let mut present = false;
+        for path in paths {
+            match exists(&path) {
+                Ok(false) => report.recycled.push(path),
+                Ok(true) => {
+                    all_missing = false;
+                    present = true;
+                }
+                Err(error) => {
+                    all_missing = false;
+                    report.errors.push(CoreError::io(error));
+                }
+            }
+        }
+        if succeeded && all_missing {
+            report.removed.push(record.snapshot.id);
+        } else if succeeded && present {
+            report.errors.push(CoreError::new(
+                ErrorCode::Filesystem,
+                "recycle operation left requested outputs",
+            ));
+        }
+    }
+    Ok(report)
 }
 
 pub(crate) fn private_options() -> OpenOptions {
@@ -911,6 +1070,7 @@ mod tests {
                 skipped: false,
                 error: None,
                 components: Vec::new(),
+                created_at: None,
             },
             resources: Vec::new(),
             completion: None,
@@ -920,6 +1080,160 @@ mod tests {
                 output: root.join("final.mp4"),
             }),
         }
+    }
+    fn completed_record(root: &Path) -> JobRecord {
+        let mut record = local_record(root);
+        let output = record.local.as_ref().unwrap().output.clone();
+        fs::write(&output, b"completed fixture bytes").unwrap();
+        let (size, sha256) =
+            file_digest_cancel(&output, &tokio_util::sync::CancellationToken::new()).unwrap();
+        record.completion = Some(Completion {
+            sha256,
+            size,
+            fingerprint: format!("manual:{}", record.snapshot.id),
+            promoted: true,
+        });
+        record.snapshot.phase = JobPhase::Completed;
+        record.snapshot.output = Some(output);
+        record
+    }
+    #[test]
+    fn completed_file_removal_checks_ownership_and_keeps_unrelated_files() {
+        let root = tempfile::tempdir().unwrap();
+        let mut record = completed_record(root.path());
+        let output = record.snapshot.output.clone().unwrap();
+        let subtitle = root.path().join("final.zh.srt");
+        write_component(
+            &subtitle,
+            b"subtitle",
+            "fixture/subtitle",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        record.snapshot.components.push(ComponentResult {
+            name: "subtitle".into(),
+            path: Some(subtitle.clone()),
+            error: None,
+            omissions: 0,
+        });
+        let unrelated = root.path().join("notes.txt");
+        fs::write(&unrelated, b"keep me").unwrap();
+        let recover = root.path().join("recovery");
+        fs::create_dir(&recover).unwrap();
+        let report = recycle_outputs_with(&[record.clone()], |paths| {
+            assert_eq!(paths, &[output.clone(), subtitle.clone()]);
+            for path in paths {
+                fs::rename(path, recover.join(path.file_name().unwrap())).map_err(CoreError::io)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(report.removed, vec![record.snapshot.id]);
+        assert_eq!(report.recycled.len(), 2);
+        assert!(report.errors.is_empty());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"keep me");
+        assert!(recover.join("final.mp4").exists());
+        assert!(recover.join("final.zh.srt").exists());
+    }
+    #[test]
+    fn modified_or_unowned_output_is_preserved_and_failed_trash_keeps_record() {
+        let root = tempfile::tempdir().unwrap();
+        let record = completed_record(root.path());
+        let output = record.snapshot.output.as_ref().unwrap();
+        fs::write(output, b"replacement bytes").unwrap();
+        let report = recycle_outputs_with(std::slice::from_ref(&record), |_| {
+            panic!("must not recycle changed bytes")
+        })
+        .unwrap();
+        assert!(report.removed.is_empty());
+        assert_eq!(report.errors[0].code, ErrorCode::Conflict);
+        assert_eq!(fs::read(output).unwrap(), b"replacement bytes");
+        let record = completed_record(root.path());
+        let report = recycle_outputs_with(std::slice::from_ref(&record), |_| {
+            Err(CoreError::new(
+                ErrorCode::Filesystem,
+                "test trash unavailable",
+            ))
+        })
+        .unwrap();
+        assert!(report.removed.is_empty());
+        assert!(report.recycled.is_empty());
+        assert_eq!(report.errors[0].code, ErrorCode::Filesystem);
+        assert!(output.exists());
+        let mut unowned = record.clone();
+        unowned.completion = None;
+        assert_eq!(
+            removal_files(&unowned).unwrap_err().code,
+            ErrorCode::Conflict
+        );
+    }
+    #[test]
+    fn recycle_inspection_errors_never_claim_missing_files_or_remove_records() {
+        let root = tempfile::tempdir().unwrap();
+        let record = completed_record(root.path());
+        let output = record.snapshot.output.clone().unwrap();
+        let report = recycle_outputs_checked(
+            &[record],
+            |_| Ok(()),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "fixture metadata failure",
+                ))
+            },
+        )
+        .unwrap();
+        assert!(report.removed.is_empty());
+        assert!(report.recycled.is_empty());
+        assert_eq!(report.errors[0].code, ErrorCode::Filesystem);
+        assert_eq!(fs::read(output).unwrap(), b"completed fixture bytes");
+    }
+    #[test]
+    fn partial_recycle_reports_only_confirmed_moved_files_and_retains_the_record() {
+        let root = tempfile::tempdir().unwrap();
+        let mut record = completed_record(root.path());
+        let output = record.snapshot.output.clone().unwrap();
+        let subtitle = root.path().join("final.srt");
+        write_component(
+            &subtitle,
+            b"subtitle",
+            "fixture/partial",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        record.snapshot.components.push(ComponentResult {
+            name: "subtitle".into(),
+            path: Some(subtitle.clone()),
+            error: None,
+            omissions: 0,
+        });
+        let recovery = root.path().join("recoverable-output.mp4");
+        let report = recycle_outputs_with(&[record], |paths| {
+            assert_eq!(paths, &[output.clone(), subtitle.clone()]);
+            fs::rename(&output, &recovery).map_err(CoreError::io)?;
+            Err(CoreError::new(
+                ErrorCode::Filesystem,
+                "fixture partial recycle",
+            ))
+        })
+        .unwrap();
+        assert!(report.removed.is_empty());
+        assert_eq!(report.recycled, vec![output]);
+        assert_eq!(report.errors[0].code, ErrorCode::Filesystem);
+        assert_eq!(fs::read(&recovery).unwrap(), b"completed fixture bytes");
+        assert_eq!(fs::read(&subtitle).unwrap(), b"subtitle");
+    }
+    #[test]
+    fn missing_legacy_admission_time_stays_unknown_after_deserialization() {
+        let root = tempfile::tempdir().unwrap();
+        let record = local_record(root.path());
+        let mut value = serde_json::to_value(&record).unwrap();
+        value["snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("created_at");
+        let restored: JobRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.snapshot.created_at, None);
     }
     #[test]
     fn promotion_recovery_requires_owned_hard_link_not_merely_matching_bytes() {
@@ -1017,6 +1331,7 @@ mod revision_recovery_tests {
                 skipped: false,
                 error: None,
                 components: Vec::new(),
+                created_at: None,
             },
             resources: Vec::new(),
             completion: None,

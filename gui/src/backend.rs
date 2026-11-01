@@ -370,7 +370,12 @@ async fn login(
     ctx: &egui::Context,
 ) -> Result<AuthSnapshot> {
     let result = async {
-        let start = core.auth(AuthAction::StartQr { remember }).await?;
+        let start = core
+            .auth(AuthAction::StartQr {
+                remember,
+                activate: true,
+            })
+            .await?;
         let expires = start
             .qr
             .as_ref()

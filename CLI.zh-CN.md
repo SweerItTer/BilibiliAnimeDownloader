@@ -67,6 +67,9 @@ PowerShell 中对应的下载命令：
 | `login qr` | 在交互终端扫码登录；`--remember` |
 | `login cookie` | 隐藏输入 Cookie，或加 `--stdin` 从重定向输入读取；`--remember` |
 | `login status` | 读取已保存账号并显示状态 |
+| `login list` | 列出已记忆的账号凭据，不访问 B 站 |
+| `login select PROFILE_ID` | 选择后续命令默认使用的已保存账号 |
+| `login forget PROFILE_ID` | 移除指定账号的记忆凭据 |
 | `logout` | 通过账号存储移除记忆的登录 |
 | `jobs` | 只读查看任务，不占用下载写锁 |
 | `resume JOB_ID` 或 `resume --all` | 继续或重试已保存任务；登录参数 |
@@ -77,7 +80,7 @@ PowerShell 中对应的下载命令：
 | `update` | 安装兼容的新版本；`--check`、`--pre-release[=true\|false]` |
 | `help [COMMAND...]` | 查看程序或子命令帮助，与其帮助开关作用相同 |
 
-登录参数指 `--auth MODE` 和显式的 `--remember`，适用于 `search`、`info`、`qualities`、`download`、`resume`，并非所有命令都接受。
+登录参数指 `--auth MODE`、`--profile PROFILE_ID` 和显式的 `--remember`，适用于 `search`、`info`、`qualities`、`download`、`resume`，并非所有命令都接受。
 
 <a id="search"></a>
 ## 搜索与排序
@@ -133,6 +136,8 @@ PowerShell 中对应的下载命令：
 
 默认的 `--auth auto` 会读取你之前选择记忆的账号，后续无需重复 `--auth stored`。若必须使用已保存账号、没有就应报错，可显式选择 `--auth stored`。保存记录出错时会报告错误，不会静默降为匿名。
 
+记忆另一个账号会新增一份凭据。用 `login list` 查看凭据 ID、账号名、来源提供的大会员信息、上次检查时间和已知的过期时间。Cookie 请求头通常不含过期日期，未知不代表永不过期。`login select PROFILE_ID` 切换默认账号；也可在下载时使用 `--profile PROFILE_ID`，它只配合 `auto` 或 `stored`，不能与 `--remember` 一起使用。`login forget PROFILE_ID` 只移除指定账号。凭据列表不会输出 Cookie 内容。
+
 只为一次下载登录，可运行 `download VIDEO_ID --auth qr`，登录持续到这条命令结束。单独运行**不带** `--remember` 的 `login qr` 或 `login cookie` 只验证本次登录；进程结束后，该登录不会传给下一条命令。
 
 | `--auth` 模式 | 行为 |
@@ -171,7 +176,7 @@ PowerShell 中对应的下载命令：
 | `--connections N` | 共享连接上限，默认 6 或配置值；支持 1–256 |
 | `--keep-temp` | 成功完成后仍保留程序拥有的临时资源；默认关闭 |
 | `--list-resolutions` | 仅查询清晰度，不创建任务或输出目录 |
-| `--auth MODE`、`--remember` | 使用哪个账号、是否明确保存；见[登录](#login) |
+| `--auth MODE`、`--profile PROFILE_ID`、`--remember` | 使用哪个账号、是否明确保存；见[登录](#login) |
 
 `--list-resolutions` 可以配合 `--parts`、登录参数和 `--connections`，但不能显式配合 `--output`、`--quality`、精确选流/编码/HDR、字幕/弹幕/合并参数、`--jobs`、`--keep-temp`。即使显式填写的值恰好等于普通下载默认值，也会冲突。
 
@@ -189,7 +194,7 @@ PowerShell 中对应的下载命令：
 ./bin/bili --state-dir "./bili-state" resume --all
 ```
 
-`JOB_ID` 取自进度或最终结果，且要使用下载时的**同一状态目录**；未覆盖时，各命令都使用平台默认目录。恢复使用本次选择的账号，任务记录不会保存原 Cookie。需要账号的内容，可能仍需已记忆登录或再次 `--auth qr`。
+`JOB_ID` 取自进度或最终结果，且要使用下载时的**同一状态目录**；未覆盖时，各命令都使用平台默认目录。新任务保留添加时的凭据 ID 和精确媒体规格，任务记录不会保存 Cookie。默认恢复沿用原凭据；想为这些任务更换凭据，可明确使用 `--profile PROFILE_ID` 或 `--auth qr`、`--auth anonymous` 等模式。原凭据缺失或过期时会报错，不会悄悄换成其他账号。
 
 `jobs` 是只读查看，可与下载进程并行。同一状态目录只能有一个写入会话；第二个下载、恢复、合并或清理进程会报告 `Busy`。强制退出后，`jobs` 可能仍显示上次记录的运行中状态；写入会话会先核对中断任务，再执行恢复，显示的字节数本身不作为可靠断点。异常关机和断电恢复尚未充分验收，不要通过删除锁文件、断点文件或手改 JSON 强迫恢复。
 

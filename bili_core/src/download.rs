@@ -20,6 +20,55 @@ use crate::{
 pub(crate) struct TransferOptions<'a> {
     pub cancel: &'a CancellationToken,
     pub rate_limit: Option<u64>,
+    pub budget: Option<&'a RateBudget>,
+}
+
+/// Shared across all current and resumed jobs bearing one immutable batch ID.
+pub(crate) struct RateBudget {
+    rate: u64,
+    next: tokio::sync::Mutex<tokio::time::Instant>,
+}
+impl RateBudget {
+    pub(crate) fn new(rate: u64) -> Self {
+        Self {
+            rate: rate.max(1),
+            next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        }
+    }
+    async fn ready(&self, cancel: &CancellationToken) -> Result<()> {
+        loop {
+            let target = {
+                let next = tokio::select! {
+                    _ = cancel.cancelled() => return Err(cancelled()),
+                    next = self.next.lock() => next,
+                };
+                *next
+            };
+            if target <= tokio::time::Instant::now() {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(cancelled()),
+                _ = tokio::time::sleep_until(target) => {}
+            }
+            // Other in-flight resources can extend the batch debt while waiting.
+        }
+    }
+    async fn wait(&self, bytes: u64, cancel: &CancellationToken) -> Result<()> {
+        // These bytes have already arrived. Charge them even when cancellation
+        // was requested by the progress callback, and retain the debt on pause.
+        let mut next = self.next.lock().await;
+        let duration = Duration::from_secs(bytes / self.rate).saturating_add(Duration::from_nanos(
+            (u128::from(bytes % self.rate) * 1_000_000_000 / u128::from(self.rate)) as u64,
+        ));
+        let target = (*next).max(tokio::time::Instant::now()) + duration;
+        *next = target;
+        drop(next);
+        tokio::select! {
+            _=cancel.cancelled()=>Err(cancelled()),
+            _=tokio::time::sleep_until(target)=>Ok(())
+        }
+    }
 }
 
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
@@ -514,6 +563,18 @@ async fn stream_once(
         };
         let mut stream = response.bytes_stream();
         loop {
+            if let Some(budget) = options.budget {
+                if let Err(error) = budget.ready(cancel).await {
+                    flush_stream_progress(&file, sidecar, checkpoint, start_at, received, &hasher)
+                        .await
+                        .map_err(TransferFailure::fatal)?;
+                    let current = start_at + received;
+                    if last_reported != Some(current) {
+                        progress(current);
+                    }
+                    return Err(TransferFailure::fatal(error));
+                }
+            }
             let next = tokio::select! {
                 _ = cancel.cancelled() => {
                     flush_stream_progress(&file, sidecar, checkpoint, start_at, received, &hasher).await.map_err(TransferFailure::fatal)?;
@@ -554,6 +615,17 @@ async fn stream_once(
                 progress(current);
                 last_reported = Some(current);
                 last_progress_at = Some(Instant::now());
+            }
+            if let Some(budget) = options.budget {
+                if let Err(error) = budget.wait(bytes.len() as u64, cancel).await {
+                    flush_stream_progress(&file, sidecar, checkpoint, start_at, received, &hasher)
+                        .await
+                        .map_err(TransferFailure::fatal)?;
+                    if last_reported != Some(current) {
+                        progress(current);
+                    }
+                    return Err(TransferFailure::fatal(error));
+                }
             }
             if let Some(limit) = rate_limit.filter(|limit| *limit > 0) {
                 let fractional_nanos =

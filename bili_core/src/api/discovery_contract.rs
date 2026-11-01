@@ -90,6 +90,101 @@ fn video_search_page(page: u32, ids: &[u64]) -> Value {
 }
 
 #[tokio::test]
+async fn channel_filter_is_sent_to_source_and_page_bounds_survive_deduplication() {
+    let response = json!({"code":0,"data":{"page":2,"pagesize":20,"numPages":96,"numResults":1915,
+        "result":[{"aid":1,"title":"<em>标题</em>","author":"作者","pubdate":123,"play":456,"video_review":7},
+                  {"aid":1,"title":"重复"}]}});
+    let (endpoint, server) = search_server(vec![response]).await;
+    let results = search_loopback(
+        SearchQuery {
+            keyword: "fixture".into(),
+            category: SearchCategory::Video,
+            page: 2,
+            sort: SearchSort::Newest,
+            filter: SearchFilter {
+                video_channel: Some(1),
+            },
+        },
+        &endpoint,
+    )
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+    assert_eq!(
+        requests[0]
+            .query_pairs()
+            .find(|(key, _)| key == "tids")
+            .unwrap()
+            .1,
+        "1"
+    );
+    let page = &results.pages[0];
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.page_size, Some(20));
+    assert_eq!(page.total_pages, Some(96));
+    let item = &page.items[0];
+    assert_eq!(item.title, "标题");
+    assert_eq!(item.author.as_deref(), Some("作者"));
+    assert_eq!(
+        (item.published_at, item.plays, item.danmaku),
+        (Some(123), Some(456), Some(7))
+    );
+}
+
+#[test]
+fn pgc_browse_uses_dynamic_genres_and_keeps_unknown_totals_unknown() {
+    let conditions = parse_browse_conditions(PgcSection::Film,&json!({"code":0,"data":{"filter":[
+        {"field":"style_id","name":"风格","values":[{"keyword":"-1","name":"全部"},{"keyword":"10012","name":"科幻"}]},
+        {"field":"unsafe_remote_parameter","name":"ignored","values":[{"keyword":"1","name":"ignored"}]}
+    ]}})).unwrap();
+    assert_eq!(conditions.genres.len(), 2);
+    assert_eq!(conditions.genres[1].id, 10012);
+    let query = BrowseQuery {
+        section: PgcSection::Film,
+        genre: Some(10012),
+        page: 3,
+        page_size: 20,
+    };
+    let url = browse_url(&query).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(params.get("season_type").map(String::as_str), Some("2"));
+    assert_eq!(params.get("type").map(String::as_str), Some("0"));
+    assert_eq!(params.get("style_id").map(String::as_str), Some("10012"));
+    assert!(!params.contains_key("keyword"));
+    let page = parse_browse_page(
+        &query,
+        &json!({"code":0,"data":{"has_next":1,"list":[
+            {"season_id":12,"title":"Fixture film","cover":"https://i0.hdslb.com/fixture.jpg"}
+        ]}}),
+    )
+    .unwrap();
+    assert!(page.has_more);
+    assert_eq!(page.total, None);
+    assert_eq!(page.total_pages, None);
+    assert_eq!(page.items[0].category, SearchCategory::Film);
+    let known = parse_browse_page(
+        &query,
+        &json!({"code":0,"data":{"total":101,"size":20,"has_next":true,"list":[]}}),
+    )
+    .unwrap();
+    assert_eq!(known.total_pages, Some(6));
+}
+
+#[test]
+fn challenge_payload_stays_transient_in_safe_discovery_errors() {
+    let error = parse_search_page(
+        SearchCategory::Video,
+        1,
+        &json!({"code":0,"data":{"v_voucher":"synthetic-voucher-private"}}),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::VerificationRequired);
+    let serialized = serde_json::to_string(&error).unwrap();
+    assert!(!serialized.contains("synthetic-voucher-private"));
+    assert!(!format!("{error:?}").contains("synthetic-voucher-private"));
+}
+
+#[tokio::test]
 async fn server_sorting_preserves_two_page_order_and_parameters() {
     let choices = [
         (SearchSort::Relevance, None),
@@ -119,6 +214,8 @@ async fn server_sorting_preserves_two_page_order_and_parameters() {
                         category: SearchCategory::Video,
                         page,
                         sort,
+
+                        filter: Default::default(),
                     },
                     &endpoint,
                 )
@@ -175,6 +272,8 @@ async fn default_mixed_search_preserves_category_pages_and_deduplication() {
             category: SearchCategory::All,
             page: 1,
             sort: SearchSort::Relevance,
+
+            filter: Default::default(),
         },
         &endpoint,
     )
@@ -223,6 +322,8 @@ async fn sorted_empty_and_access_failures_are_not_conflated() {
         category: SearchCategory::Video,
         page: 1,
         sort: SearchSort::Newest,
+
+        filter: Default::default(),
     };
     let empty = search_loopback(query.clone(), &endpoint).await.unwrap();
     let challenge = search_loopback(query.clone(), &endpoint).await.unwrap_err();
@@ -250,6 +351,8 @@ async fn unsupported_sort_never_calls_the_fetch_boundary() {
                 category,
                 page: 1,
                 sort,
+
+                filter: Default::default(),
             };
             let result = search_pages(query, |_| async {
                 panic!("invalid sort must fail before fetching or signing")

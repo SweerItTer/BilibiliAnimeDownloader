@@ -813,6 +813,7 @@ mod representation_validation_tests {
             sidecars: SidecarPolicy::default(),
             keep_temp: false,
             catalog_revision: 1,
+            context: None,
         }
     }
 

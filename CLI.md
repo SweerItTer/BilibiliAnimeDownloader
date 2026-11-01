@@ -67,6 +67,9 @@ Square brackets below mean optional arguments, and `INPUT...` means one or more 
 | `login qr` | Scan a QR code in an interactive terminal; `--remember` |
 | `login cookie` | Hidden Cookie prompt, or redirected input with `--stdin`; `--remember` |
 | `login status` | Load any saved account and report its status |
+| `login list` | List remembered credential profiles without contacting Bilibili |
+| `login select PROFILE_ID` | Choose the saved profile used by following commands |
+| `login forget PROFILE_ID` | Remove one saved credential profile |
 | `logout` | Remove remembered login through the account store |
 | `jobs` | Inspect durable jobs without acquiring the download writer lock |
 | `resume JOB_ID` or `resume --all` | Continue/retry saved work; authentication options |
@@ -77,7 +80,7 @@ Square brackets below mean optional arguments, and `INPUT...` means one or more 
 | `update` | Install a compatible newer version; `--check`, `--pre-release[=true\|false]` |
 | `help [COMMAND...]` | Show help for the program or a subcommand; equivalent to its help flag |
 
-Authentication options are `--auth MODE` and explicit `--remember`; they apply to `search`, `info`, `qualities`, `download` and `resume`, not to every command.
+Authentication options are `--auth MODE`, `--profile PROFILE_ID` and explicit `--remember`; they apply to `search`, `info`, `qualities`, `download` and `resume`, not to every command.
 
 <a id="search"></a>
 ## Search and sorting
@@ -133,6 +136,8 @@ To use an account across commands, explicitly save it once:
 
 The default `--auth auto` loads an account you previously chose to remember. You do not need `--auth stored` on each later command. To require a saved account and fail if none exists, choose `--auth stored`. A bad saved record is reported, not silently treated as anonymous.
 
+Remembering another account adds a credential profile. Use `login list` to see its opaque ID, account name, membership information when supplied, last check and expiry when known. Imported Cookie headers often have no expiry date; unknown means unknown, not permanent validity. `login select PROFILE_ID` changes the default saved account. You may also choose it with `download VIDEO_ID --profile PROFILE_ID`; this accepts `auto` or `stored` authentication and cannot combine with `--remember`. `login forget PROFILE_ID` removes only that profile. No Cookie value is printed in this list.
+
 For one download only, run `download VIDEO_ID --auth qr`. The QR login lives until that command ends. Standalone `login qr` or `login cookie` **without** `--remember` validates a session, but that session ends with the process and is unavailable to the next command.
 
 | `--auth` mode | Behavior |
@@ -171,7 +176,7 @@ Remembered login prefers the OS secure store. The default permits a warned plain
 | `--connections N` | Shared connection budget; default 6 or config value, supported range 1–256 |
 | `--keep-temp` | Retain owned temporary resources after successful completion; off by default |
 | `--list-resolutions` | Catalog-only query; creates no jobs or output directories |
-| `--auth MODE`, `--remember` | Account choice and explicit persistence; see [login](#login) |
+| `--auth MODE`, `--profile PROFILE_ID`, `--remember` | Account choice and explicit persistence; see [login](#login) |
 
 `--list-resolutions` may use `--parts`, authentication and `--connections`. It conflicts with explicitly supplied `--output`, `--quality`, representation/codec/HDR constraints, subtitle/danmaku/merge options, `--jobs` and `--keep-temp`, including explicit values equal to their normal download defaults.
 
@@ -189,7 +194,7 @@ Press **Ctrl+C once** to request a safe pause, save recoverable state and wait f
 ./bin/bili --state-dir "./bili-state" resume --all
 ```
 
-Use the job ID printed in progress/results, and the **same state directory** used for the download. Without an override, every invocation uses the platform default. `resume` uses your current chosen authentication; it does not store the original Cookie in the job. Account-only content may require saved login or `--auth qr` again.
+Use the job ID printed in progress/results, and the **same state directory** used for the download. Without an override, every invocation uses the platform default. New jobs retain the admitted profile ID and exact media choice; Cookies are never stored in job records. Default `resume` keeps that profile. To replace credentials for the resumed jobs explicitly, use `--profile PROFILE_ID` or an explicit `--auth` mode such as `qr` or `anonymous`. Missing or expired credentials are reported rather than silently substituting another account.
 
 `jobs` is read-only and may run while another process downloads. Only one mutating Core session may own a state directory; a second downloader/resume/merge/clean reports `Busy`. After a forced exit, `jobs` may still show the last recorded active phase. A writable session reconciles interrupted active jobs before resuming; displayed bytes alone are not the durable offset. Unexpected-shutdown/power-loss behavior has not been fully qualified. Do not delete lock/checkpoint files or edit JSON to force a state.
 

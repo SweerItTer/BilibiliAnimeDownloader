@@ -60,10 +60,20 @@ pub(crate) struct Api {
     client: reqwest::Client,
     credentials: Arc<RwLock<CredentialJar>>,
     connections: Arc<Semaphore>,
-    wbi_key: Mutex<Option<(Instant, String)>>,
+    wbi_key: Arc<Mutex<Option<(Instant, String)>>>,
+    pgc_conditions: Arc<Mutex<std::collections::HashMap<PgcSection, BrowseConditions>>>,
 }
 
 impl Api {
+    pub(crate) fn with_credentials(&self, credentials: Arc<RwLock<CredentialJar>>) -> Self {
+        Self {
+            client: self.client.clone(),
+            credentials,
+            connections: self.connections.clone(),
+            wbi_key: self.wbi_key.clone(),
+            pgc_conditions: self.pgc_conditions.clone(),
+        }
+    }
     pub(crate) fn new(
         client: reqwest::Client,
         credentials: Arc<RwLock<CredentialJar>>,
@@ -73,7 +83,8 @@ impl Api {
             client,
             credentials,
             connections,
-            wbi_key: Mutex::new(None),
+            wbi_key: Arc::new(Mutex::new(None)),
+            pgc_conditions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -243,10 +254,56 @@ impl Api {
     }
 
     pub(crate) async fn search(&self, query: SearchQuery) -> Result<CandidatePage> {
-        search_pages(query, |url| async move {
+        search_pages(query, |mut url| async move {
+            let token = self
+                .credentials
+                .read()
+                .map_err(|_| {
+                    CoreError::new(ErrorCode::CredentialStore, "credential lock unavailable")
+                })?
+                .cookie_value_for("x-bili-gaia-vtoken", &url);
+            if let Some(token) = token {
+                url.query_pairs_mut().append_pair("gaia_vtoken", &token);
+            }
             self.get_json(self.sign_wbi(url, &[]).await?, REFERER).await
         })
         .await
+    }
+
+    pub(crate) async fn browse_conditions(&self, section: PgcSection) -> Result<BrowseConditions> {
+        if let Some(conditions) = self.pgc_conditions.lock().await.get(&section).cloned() {
+            return Ok(conditions);
+        }
+        let value: Value = self
+            .get_json(
+                api_url(
+                    "/pgc/season/index/condition",
+                    &[
+                        ("season_type", section.season_type().to_string()),
+                        ("type", "0".into()),
+                    ],
+                )?,
+                REFERER,
+            )
+            .await?;
+        let conditions = parse_browse_conditions(section, &value)?;
+        self.pgc_conditions
+            .lock()
+            .await
+            .insert(section, conditions.clone());
+        Ok(conditions)
+    }
+
+    pub(crate) async fn browse(&self, query: BrowseQuery) -> Result<CandidatePage> {
+        query.validate()?;
+        if let Some(genre) = query.genre.filter(|id| *id != -1) {
+            let conditions = self.browse_conditions(query.section).await?;
+            if !conditions.genres.iter().any(|choice| choice.id == genre) {
+                return Err(invalid("PGC genre is unavailable"));
+            }
+        }
+        let value: Value = self.get_json(browse_url(&query)?, REFERER).await?;
+        parse_browse_page(&query, &value).map(|page| CandidatePage { pages: vec![page] })
     }
 
     pub(crate) async fn cover(&self, request: CoverRequest) -> Result<CoverBytes> {
@@ -457,6 +514,7 @@ impl Api {
             sidecars: selection.sidecars,
             keep_temp: selection.keep_temp,
             catalog_revision: catalog.revision,
+            context: None,
         };
         plan.fingerprint = plan_fingerprint(&plan)?;
         Ok(plan)
@@ -569,6 +627,124 @@ impl Api {
     }
 }
 
+fn parse_browse_conditions(section: PgcSection, value: &Value) -> Result<BrowseConditions> {
+    let data = api_result(value, "load PGC genres")?;
+    let filters = data
+        .get("filter")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("PGC condition shape invalid"))?;
+    let mut genres = Vec::new();
+    for filter in filters {
+        // Remote field names never become arbitrary request parameters.
+        if filter.get("field").and_then(Value::as_str) != Some("style_id") {
+            continue;
+        }
+        let values = filter
+            .get("values")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid("PGC genre shape invalid"))?;
+        for value in values {
+            let id = text_number(value.get("keyword"))
+                .or_else(|| text(value.get("keyword")))
+                .and_then(|id| id.parse::<i64>().ok());
+            let label = text(value.get("name"));
+            if let (Some(id), Some(label)) = (id, label) {
+                if (-1..=i64::from(u32::MAX)).contains(&id)
+                    && !label.is_empty()
+                    && !genres.iter().any(|choice: &GenreChoice| choice.id == id)
+                {
+                    genres.push(GenreChoice { id, label });
+                }
+            }
+        }
+    }
+    Ok(BrowseConditions { section, genres })
+}
+
+fn browse_url(query: &BrowseQuery) -> Result<Url> {
+    query.validate()?;
+    api_url(
+        "/pgc/season/index/result",
+        &[
+            ("season_type", query.section.season_type().to_string()),
+            ("type", "0".into()),
+            ("style_id", query.genre.unwrap_or(-1).to_string()),
+            ("page", query.page.to_string()),
+            ("pagesize", query.page_size.to_string()),
+        ],
+    )
+}
+
+fn parse_browse_page(query: &BrowseQuery, value: &Value) -> Result<CategoryPage> {
+    let data = api_result(value, "browse PGC index")?;
+    let rows = data
+        .get("list")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("PGC index shape invalid"))?;
+    let category = query.section.category();
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for row in rows {
+        let Some(season) = row
+            .get("season_id")
+            .and_then(Value::as_u64)
+            .and_then(|id| SeasonId::new(id).ok())
+        else {
+            continue;
+        };
+        if !seen.insert(season.get()) {
+            continue;
+        }
+        let Some(title) = text(row.get("title"))
+            .map(|title| strip_markup(&title))
+            .filter(|title| !title.is_empty())
+        else {
+            continue;
+        };
+        items.push(Candidate {
+            reference: ContentRef::Bangumi(season),
+            category,
+            title,
+            cover: safe_cover_url(text(row.get("cover"))),
+            duration_ms: None,
+            author: None,
+            published_at: row.get("pub_time").and_then(Value::as_u64),
+            plays: row.get("play").and_then(Value::as_u64),
+            danmaku: row.get("danmaku").and_then(Value::as_u64),
+        });
+    }
+    let total = data.get("total").and_then(Value::as_u64);
+    let page_size = data
+        .get("size")
+        .or_else(|| data.get("pagesize"))
+        .or_else(|| data.get("page_size"))
+        .and_then(Value::as_u64)
+        .and_then(|size| u32::try_from(size).ok())
+        .filter(|size| *size > 0);
+    let total_pages = data
+        .get("numPages")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| {
+            total
+                .zip(page_size)
+                .and_then(|(total, size)| u32::try_from(total.div_ceil(u64::from(size))).ok())
+        });
+    let has_more = data
+        .get("has_next")
+        .map(|value| truthy(Some(value)))
+        .unwrap_or_else(|| total_pages.is_some_and(|n| query.page < n));
+    Ok(CategoryPage {
+        category,
+        page: query.page,
+        total,
+        has_more,
+        items,
+        page_size,
+        total_pages,
+    })
+}
+
 /// The shared search request/response path. The private fetch boundary lets
 /// deterministic tests use loopback without changing production host policy.
 async fn search_pages<F, Response>(query: SearchQuery, fetch: F) -> Result<CandidatePage>
@@ -592,6 +768,7 @@ where
         let keyword = query.keyword.as_str();
         let page = query.page;
         let sort = query.sort;
+        let channel = query.filter.video_channel;
         async move {
             let mut params = vec![
                 ("search_type", (*kind).to_owned()),
@@ -608,6 +785,9 @@ where
             };
             if let Some(order) = order {
                 params.push(("order", order.to_owned()));
+            }
+            if let Some(channel) = channel {
+                params.push(("tids", channel.to_string()));
             }
             let value = fetch(api_url("/x/web-interface/search/type", &params)?).await?;
             parse_search_page(*category, page, &value)
@@ -716,6 +896,13 @@ fn parse_search_page(category: SearchCategory, page: u32, value: &Value) -> Resu
             cover: safe_cover_url(text(row.get("pic")).or_else(|| text(row.get("cover")))),
             duration_ms: duration_ms(row.get("duration"))
                 .or_else(|| parse_duration(row.get("duration"))),
+            author: text(row.get("author")).or_else(|| text(row.get("up_name"))),
+            published_at: row.get("pubdate").and_then(Value::as_u64),
+            plays: row.get("play").and_then(Value::as_u64),
+            danmaku: row
+                .get("danmaku")
+                .and_then(Value::as_u64)
+                .or_else(|| row.get("video_review").and_then(Value::as_u64)),
         });
     }
     let total = data
@@ -734,12 +921,29 @@ fn parse_search_page(category: SearchCategory, page: u32, value: &Value) -> Resu
         },
         |page_count| u64::from(page) < page_count,
     );
+    let page_size = data
+        .get("pagesize")
+        .or_else(|| data.get("page_size"))
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0);
+    let total_pages = data
+        .get("numPages")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| {
+            total
+                .zip(page_size)
+                .and_then(|(total, size)| u32::try_from(total.div_ceil(u64::from(size))).ok())
+        });
     Ok(CategoryPage {
         category,
         page,
         total,
         has_more,
         items,
+        page_size,
+        total_pages,
     })
 }
 
@@ -799,6 +1003,27 @@ fn parse_season_item(
     Ok(MediaItem {
         reference,
         bvid: None,
+        source: Some(SourceProject {
+            reference: ContentRef::Bangumi(season),
+            title: title.clone(),
+            category: match result
+                .get("type")
+                .or_else(|| result.get("season_type"))
+                .and_then(Value::as_u64)
+            {
+                Some(1 | 4) => Some(SearchCategory::Bangumi),
+                Some(2 | 3 | 5 | 7) => Some(SearchCategory::Film),
+                _ => None,
+            },
+            cover: cover.clone(),
+            ordinal: if selected.is_some() {
+                parts[0].ordinal
+            } else {
+                0
+            },
+        }),
+        description: text(result.get("evaluate")),
+        author: text(result.pointer("/up_info/uname")),
         title,
         cover,
         duration_ms: None,
@@ -861,6 +1086,15 @@ fn parse_video_item(
     Ok(MediaItem {
         reference: ContentRef::Video(aid),
         bvid,
+        source: Some(SourceProject {
+            reference: ContentRef::Video(aid),
+            title: title.clone(),
+            category: Some(SearchCategory::Video),
+            cover: cover.clone(),
+            ordinal: 0,
+        }),
+        description: text(data.get("desc")),
+        author: text(data.pointer("/owner/name")),
         title,
         cover,
         duration_ms: duration_ms(data.get("duration")),
@@ -965,6 +1199,9 @@ fn select_video_part(mut item: MediaItem, ordinal: Option<u32>) -> Result<MediaI
             .find(|part| part.ordinal == ordinal)
             .ok_or_else(|| invalid("video part does not exist"))?;
         item.duration_ms = part.duration_ms;
+        if let Some(source) = &mut item.source {
+            source.ordinal = part.ordinal;
+        }
         item.parts = vec![part];
     }
     Ok(item)
@@ -1714,18 +1951,12 @@ fn api_result<'a>(v: &'a Value, operation: &'static str) -> Result<&'a Value> {
             .or_else(|| root.get("result"))
             .ok_or_else(|| response_error(v, operation))?;
         if data.get("v_voucher").is_some() {
-            Err(CoreError::new(
-                ErrorCode::VerificationRequired,
-                "Bilibili verification required",
-            ))
+            Err(verification_required(v))
         } else {
             Ok(data)
         }
     } else if code == -352 || code == -412 || has_voucher(v) {
-        Err(CoreError::new(
-            ErrorCode::VerificationRequired,
-            "Bilibili verification required",
-        ))
+        Err(verification_required(v))
     } else if matches!(code, -101 | -111) {
         Err(CoreError::new(
             ErrorCode::LoginRequired,
@@ -1797,13 +2028,18 @@ fn raw_durl_count(raw: &Value) -> usize {
 }
 fn response_error(v: &Value, op: &'static str) -> CoreError {
     if has_voucher(v) {
-        CoreError::new(
-            ErrorCode::VerificationRequired,
-            "Bilibili verification required",
-        )
+        verification_required(v)
     } else {
         CoreError::new(ErrorCode::Transport, op)
     }
+}
+fn verification_required(value: &Value) -> CoreError {
+    let mut error = CoreError::new(
+        ErrorCode::VerificationRequired,
+        "Bilibili verification required",
+    );
+    error.verification = crate::verification::VerificationRequest::from_response(value);
+    error
 }
 fn api_url(path: &str, params: &[(&str, String)]) -> Result<Url> {
     let mut u = Url::parse(&format!("{API}{path}")).map_err(|_| invalid("invalid API endpoint"))?;
@@ -2011,7 +2247,7 @@ fn strip_markup(s: &str) -> String {
     }
     out
 }
-fn safe_filename(title: &str, suffix: &str) -> String {
+pub(crate) fn safe_filename(title: &str, suffix: &str) -> String {
     const MAX_COMPONENT_BYTES: usize = 255;
     let cleaned: String = title
         .chars()

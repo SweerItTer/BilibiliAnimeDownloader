@@ -2139,8 +2139,16 @@ mod layout_tests {
                         title: format!("测试视频 {index}"),
                         cover: None,
                         duration_ms: Some(61_000),
+
+                        author: None,
+                        published_at: None,
+                        plays: None,
+                        danmaku: None,
                     })
                     .collect(),
+
+                page_size: None,
+                total_pages: None,
             }],
         }
     }
@@ -2166,6 +2174,10 @@ mod layout_tests {
                 duration_ms: Some(213_000),
                 preview: false,
             }],
+
+            author: None,
+            description: None,
+            source: None,
         }
     }
 
@@ -2181,6 +2193,8 @@ mod layout_tests {
             skipped: false,
             error: None,
             components: Vec::new(),
+
+            created_at: None,
         }
     }
 
@@ -2458,10 +2472,16 @@ mod layout_tests {
                 mid: 1,
                 name: "测试账号".into(),
                 face: None,
+
+                vip: None,
             }),
             notice: None,
             qr: None,
             qr_status: None,
+
+            profiles: Vec::new(),
+            selected_profile: None,
+            login_profile: None,
         });
         app.prefs.remember_login = true;
         for size in [

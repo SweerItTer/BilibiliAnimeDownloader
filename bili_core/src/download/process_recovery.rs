@@ -55,6 +55,7 @@ fn plan(root: &Path) -> StreamPlan {
         },
         keep_temp: true,
         catalog_revision: 1,
+        context: None,
     };
     plan.fingerprint = crate::api::plan_fingerprint(&plan).unwrap();
     plan
@@ -205,6 +206,7 @@ async fn crash_transfer_child() {
             TransferOptions {
                 cancel: &cancel,
                 rate_limit: None,
+                budget: None,
             },
             &policy,
             |_| {},
@@ -239,6 +241,7 @@ async fn crash_transfer_child() {
         TransferOptions {
             cancel: &cancel,
             rate_limit: None,
+            budget: None,
         },
         &policy,
         |_| {},
@@ -380,6 +383,7 @@ async fn killed_transfer_recovers_checkpoint_and_normalizes_active_job() {
         TransferOptions {
             cancel: &CancellationToken::new(),
             rate_limit: None,
+            budget: None,
         },
         &RetryPolicy {
             attempts: 1,

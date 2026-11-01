@@ -122,12 +122,13 @@ fn invocation_needs_store(command: &Command) -> bool {
             method: Login::Qr { remember } | Login::Cookie { remember, .. },
         } => return *remember,
         Command::Login {
-            method: Login::Status,
+            method: Login::Status | Login::List | Login::Select { .. } | Login::Forget { .. },
         }
         | Command::Logout => return true,
         _ => return false,
     };
-    matches!(auth.auth, AuthMode::Auto | AuthMode::Stored)
+    auth.profile.is_some()
+        || matches!(auth.auth, AuthMode::Auto | AuthMode::Stored)
         || (auth.remember
             && matches!(
                 auth.auth,
@@ -297,6 +298,16 @@ fn read_cookie_stdin_blocking() -> Result<String> {
 }
 
 async fn authenticate(core: &Core, options: &AuthOptions) -> Result<()> {
+    if let Some(id) = &options.profile {
+        if !matches!(options.auth, AuthMode::Auto | AuthMode::Stored) || options.remember {
+            return Err(invalid(
+                "--profile requires auto or stored authentication and no --remember",
+            ));
+        }
+        core.auth(AuthAction::SelectProfile { id: id.clone() })
+            .await?;
+        return Ok(());
+    }
     if options.remember
         && matches!(
             options.auth,
@@ -337,7 +348,12 @@ async fn qr_login(core: &Core, remember: bool) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Err(invalid("QR login requires an interactive terminal"));
     }
-    let start = core.auth(AuthAction::StartQr { remember }).await?;
+    let start = core
+        .auth(AuthAction::StartQr {
+            remember,
+            activate: true,
+        })
+        .await?;
     let challenge = start
         .qr
         .ok_or_else(|| CoreError::new(ErrorCode::Corruption, "QR challenge absent"))?;
@@ -463,6 +479,8 @@ async fn execute(core: &Core, cli: &Cli, config: &CoreConfig) -> Result<u8> {
                 category,
                 page: *page,
                 sort: (*sort).into(),
+
+                filter: Default::default(),
             };
             query.validate()?;
             authenticate(core, auth).await?;
@@ -485,6 +503,16 @@ async fn execute(core: &Core, cli: &Cli, config: &CoreConfig) -> Result<u8> {
             output::qualities(&item, &selected, &catalog, cli.json)?;
         }
         Command::Login { method } => {
+            let profile_action = match method {
+                Login::List => Some(AuthAction::ListProfiles),
+                Login::Select { id } => Some(AuthAction::SelectProfile { id: id.clone() }),
+                Login::Forget { id } => Some(AuthAction::ForgetProfile { id: id.clone() }),
+                _ => None,
+            };
+            if let Some(action) = profile_action {
+                output::result("auth", &core.auth(action).await?, cli.json)?;
+                return Ok(0);
+            }
             match method {
                 Login::Qr { remember } => {
                     qr_login(core, *remember).await?;
@@ -515,6 +543,7 @@ async fn execute(core: &Core, cli: &Cli, config: &CoreConfig) -> Result<u8> {
                         eprintln!("{notice}");
                     }
                 }
+                Login::List | Login::Select { .. } | Login::Forget { .. } => unreachable!(),
             }
             output::result("auth", &core.auth(AuthAction::Status).await?, cli.json)?;
         }
@@ -587,7 +616,15 @@ async fn execute(core: &Core, cli: &Cli, config: &CoreConfig) -> Result<u8> {
                         keep_temp: options.keep_temp,
                     };
                     match core.plan(selection).await {
-                        Ok(plan) => {
+                        Ok(mut plan) => {
+                            // Preserve CLI's flat destination while retaining
+                            // the resolved work/part identity for shared history.
+                            if let Some(mut source) = item.source.clone() {
+                                source.ordinal = part.ordinal;
+                                plan.context
+                                    .get_or_insert_with(DownloadContext::default)
+                                    .project = Some(source);
+                            }
                             if cli.json {
                                 output::json("plan", &plan)?;
                             } else {
@@ -632,7 +669,15 @@ async fn execute(core: &Core, cli: &Cli, config: &CoreConfig) -> Result<u8> {
                     .ok_or_else(|| invalid("resume requires job or --all"))?
                     .parse()?]
             };
+            let replacement = if auth.profile.is_some() || !matches!(auth.auth, AuthMode::Auto) {
+                Some(core.auth(AuthAction::ListProfiles).await?.selected_profile)
+            } else {
+                None
+            };
             for id in &jobs {
+                if let Some(profile) = &replacement {
+                    core.retarget_profile(*id, profile.clone()).await?;
+                }
                 core.control(*id, JobAction::Resume).await?;
             }
             return wait_jobs(core, &jobs, cli.json).await;
@@ -964,6 +1009,7 @@ mod tests {
     #[test]
     fn completed_video_does_not_hide_failed_requested_components() {
         let mut job = JobSnapshot {
+            created_at: None,
             id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
             revision: 1,
             plan: None,

@@ -574,6 +574,7 @@ fn plan_fingerprint_tracks_media_not_presentation_or_delivery_policy() {
         sidecars: SidecarPolicy::default(),
         keep_temp: false,
         catalog_revision: 1,
+        context: None,
     };
     let original = plan_fingerprint(&plan).unwrap();
     plan.title = "renamed".into();

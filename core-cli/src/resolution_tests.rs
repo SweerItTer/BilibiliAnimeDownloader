@@ -18,6 +18,9 @@ fn part(ordinal: u32) -> Part {
 }
 fn item(ordinals: &[u32]) -> MediaItem {
     MediaItem {
+        source: None,
+        description: None,
+        author: None,
         reference: part(1).reference.content,
         bvid: None,
         title: "标题\n\x1b[31m".into(),

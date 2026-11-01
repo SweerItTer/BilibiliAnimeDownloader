@@ -162,6 +162,8 @@ impl SearchState {
             category: self.category,
             page: 1,
             sort: self.sort,
+
+            filter: Default::default(),
         };
         if classify_input(&self.input) != InputKind::Keyword || query.validate().is_err() {
             return None;
@@ -540,6 +542,8 @@ mod tests {
                 category: SearchCategory::Bangumi,
                 page: 1,
                 sort: SearchSort::Relevance,
+
+                filter: Default::default(),
             }),
             ..SearchState::default()
         };
@@ -549,6 +553,8 @@ mod tests {
             category: SearchCategory::Bangumi,
             page: 2,
             sort: SearchSort::Relevance,
+
+            filter: Default::default(),
         });
         state.discard_request();
         assert_eq!(state.submitted.as_ref().unwrap().page, 1);
@@ -567,6 +573,8 @@ mod tests {
                 category: SearchCategory::Video,
                 page: 4,
                 sort: SearchSort::Views,
+
+                filter: Default::default(),
             }),
             ..SearchState::default()
         };
@@ -670,8 +678,16 @@ mod layout_tests {
                         },
                         cover: None,
                         duration_ms: Some(61_000),
+
+                        author: None,
+                        published_at: None,
+                        plays: None,
+                        danmaku: None,
                     })
                     .collect(),
+
+                page_size: None,
+                total_pages: None,
             }],
         }
     }

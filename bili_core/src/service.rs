@@ -27,6 +27,13 @@ enum Command {
     Shutdown(StopMode, Reply<ShutdownReport>),
     Update(JobId, Update, Reply<()>),
     Progress(JobId, u64),
+    OutputInfo(JobId, Reply<OutputInfo>),
+    RemoveJobs(Vec<JobId>, RemoveMode, Reply<RemovalReport>),
+    RetargetProfile(JobId, Option<String>, Reply<()>),
+}
+enum Maintenance {
+    Output(JobId, Reply<OutputInfo>, Result<OutputInfo>),
+    Removed(Vec<JobId>, Reply<RemovalReport>, Result<RemovalReport>),
 }
 enum Update {
     Phase(JobPhase),
@@ -40,6 +47,8 @@ struct CoreInner {
     config: CoreConfig,
     api: Arc<Api>,
     auth: Arc<Mutex<AuthManager>>,
+    client: reqwest::Client,
+    connections: Arc<Semaphore>,
     commands: mpsc::Sender<Command>,
     snapshots: watch::Receiver<Arc<QueueSnapshot>>,
     events: broadcast::Sender<CoreEvent>,
@@ -146,11 +155,14 @@ impl Core {
             client: media_client,
             sidecar_client: client.clone(),
             credentials: credentials.clone(),
-            connections,
+            connections: connections.clone(),
             merges: Arc::new(Semaphore::new(1)),
             queue: VecDeque::new(),
             workers: JoinSet::new(),
             active: HashMap::new(),
+            maintenance: JoinSet::new(),
+            maintenance_ids: HashSet::new(),
+            budgets: HashMap::new(),
             deferred: HashMap::new(),
             stopping: None,
             abort: abort.clone(),
@@ -161,6 +173,8 @@ impl Core {
                 config,
                 api,
                 auth,
+                client,
+                connections,
                 commands,
                 snapshots,
                 events,
@@ -172,27 +186,152 @@ impl Core {
         })
     }
     pub async fn resolve(&self, input: ContentInput) -> Result<MediaItem> {
+        self.active_api().await?.resolve(input).await
+    }
+    pub async fn resolve_for(
+        &self,
+        input: ContentInput,
+        profile_id: Option<String>,
+    ) -> Result<MediaItem> {
         self.ensure_open()?;
-        self.inner.api.resolve(input).await
+        let auth = self.inner.auth.lock().await;
+        self.ensure_open()?;
+        let api = self
+            .inner
+            .api
+            .with_credentials(auth.session(profile_id.as_deref())?);
+        drop(auth);
+        api.resolve(input).await
     }
     pub async fn search(&self, query: SearchQuery) -> Result<CandidatePage> {
-        self.ensure_open()?;
-        self.inner.api.search(query).await
+        query.validate()?;
+        self.active_api().await?.search(query).await
+    }
+    pub async fn browse_conditions(&self, section: PgcSection) -> Result<BrowseConditions> {
+        self.active_api().await?.browse_conditions(section).await
+    }
+    pub async fn browse(&self, query: BrowseQuery) -> Result<CandidatePage> {
+        query.validate()?;
+        self.active_api().await?.browse(query).await
     }
     pub async fn cover(&self, request: CoverRequest) -> Result<CoverBytes> {
         self.ensure_open()?;
         self.inner.api.cover(request).await
     }
+    async fn active_api(&self) -> Result<Api> {
+        self.ensure_open()?;
+        // Capture the selected jar while holding the auth transaction lock;
+        // discovery must not observe a candidate login before it is installed.
+        let auth = self.inner.auth.lock().await;
+        self.ensure_open()?;
+        let profile = auth.selected_profile_id();
+        Ok(self
+            .inner
+            .api
+            .with_credentials(auth.session(profile.as_deref())?))
+    }
     pub async fn quality_catalog(&self, part: PartRef) -> Result<QualityCatalog> {
         self.ensure_open()?;
-        self.inner.api.quality_catalog(part).await
+        let profile = self.inner.auth.lock().await.selected_profile_id();
+        self.quality_catalog_for(part, profile).await
+    }
+    pub async fn quality_catalog_for(
+        &self,
+        part: PartRef,
+        profile_id: Option<String>,
+    ) -> Result<QualityCatalog> {
+        self.ensure_open()?;
+        let jar = self
+            .inner
+            .auth
+            .lock()
+            .await
+            .session(profile_id.as_deref())?;
+        self.inner
+            .api
+            .with_credentials(jar)
+            .quality_catalog(part)
+            .await
     }
     pub async fn plan(&self, selection: DownloadSelection) -> Result<StreamPlan> {
         self.ensure_open()?;
-        self.inner
-            .api
-            .plan(selection, &self.inner.config.output_dir)
+        let profile_id = self.inner.auth.lock().await.selected_profile_id();
+        self.plan_with_context(
+            selection,
+            DownloadContext {
+                profile_id,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+    pub async fn plan_with_context(
+        &self,
+        selection: DownloadSelection,
+        context: DownloadContext,
+    ) -> Result<StreamPlan> {
+        self.plan_in_directory(selection, context, self.inner.config.output_dir.clone())
             .await
+    }
+    pub async fn plan_in_directory(
+        &self,
+        selection: DownloadSelection,
+        context: DownloadContext,
+        root: std::path::PathBuf,
+    ) -> Result<StreamPlan> {
+        self.ensure_open()?;
+        validate_context(&context)?;
+        if !root.is_absolute() {
+            return Err(CoreError::new(
+                ErrorCode::InvalidInput,
+                "output directory must be absolute",
+            ));
+        }
+        let jar = self
+            .inner
+            .auth
+            .lock()
+            .await
+            .session(context.profile_id.as_deref())?;
+        let output = context.project.as_ref().map_or(root.clone(), |project| {
+            let suffix = match project.reference {
+                ContentRef::Video(id) => format!("_av{}", id.get()),
+                ContentRef::Bangumi(id) => format!("_ss{}", id.get()),
+                ContentRef::Episode(id) => format!("_ep{}", id.get()),
+            };
+            root.join(crate::api::safe_filename(&project.title, &suffix))
+        });
+        let mut plan = self
+            .inner
+            .api
+            .with_credentials(jar)
+            .plan(selection, &output)
+            .await?;
+        plan.context = Some(context);
+        Ok(plan)
+    }
+    pub async fn retarget_profile(&self, id: JobId, profile_id: Option<String>) -> Result<()> {
+        self.ensure_open()?;
+        // Fail before mutating the durable job if the requested identity is absent.
+        self.inner
+            .auth
+            .lock()
+            .await
+            .session(profile_id.as_deref())?;
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::RetargetProfile(id, profile_id, tx))
+            .await?;
+        receive(rx).await
+    }
+    pub async fn output_info(&self, id: JobId) -> Result<OutputInfo> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::OutputInfo(id, tx)).await?;
+        receive(rx).await
+    }
+    pub async fn remove_jobs(&self, ids: Vec<JobId>, mode: RemoveMode) -> Result<RemovalReport> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::RemoveJobs(ids, mode, tx)).await?;
+        receive(rx).await
     }
     pub async fn enqueue(&self, plan: StreamPlan) -> Result<JobId> {
         let (tx, rx) = oneshot::channel();
@@ -215,6 +354,44 @@ impl Core {
         let mut auth = self.inner.auth.lock().await;
         self.ensure_open()?;
         auth.apply(action).await
+    }
+    pub async fn begin_verification(
+        &self,
+        request: crate::VerificationRequest,
+        profile_id: Option<String>,
+    ) -> Result<crate::VerificationChallenge> {
+        self.ensure_open()?;
+        let credentials = self
+            .inner
+            .auth
+            .lock()
+            .await
+            .session(profile_id.as_deref())?;
+        crate::verification::begin(
+            &self.inner.client,
+            credentials,
+            self.inner.connections.clone(),
+            request,
+            profile_id,
+        )
+        .await
+    }
+    pub async fn complete_verification(
+        &self,
+        challenge: crate::VerificationChallenge,
+        proof: crate::VerificationProof,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let grant = crate::verification::complete(
+            &self.inner.client,
+            self.inner.connections.clone(),
+            challenge,
+            proof,
+        )
+        .await?;
+        let mut auth = self.inner.auth.lock().await;
+        self.ensure_open()?;
+        auth.apply_verification(grant.profile_id.as_deref(), &grant.vtoken)
     }
     pub async fn merge(&self, request: MergeRequest) -> Result<JobId> {
         let (tx, rx) = oneshot::channel();
@@ -280,6 +457,36 @@ fn media_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
         .build()
         .map_err(|_| CoreError::new(ErrorCode::Transport, "create anonymous media client"))
 }
+fn validate_context(context: &DownloadContext) -> Result<()> {
+    let invalid_profile = context
+        .profile_id
+        .as_ref()
+        .is_some_and(|id| id.is_empty() || id.len() > 128 || id.chars().any(char::is_control));
+    let invalid_project = context.project.as_ref().is_some_and(|project| {
+        project.title.is_empty()
+            || project.title.len() > 4096
+            || project.ordinal == 0
+            || project.category == Some(SearchCategory::All)
+            || project
+                .cover
+                .as_ref()
+                .is_some_and(|cover| cover.len() > 4096)
+    });
+    let invalid_batch = context.batch.as_ref().is_some_and(|batch| {
+        batch.id.is_empty()
+            || batch.id.len() > 128
+            || batch.id.chars().any(char::is_control)
+            || batch.rate_limit == Some(0)
+    });
+    if invalid_profile || invalid_project || invalid_batch {
+        Err(CoreError::new(
+            ErrorCode::InvalidInput,
+            "invalid download context",
+        ))
+    } else {
+        Ok(())
+    }
+}
 impl Drop for CoreInner {
     fn drop(&mut self) {
         self.abort.cancel();
@@ -311,6 +518,9 @@ struct Reducer {
     queue: VecDeque<JobId>,
     workers: JoinSet<(JobId, Result<()>)>,
     active: HashMap<JobId, Active>,
+    maintenance: JoinSet<Maintenance>,
+    maintenance_ids: HashSet<JobId>,
+    budgets: HashMap<String, Arc<crate::download::RateBudget>>,
     deferred: HashMap<JobId, Vec<Reply<()>>>,
     stopping: Option<Reply<ShutdownReport>>,
     abort: CancellationToken,
@@ -323,7 +533,7 @@ impl Reducer {
     async fn run(mut self) {
         loop {
             self.launch();
-            if self.stopping.is_some() && self.workers.is_empty() {
+            if self.stopping.is_some() && self.workers.is_empty() && self.maintenance.is_empty() {
                 // Auth store handles may outlive a dropped caller future.
                 // Join them while Journal still owns the OS writer lock.
                 let auth_result = self.auth.lock().await.shutdown().await;
@@ -364,6 +574,15 @@ impl Reducer {
                 result=self.workers.join_next(),if !self.workers.is_empty()=>{
                     if let Some(Ok((id,result)))=result {self.finished(id,result);}
                     else {self.stop_all(StopMode::Pause);for r in &mut self.records{if r.snapshot.phase.is_active(){r.snapshot.phase=JobPhase::Failed;r.snapshot.error=Some(CoreError::new(ErrorCode::Corruption,"job supervisor failed"));self.dirty.insert(r.snapshot.id);}}let _=self.persist();}
+                },
+                result=self.maintenance.join_next(),if !self.maintenance.is_empty()=>{
+                    match result {
+                        Some(Ok(result)) => self.finished_maintenance(result),
+                        _ => {
+                            self.failure=Some(CoreError::new(ErrorCode::Corruption,"maintenance supervisor failed"));
+                            self.stop_all(StopMode::Pause);
+                        }
+                    }
                 },
             }
         }
@@ -459,8 +678,190 @@ impl Reducer {
             message: "job transition".into(),
         });
     }
+    fn remove_records(&mut self, ids: &[JobId]) -> Result<()> {
+        self.writable()?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for id in ids {
+            let index = self.index(*id)?;
+            if self.records[index].snapshot.phase.is_active() || self.active.contains_key(id) {
+                return Err(CoreError::new(
+                    ErrorCode::Busy,
+                    "selected job became active",
+                ));
+            }
+        }
+        self.records
+            .retain(|record| !ids.contains(&record.snapshot.id));
+        self.queue.retain(|id| !ids.contains(id));
+        self.cache.retain(|id, _| !ids.contains(id));
+        self.budgets.retain(|id, _| {
+            self.records
+                .iter()
+                .filter_map(|record| record.snapshot.plan.as_ref())
+                .filter_map(|plan| plan.context.as_ref())
+                .filter_map(|context| context.batch.as_ref())
+                .any(|batch| batch.id == *id)
+        });
+        self.persist()
+    }
+    fn finished_maintenance(&mut self, result: Maintenance) {
+        match result {
+            Maintenance::Output(id, reply, result) => {
+                self.maintenance_ids.remove(&id);
+                let _ = reply.send(result);
+            }
+            Maintenance::Removed(ids, reply, result) => {
+                let result = result.map(|mut report| {
+                    if let Err(error) = self.remove_records(&report.removed) {
+                        report.removed.clear();
+                        report.errors.push(error);
+                    }
+                    report
+                });
+                for id in ids {
+                    self.maintenance_ids.remove(&id);
+                }
+                let _ = reply.send(result);
+            }
+        }
+    }
     fn command(&mut self, command: Command) {
         match command {
+            Command::OutputInfo(id, reply) => {
+                let result = self.index(id).and_then(|index| {
+                    if self.records[index].snapshot.phase.is_active()
+                        || self.active.contains_key(&id)
+                        || self.maintenance_ids.contains(&id)
+                        || self.maintenance.len() >= 16
+                    {
+                        return Err(CoreError::new(
+                            ErrorCode::Busy,
+                            "job is active or being inspected",
+                        ));
+                    }
+                    Ok(self.records[index].clone())
+                });
+                match result {
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                    Ok(record) => {
+                        self.maintenance_ids.insert(id);
+                        self.maintenance.spawn(async move {
+                            let result =
+                                tokio::task::spawn_blocking(move || state::output_info(&record))
+                                    .await
+                                    .map_err(|_| {
+                                        CoreError::new(
+                                            ErrorCode::Corruption,
+                                            "output inspection worker failed",
+                                        )
+                                    })
+                                    .and_then(|result| result);
+                            Maintenance::Output(id, reply, result)
+                        });
+                    }
+                }
+            }
+            Command::RemoveJobs(ids, mode, reply) => {
+                let result = self.writable().and_then(|()| {
+                    if mode == RemoveMode::RecycleFiles && self.config.recycle.is_none() {
+                        return Err(CoreError::new(
+                            ErrorCode::NativeCapability,
+                            "host recycle bin adapter unavailable",
+                        ));
+                    }
+                    if ids.is_empty()
+                        || ids.len() > 1024
+                        || ids.iter().collect::<HashSet<_>>().len() != ids.len()
+                    {
+                        return Err(CoreError::new(
+                            ErrorCode::InvalidInput,
+                            "invalid removal selection",
+                        ));
+                    }
+                    if self.maintenance.len() >= 16 {
+                        return Err(CoreError::new(
+                            ErrorCode::Busy,
+                            "too many output operations",
+                        ));
+                    }
+                    ids.iter()
+                        .map(|id| {
+                            let index = self.index(*id)?;
+                            if self.records[index].snapshot.phase.is_active()
+                                || self.active.contains_key(id)
+                                || self.maintenance_ids.contains(id)
+                            {
+                                return Err(CoreError::new(
+                                    ErrorCode::Busy,
+                                    "stop selected jobs before removal",
+                                ));
+                            }
+                            Ok(self.records[index].clone())
+                        })
+                        .collect::<Result<Vec<_>>>()
+                });
+                match result {
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                    Ok(_records) if mode == RemoveMode::RecordsOnly => {
+                        let result = self.remove_records(&ids).map(|()| RemovalReport {
+                            removed: ids,
+                            ..Default::default()
+                        });
+                        let _ = reply.send(result);
+                    }
+                    Ok(records) => {
+                        let recycle = self
+                            .config
+                            .recycle
+                            .expect("recycle adapter validated before maintenance");
+                        self.maintenance_ids.extend(ids.iter().copied());
+                        self.maintenance.spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || {
+                                state::recycle_outputs(&records, recycle)
+                            })
+                            .await
+                            .map_err(|_| {
+                                CoreError::new(ErrorCode::Corruption, "recycle worker failed")
+                            })
+                            .and_then(|result| result);
+                            Maintenance::Removed(ids, reply, result)
+                        });
+                    }
+                }
+            }
+            Command::RetargetProfile(id, profile_id, reply) => {
+                let result = self.writable().and_then(|()| {
+                    let index = self.index(id)?;
+                    if self.records[index].snapshot.phase.is_active()
+                        || self.active.contains_key(&id)
+                        || self.maintenance_ids.contains(&id)
+                    {
+                        return Err(CoreError::new(
+                            ErrorCode::Busy,
+                            "stop job before selecting credentials",
+                        ));
+                    }
+                    let plan = self.records[index].snapshot.plan.as_mut().ok_or_else(|| {
+                        CoreError::new(
+                            ErrorCode::InvalidInput,
+                            "local merge has no credential profile",
+                        )
+                    })?;
+                    let context = Arc::make_mut(plan)
+                        .context
+                        .get_or_insert_with(DownloadContext::default);
+                    context.profile_id = profile_id;
+                    self.dirty.insert(id);
+                    self.persist()
+                });
+                let _ = reply.send(result);
+            }
             Command::Enqueue(plan, reply) => {
                 let result = self.enqueue(*plan);
                 let _ = reply.send(result);
@@ -551,6 +952,38 @@ impl Reducer {
                 "invalid stream plan",
             ));
         }
+        if let Some(context) = &plan.context {
+            validate_context(context)?;
+            if context.project.as_ref().is_some_and(|project| {
+                self.records
+                    .iter()
+                    .filter(|record| self.maintenance_ids.contains(&record.snapshot.id))
+                    .filter_map(|record| record.snapshot.plan.as_ref())
+                    .filter_map(|plan| plan.context.as_ref())
+                    .filter_map(|context| context.project.as_ref())
+                    .any(|old| old.reference == project.reference)
+            }) {
+                return Err(CoreError::new(
+                    ErrorCode::Busy,
+                    "source project is being inspected or removed",
+                ));
+            }
+            if let Some(batch) = &context.batch {
+                if self
+                    .records
+                    .iter()
+                    .filter_map(|record| record.snapshot.plan.as_ref())
+                    .filter_map(|plan| plan.context.as_ref())
+                    .filter_map(|context| context.batch.as_ref())
+                    .any(|old| old.id == batch.id && old.rate_limit != batch.rate_limit)
+                {
+                    return Err(CoreError::new(
+                        ErrorCode::Conflict,
+                        "batch rate differs from admitted settings",
+                    ));
+                }
+            }
+        }
         // StreamPlan is an editable DTO. Never trust a stale caller-provided
         // fingerprint to turn a changed exact representation into a skip.
         plan.fingerprint = crate::api::plan_fingerprint(&plan)?;
@@ -558,7 +991,24 @@ impl Reducer {
             if record.snapshot.plan.as_ref().is_some_and(|p| {
                 p.fingerprint == plan.fingerprint && p.destination == plan.destination
             }) {
+                if self.maintenance_ids.contains(&record.snapshot.id) {
+                    return Err(CoreError::new(
+                        ErrorCode::Busy,
+                        "matching job is being inspected or removed",
+                    ));
+                }
                 if record.snapshot.phase == JobPhase::Completed {
+                    if record
+                        .snapshot
+                        .plan
+                        .as_ref()
+                        .is_some_and(|old| old.context != plan.context)
+                    {
+                        return Err(CoreError::new(
+                            ErrorCode::Conflict,
+                            "completed job retains its original admission settings; choose another output directory",
+                        ));
+                    }
                     if record
                         .snapshot
                         .plan
@@ -605,6 +1055,12 @@ impl Reducer {
     }
     fn control(&mut self, id: JobId, action: JobAction) -> Result<()> {
         self.writable()?;
+        if self.maintenance_ids.contains(&id) {
+            return Err(CoreError::new(
+                ErrorCode::Busy,
+                "job is being inspected or removed",
+            ));
+        }
         let i = self.index(id)?;
         let phase = self.records[i].snapshot.phase;
         self.dirty.insert(id);
@@ -636,7 +1092,7 @@ impl Reducer {
                 }
             }
             JobAction::Resume | JobAction::Retry => {
-                if phase.is_active() {
+                if phase.is_active() || self.active.contains_key(&id) {
                     return Err(CoreError::new(ErrorCode::Conflict, "job already active"));
                 }
                 if phase == JobPhase::Completed
@@ -654,7 +1110,7 @@ impl Reducer {
                 self.queue.push_back(id);
             }
             JobAction::Remove { cleanup } => {
-                if phase.is_active() {
+                if phase.is_active() || self.active.contains_key(&id) {
                     return Err(CoreError::new(
                         ErrorCode::Conflict,
                         "cannot remove active job",
@@ -682,8 +1138,14 @@ impl Reducer {
         self.writable()?;
         match request {
             MergeRequest::Managed(id) => {
+                if self.maintenance_ids.contains(&id) {
+                    return Err(CoreError::new(
+                        ErrorCode::Busy,
+                        "job is being inspected or removed",
+                    ));
+                }
                 let i = self.index(id)?;
-                if self.records[i].snapshot.phase.is_active() {
+                if self.records[i].snapshot.phase.is_active() || self.active.contains_key(&id) {
                     return Err(CoreError::new(ErrorCode::Conflict, "job already active"));
                 }
                 let plan = self.records[i].snapshot.plan.as_mut().ok_or_else(|| {
@@ -743,6 +1205,7 @@ impl Reducer {
                         skipped: false,
                         error: None,
                         components: Vec::new(),
+                        created_at: Some(state::admission_time()),
                     },
                     resources: Vec::new(),
                     completion: None,
@@ -878,6 +1341,20 @@ impl Reducer {
             };
             let Ok(i) = self.index(id) else { continue };
             let cancel = self.abort.child_token();
+            let budget = self.records[i]
+                .snapshot
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.context.as_ref())
+                .and_then(|context| context.batch.as_ref())
+                .and_then(|batch| {
+                    batch.rate_limit.map(|rate| {
+                        self.budgets
+                            .entry(batch.id.clone())
+                            .or_insert_with(|| Arc::new(crate::download::RateBudget::new(rate)))
+                            .clone()
+                    })
+                });
             self.active.insert(
                 id,
                 Active {
@@ -893,6 +1370,8 @@ impl Reducer {
                 client: self.client.clone(),
                 sidecar_client: self.sidecar_client.clone(),
                 credentials: self.credentials.clone(),
+                auth: self.auth.clone(),
+                budget,
                 connections: self.connections.clone(),
                 merges: self.merges.clone(),
                 config: self.config.clone(),
@@ -996,6 +1475,8 @@ struct Worker {
     client: reqwest::Client,
     sidecar_client: reqwest::Client,
     credentials: Arc<RwLock<CredentialJar>>,
+    auth: Arc<Mutex<AuthManager>>,
+    budget: Option<Arc<crate::download::RateBudget>>,
     connections: Arc<Semaphore>,
     merges: Arc<Semaphore>,
     config: CoreConfig,
@@ -1017,6 +1498,23 @@ impl Worker {
         self.update(Update::Phase(phase)).await
     }
     async fn run(mut self) -> Result<()> {
+        // Freeze one selected credential jar for locators, renewals and sidecars.
+        // Old context-free records resume anonymously until explicitly retargeted.
+        let profile_id = self
+            .record
+            .snapshot
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.context.as_ref())
+            .and_then(|context| context.profile_id.as_deref());
+        let auth = tokio::select! {
+            _=self.cancel.cancelled()=>return Err(CoreError::new(ErrorCode::Cancelled,"job credentials cancelled")),
+            auth=self.auth.lock()=>auth,
+        };
+        let credentials = auth.session(profile_id)?;
+        drop(auth);
+        self.api = Arc::new(self.api.with_credentials(credentials.clone()));
+        self.credentials = credentials;
         // A completed video survives a failed sidecar; retry only requested components.
         if self.record.completion.is_some() {
             self.phase(JobPhase::Verifying).await?;
@@ -1206,6 +1704,7 @@ impl Worker {
                         crate::download::TransferOptions {
                             cancel: &self.cancel,
                             rate_limit: self.config.rate_limit,
+                            budget: self.budget.as_deref(),
                         },
                         &self.config.retry,
                         move |bytes| {
@@ -1382,6 +1881,219 @@ fn run_native_gate(inputs: &[std::path::PathBuf]) {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    fn offline_plan(destination: std::path::PathBuf) -> StreamPlan {
+        let part = PartRef {
+            content: ContentRef::Video(Aid::new(7).unwrap()),
+            aid: Aid::new(7).unwrap(),
+            cid: Cid::new(8).unwrap(),
+            episode: None,
+        };
+        let video = RepresentationKey {
+            part: part.clone(),
+            id: 80,
+            quality: 80,
+            codec: "avc1".into(),
+            width: Some(1920),
+            height: Some(1080),
+            fps: None,
+            dynamic_range: None,
+            color: None,
+            bandwidth: 1,
+            audio: false,
+            sample_rate: None,
+            channels: None,
+            language: None,
+        };
+        let mut plan = StreamPlan {
+            schema_version: 1,
+            fingerprint: String::new(),
+            part,
+            title: "episode".into(),
+            video,
+            audio: None,
+            topology: StreamTopology::Direct,
+            segments: vec![],
+            destination,
+            merge: MergePolicy::Automatic,
+            sidecars: SidecarPolicy::default(),
+            keep_temp: false,
+            catalog_revision: 1,
+            context: Some(DownloadContext {
+                project: Some(SourceProject {
+                    reference: ContentRef::Video(Aid::new(7).unwrap()),
+                    title: "source project".into(),
+                    category: Some(SearchCategory::Video),
+                    cover: None,
+                    ordinal: 3,
+                }),
+                batch: Some(BatchSettings {
+                    id: "offline-batch".into(),
+                    rate_limit: Some(1024),
+                }),
+                profile_id: None,
+            }),
+        };
+        plan.fingerprint = crate::api::plan_fingerprint(&plan).unwrap();
+        plan
+    }
+    #[tokio::test]
+    async fn durable_context_time_and_record_only_removal_survive_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let config = CoreConfig::new(root.path().join("state"), root.path().join("out"));
+        let output = root.path().join("completed.mp4");
+        std::fs::write(&output, b"user retained bytes").unwrap();
+        let journal = Journal::open(&config.state_dir, StateMode::ReadWrite).unwrap();
+        let id = JobId::new();
+        let mut record = JobRecord::planned(id, offline_plan(output.clone()));
+        record.snapshot.phase = JobPhase::Downloading;
+        record.snapshot.created_at = Some(12345);
+        journal.save(1, &mut [record], None).unwrap();
+        drop(journal);
+        let core = Core::new(config.clone(), Handle::current()).unwrap();
+        let recovered = core.jobs().borrow().jobs[0].clone();
+        assert_eq!(recovered.phase, JobPhase::Paused);
+        assert_eq!(recovered.created_at, Some(12345));
+        assert_eq!(
+            recovered
+                .plan
+                .as_ref()
+                .unwrap()
+                .context
+                .as_ref()
+                .unwrap()
+                .project
+                .as_ref()
+                .unwrap()
+                .ordinal,
+            3
+        );
+        assert_eq!(
+            recovered
+                .plan
+                .as_ref()
+                .unwrap()
+                .context
+                .as_ref()
+                .unwrap()
+                .batch
+                .as_ref()
+                .unwrap()
+                .rate_limit,
+            Some(1024)
+        );
+        core.retarget_profile(id, None).await.unwrap();
+        let retargeted = core.jobs().borrow().jobs[0].clone();
+        assert_eq!(retargeted.created_at, recovered.created_at);
+        assert_eq!(retargeted.plan.as_ref().unwrap().destination, output);
+        assert_eq!(
+            retargeted.plan.as_ref().unwrap().fingerprint,
+            recovered.plan.as_ref().unwrap().fingerprint
+        );
+        let report = core
+            .remove_jobs(vec![id], RemoveMode::RecordsOnly)
+            .await
+            .unwrap();
+        assert_eq!(report.removed, vec![id]);
+        assert!(report.recycled.is_empty());
+        assert_eq!(std::fs::read(&output).unwrap(), b"user retained bytes");
+        core.shutdown(StopMode::Pause).await.unwrap();
+        let reopened = Core::new(config, Handle::current()).unwrap();
+        assert!(reopened.jobs().borrow().jobs.is_empty());
+        reopened.shutdown(StopMode::Pause).await.unwrap();
+    }
+    #[tokio::test]
+    async fn a_batch_cannot_change_the_rate_of_previously_admitted_jobs() {
+        let root = tempfile::tempdir().unwrap();
+        let config = CoreConfig::new(root.path().join("state"), root.path().join("out"));
+        let journal = Journal::open(&config.state_dir, StateMode::ReadWrite).unwrap();
+        let mut plan = offline_plan(root.path().join("first.mp4"));
+        let mut record = JobRecord::planned(JobId::new(), plan.clone());
+        record.snapshot.phase = JobPhase::Paused;
+        journal.save(1, &mut [record], None).unwrap();
+        drop(journal);
+        let core = Core::new(config, Handle::current()).unwrap();
+        plan.destination = root.path().join("second.mp4");
+        plan.context
+            .as_mut()
+            .unwrap()
+            .batch
+            .as_mut()
+            .unwrap()
+            .rate_limit = Some(2048);
+        assert_eq!(
+            core.enqueue(plan).await.unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(core.jobs().borrow().jobs.len(), 1);
+        assert_eq!(core.jobs().borrow().jobs[0].phase, JobPhase::Paused);
+        core.shutdown(StopMode::Pause).await.unwrap();
+    }
+    #[tokio::test]
+    async fn completed_re_admission_cannot_replace_original_batch_profile_or_project() {
+        let root = tempfile::tempdir().unwrap();
+        let config = CoreConfig::new(root.path().join("state"), root.path().join("out"));
+        let output = root.path().join("completed.mp4");
+        std::fs::write(&output, b"retained verified fixture").unwrap();
+        let plan = offline_plan(output.clone());
+        let original_context = plan.context.clone();
+        let id = JobId::new();
+        let mut record = JobRecord::planned(id, plan.clone());
+        let (size, sha256) = state::file_digest_cancel(&output, &CancellationToken::new()).unwrap();
+        record.completion = Some(Completion {
+            fingerprint: plan.fingerprint.clone(),
+            size,
+            sha256,
+            promoted: true,
+        });
+        record.snapshot.phase = JobPhase::Completed;
+        record.snapshot.output = Some(output.clone());
+        record.snapshot.created_at = Some(12345);
+        let journal = Journal::open(&config.state_dir, StateMode::ReadWrite).unwrap();
+        journal.save(1, &mut [record], None).unwrap();
+        drop(journal);
+        let core = Core::new(config, Handle::current()).unwrap();
+        let mut changed = plan.clone();
+        changed.context.as_mut().unwrap().batch.as_mut().unwrap().id = "different-batch".into();
+        assert_eq!(
+            core.enqueue(changed).await.unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        let mut changed = plan.clone();
+        changed.context.as_mut().unwrap().profile_id = Some("different-profile".into());
+        assert_eq!(
+            core.enqueue(changed).await.unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        let mut changed = plan;
+        changed
+            .context
+            .as_mut()
+            .unwrap()
+            .project
+            .as_mut()
+            .unwrap()
+            .title = "different project".into();
+        assert_eq!(
+            core.enqueue(changed).await.unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        let snapshot = core.jobs();
+        let jobs = snapshot.borrow();
+        assert_eq!(jobs.jobs.len(), 1);
+        assert_eq!(jobs.jobs[0].id, id);
+        assert_eq!(jobs.jobs[0].phase, JobPhase::Completed);
+        assert_eq!(jobs.jobs[0].created_at, Some(12345));
+        assert_eq!(
+            jobs.jobs[0].plan.as_ref().unwrap().context,
+            original_context
+        );
+        drop(jobs);
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            b"retained verified fixture"
+        );
+        core.shutdown(StopMode::Pause).await.unwrap();
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_retains_writer_lock_until_owned_blocking_worker_joins() {
         let root = tempfile::tempdir().unwrap();
@@ -1544,6 +2256,7 @@ mod lifecycle_tests {
             sidecars: SidecarPolicy::default(),
             keep_temp: false,
             catalog_revision: 1,
+            context: None,
         };
         plan.fingerprint = crate::api::plan_fingerprint(&plan).unwrap();
         let id = JobId::new();

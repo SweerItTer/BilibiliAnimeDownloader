@@ -50,12 +50,16 @@ async fn invalid_search_pagination_is_not_empty_success_or_network_retry() {
             category: SearchCategory::All,
             page: 1,
             sort: SearchSort::Relevance,
+
+            filter: Default::default(),
         },
         SearchQuery {
             keyword: "sample".into(),
             category: SearchCategory::Video,
             page: 0,
             sort: SearchSort::Relevance,
+
+            filter: Default::default(),
         },
     ] {
         assert_eq!(
@@ -90,6 +94,8 @@ async fn public_search_rejects_unsupported_sort_before_network() {
                     category,
                     page: 1,
                     sort,
+
+                    filter: Default::default(),
                 })
                 .await
                 .unwrap_err();
