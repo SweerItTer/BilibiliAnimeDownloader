@@ -26,6 +26,7 @@
 
 ### 📝 Documentation
 
+- Add complete English and Chinese CLI guides covering commands, options, login reuse, quality/part selection, downloads, recovery, cleanup, configuration, JSON and updates. Keep README quick starts compatible with the published Alpha 6 and distinguish newer source-only features.
 - Add community conduct, contribution, security and accessibility guidance, plus issue forms and a pull request template.
 - Document the shared CLI update protocol, Windows path handling and reproducible offline package acceptance; retain historical Linux/Windows results and the GUI's implemented product isolation and headless validation contract.
 

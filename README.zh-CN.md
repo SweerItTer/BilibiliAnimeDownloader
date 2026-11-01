@@ -4,6 +4,10 @@
 
 这是一个用于搜索和下载 Bilibili 视频的 Rust 命令行工具。下载后可将音视频合成为可播放文件，也可保存字幕和弹幕文件。`bili_core` 可供 Rust 程序复用；`bili` 是命令行客户端。
 
+- [CLI 使用指南与完整命令表](CLI.zh-CN.md)：登录、搜索、清晰度选择、下载、恢复、清理、配置和更新。
+- [原生 GUI 构建与更新说明](gui/README.md)。
+- [开发构建环境](BUILDING.md)。
+
 ## 下载与当前状态
 
 `2.0.0-alpha.6` 是面向 Linux x86_64 的命令行试用版。软件包和校验文件现已在[该版本的发布页面](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.6)提供。发布 CI 进行离线验证；在线检查是单独进行且须明确授权的人工验收，外部服务可能无法访问。更早的版本是旧 Python 程序。本次不提供 Windows 包；macOS 不在范围内。
@@ -16,51 +20,43 @@
 
 ```sh
 ./bin/bili search "KEYWORD" --type video --page 1 --auth anonymous
-./bin/bili download VIDEO_ID --list-resolutions --parts all --auth anonymous
+./bin/bili qualities VIDEO_ID --auth anonymous
 ./bin/bili download VIDEO_ID --parts all --output "$HOME/Videos/Bilibili" --auth anonymous
 ```
 
-`--list-resolutions` 会按分 P 列出清晰度档位 ID、实际尺寸、帧率、编码和可用状态，不开始下载。选好后使用 `download VIDEO_ID --quality QUALITY_ID`；像素尺寸和 Stream ID 不是清晰度档位 ID。缺少元数据或权限原因时显示未知。用 `--parts 1,3-5` 选择分 P，或用 `qualities VIDEO_ID --part 3` 查询单个分 P。加 `--json` 可获得机器可读输出。在 Windows PowerShell 中将程序路径替换为 `.\bili.exe`，参数相同。
+`qualities` 查询单个分 P，不开始下载；加 `--part 3` 可查询原始序号为 3 的分 P。选好后使用 `download VIDEO_ID --quality QUALITY_ID`，像素尺寸和 Stream ID 不是清晰度档位 ID。用 `--parts 1,3-5` 选择下载分 P。当前源码还提供 `download VIDEO_ID --list-resolutions` 批量列出各分 P 清晰度，Alpha 6 没有此参数。加 `--json` 可获得机器可读输出。Windows 源码构建在 PowerShell 中使用 `.\bili.exe`，参数相同。
 
-CLI 会显示已完成文件的路径；不会安装或启动播放器。其他命令和选项请运行 `./bin/bili --help`。
+CLI 会显示已完成文件的路径；不会安装或启动播放器。接下来可阅读[完整 CLI 指南](CLI.zh-CN.md)，或运行 `./bin/bili download --help` 查看某条命令的参数。
 
 ## 检查和安装更新
 
-**由本分支构建**的 CLI 支持检查更新，并从兼容的新布局软件包中手动安装更新。这项功能尚未正式发布，请在隔离的安装目录中试用。已发布的 `2.0.0-alpha.6` 软件包没有 `update` 子命令：
+**由当前源码构建**的 CLI 支持在 Linux 和原生 Windows 上检查并手动安装兼容更新。已发布的 `2.0.0-alpha.6` 软件包没有 `update` 子命令，首次使用兼容新布局的软件包需要手动安装：
 
 ```sh
 ./bin/bili update --check
 ./bin/bili update
 ```
 
-检查更新时读取固定的 HTTPS 静态清单，安装包仍直接从对应 Tag 的 GitHub Release 下载。客户端不调用 Releases API，也不需要 API key。`--pre-release` 仅对这一次命令同时考虑预发布版本（配置文件中已允许预发布时，`--pre-release=false` 仍可强制切回稳定渠道）。
-
-Linux 和原生 Windows 使用同一套版本目录更新协议。在 Windows PowerShell 中运行：
-
-```powershell
-.\bili.exe update --check
-.\bili.exe update
-```
-
-首次安装兼容软件包时，将完整目录解压到可写的安装位置。后续更新从正在运行的程序定位安装目录，准备并校验独立的新版本，再切换 `CURRENT`；不覆盖正在运行的版本，也不删除旧版本。Windows 在校验和启动深层目录中的程序时保留规范化后的完整路径，支持空格和中文目录名；文件系统本身的路径长度和单级目录名长度限制仍然适用。
-
-`2.0.0-alpha.6` 早于本协议，无法自我更新；首个兼容版本需要手工解压到新目录中安装。
-
-共享协议、descriptor 格式、配置项、验证结果与已知限制记录在[升级协议说明](.trellis/spec/bili_core/backend/update-protocol.md)。其中的 `auto_update` 仅供 GUI 使用；CLI 只在你亲自执行 `bili update` 时才会安装，其余情况最多做一次检查。
+默认只考虑稳定版。加 `--pre-release` 可在本次命令中同时考虑预发布版，`--pre-release=false` 则强制使用稳定渠道。检查使用固定 HTTPS 清单，并要求版本提供匹配产品和平台的软件包。安装会先校验独立的新版本，再切换到它，并保留旧版本。CLI 只有在你明确运行 `update` 时才安装。软件包布局、Windows 命令、长期偏好和自动检查行为见[更新与兼容性](CLI.zh-CN.md#updates)。
 
 ## 登录与隐私
 
-- 默认不保存登录。
-- 单次命令可在需要登录的命令（例如 `download`）上使用 `--auth qr`。登录只在这条命令结束前有效。
-- 若要在之后的命令中使用 QR 登录，请显式运行 `./bin/bili login qr --remember` 保存，再使用 `--auth stored`。
-- 优先使用操作系统安全存储；若不可用，会提示，并可能以明文保存在本机个人配置目录。
-- 不要保存测试专用凭据，也不要将 Cookie 放入命令文本、日志或报告。
+想在后续命令中保持登录，只需明确记忆一次：
+
+```sh
+./bin/bili login qr --remember
+./bin/bili download VIDEO_ID --parts 1
+```
+
+后续命令会通过默认的 `--auth auto` 自动使用已保存账号，不用重新登录，也不必反复填写 `--auth stored`。只想为本次下载登录，可用 `download VIDEO_ID --auth qr`。单独运行不带 `--remember` 的 `login qr` 只验证本次登录，不会让下一个进程继续使用它。
+
+优先使用操作系统安全存储；不可用时会提示可能使用明文存储。[登录说明](CLI.zh-CN.md#login)包含关闭明文后备、Cookie 输入、查看状态和退出登录的方法。不要将 Cookie 写进命令文本，也不要保存测试专用凭据。
 
 只下载你有权保存的内容。本项目不会绕过登录、权益、地区限制或 DRM。网站要求额外验证时，请停止；程序会报错。
 
 ## 限制与构建
 
-此分支新增原生桌面 GUI；Alpha 发布仍只针对 Linux x86_64，暂不发布 Windows 发布包。Aria2、验证 WebView、搜索排序或损坏分段修复尚未包含；稳定性、性能和恢复能力还没有充分测试。FFmpeg 以可替换共享库形式提供；不会随包提供或启动 FFmpeg 可执行文件，也不会启动播放器。应用程序采用[附加 Commons Clause 的 MIT 许可证](LICENSE)；FFmpeg 和其他第三方组件适用软件包声明中的独立条款。
+当前源码包含原生桌面 GUI；已发布的 Alpha 仍为 Linux x86_64 CLI，没有 Windows 或 GUI 发布包。Aria2、验证 WebView 和损坏分段修复尚未包含；稳定性、性能和异常退出恢复还没有充分验收。FFmpeg 以可替换共享库形式提供；不会随包提供或启动 FFmpeg 可执行文件，也不会启动播放器。应用程序采用[附加 Commons Clause 的 MIT 许可证](LICENSE)；FFmpeg 和其他第三方组件适用软件包声明中的独立条款。
 
 开发构建要求和命令见 [BUILDING.md](BUILDING.md)。
 

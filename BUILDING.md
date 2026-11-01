@@ -56,7 +56,7 @@ Linux CI consumes that reference in the media-fixture job, the Linux build-matri
 
 ## CI routing and cache behavior
 
-`cli-packages.yml` uses `scripts/ci/classify_paths.py` to choose a route. Its Docs whitelist is exactly `README.md`, `README.zh-CN.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `ACCESSIBILITY.md`, `BUILDING.md`, `.github/pull_request_template.md`, Markdown files under `.trellis/spec/`, and direct-child `.md`, `.yml`, or `.yaml` files under `.github/ISSUE_TEMPLATE/`. Docs-only changes take the Docs route. If code also changes, Docs validation runs alongside the code route selected from the non-documentation paths.
+`cli-packages.yml` uses `scripts/ci/classify_paths.py` to choose a route. Its Docs whitelist is exactly `README.md`, `README.zh-CN.md`, `CLI.md`, `CLI.zh-CN.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `ACCESSIBILITY.md`, `BUILDING.md`, `.github/pull_request_template.md`, Markdown files under `.trellis/spec/`, and direct-child `.md`, `.yml`, or `.yaml` files under `.github/ISSUE_TEMPLATE/`. Docs-only changes take the Docs route. If code also changes, Docs validation runs alongside the code route selected from the non-documentation paths.
 
 The Docs route runs routing and issue-form checks without Rust compilation, native builds, or corpus generation. The GUI route skips CLI packaging and package smoke checks.
 
