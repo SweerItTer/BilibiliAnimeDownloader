@@ -1,5 +1,21 @@
 # Native desktop development
 
+## Using the GUI
+
+The BiliDL logo returns to search. Video, Bangumi and Film are the three top-level categories. Search accepts keywords or a video/episode link; category browsing uses its own filters. Click a cover to open details, then select the parts to download. For several results, enable bulk selection and open the same download configuration dialog.
+
+The dialog checks each selected part with the chosen account. An unavailable quality stays marked until you choose another quality, explicitly select the best available, or skip that item. The rate limit is shared by the batch. A directory change applies to this batch; “Set as default” separately changes the starting directory for future content. Adding tasks keeps the current workflow open and shows the acknowledged result with a Download History entry. Failed admissions keep their selections for retry.
+
+The two circles at the upper right open the account menu and Download History. The account menu includes account switching and Settings. New logins remain in memory unless you explicitly choose to remember them. Account changes apply to future tasks; an existing failed task can explicitly select replacement credentials. An unknown credential expiry is shown as unknown.
+
+Download History has In Progress, Failed and Completed views, with content-type and added-time filters. Seasons and multipart videos open as projects with their original episode/part order. Paused and interrupted tasks remain in In Progress for manual continuation. Failures show the applicable retry, sidecar or account action and a persistent error. When a supported verification challenge is supplied, the Windows verification window opens only on request and closes on completion, cancellation or timeout. A successful CAPTCHA result is submitted to the service before any success is reported; challenges without a supported payload remain explicit failures.
+
+Completed files can be located in Windows Explorer. Media Information shows actual available media/attachment parameters, with missing values left unknown. Removal distinguishes deleting the record from moving verified owned files to the system Recycle Bin. Modified or unrelated files are retained; recovery of recycled files uses the system Recycle Bin. A project with several output directories offers those actual directories.
+
+These source features have not been published as a GUI release. Local/offline checks do not establish live-site availability or solve a real verification challenge.
+
+## Build and updates
+
 The GUI is developed on this branch and is not part of the published Linux CLI Alpha. Follow [the native Windows build setup](../BUILDING.md#windows-x86_64), then build the GUI and the stable installation entry:
 
 ```powershell

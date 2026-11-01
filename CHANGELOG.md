@@ -4,6 +4,8 @@
 
 ### ✨ Features
 
+- Restructure the native GUI around browsing, content details and one shared single/bulk download dialog. Add strict per-part quality checks, batch directories and rate limits, retained admission receipts, grouped three-state history, media information, Windows file location and ownership-verified recycling.
+- Add shared credential profiles with explicit remembering, isolated job identities and CLI profile selection; support video channels, source pagination metadata and dynamic genre browsing. Open supported Windows verification challenges only on request and keep verification tokens out of persistent storage.
 - Add shared video search sorting to Core, CLI and GUI: relevance, views, newest, danmaku, favorites and comments. Preserve server pagination and reject unsupported category/order combinations before authentication or network requests.
 - Add the native GUI, including search, queues, session login and appearance settings. GUI updating now uses the shared static catalog, GUI identity, headless native validation and core installation transaction.
 - Add `download --list-resolutions` and readable `qualities` output: one table per part retains descriptions, dimensions, frame rate and codecs, with separate login/VIP requirements and returned-address evidence. Queries create no download jobs and keep machine-readable JSON output.
@@ -23,6 +25,7 @@
 
 ### 💥 Breaking Changes
 
+- Extend public Rust discovery, plan, error and job structs with typed filters and optional metadata. Source consumers must supply the new fields and rebuild matched SDK binaries; older serialized state defaults missing optional fields. OS recycling is supplied through the trusted host adapter in `CoreConfig`.
 - Add `sort` to the public Rust `SearchQuery` struct. Source callers must supply `SearchSort` and rebuild matched consumers; serialized queries without the field retain the default order.
 - The stable package entry remains unchanged, but the CLI and native runtime now live under `versions/<id>/`, selected by `CURRENT`. `2.0.0-alpha.6` cannot update to this layout; manually extract the first compatible package into a new directory rather than overwriting an Alpha 6 installation. No automatic migration is provided.
 

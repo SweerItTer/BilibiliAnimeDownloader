@@ -23,4 +23,5 @@ One integration owner runs consolidated fmt/check/clippy/test after source/depen
 | [Quality Guidelines](quality-guidelines.md) | Seven-section commands/config/output/native/SDK/package acceptance |
 | [Logging Guidelines](logging-guidelines.md) | stdout/stderr, secret exclusion and evidence |
 | [Search sorting](../../bili_core/backend/search-sorting.md) | Shared --sort values, supported combinations, pre-auth errors and pagination |
+| [Profile-bound browsing and batches](../../bili_core/backend/browse-download-ux.md) | Shared profile selection, independent job identities, persisted source metadata and archive-operation ownership |
 | [Update protocol](../../bili_core/backend/update-protocol.md) | Shared static HTTPS discovery, release descriptor, channel rules, install layout and the `--pre-release`/`auto_update` boundary the CLI must follow |
