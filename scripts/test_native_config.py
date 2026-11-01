@@ -1,6 +1,9 @@
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
-from verify_package import has_forbidden_native_options, parse_windows_dependencies
+from verify_package import has_forbidden_native_options, inspect_windows, parse_windows_dependencies
 
 
 class NativeConfigurationPolicyTests(unittest.TestCase):
@@ -53,6 +56,29 @@ class WindowsDependencyParsingTests(unittest.TestCase):
             parse_windows_dependencies(output),
             ["KERNEL32.DLL", "Unknown-Mixed_1.DlL"],
         )
+
+    def test_gui_accepts_windows_common_controls_but_requires_non_system_libraries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("bili.exe", "avformat-62.dll", "avcodec-62.dll", "avutil-60.dll"):
+                (root / name).write_bytes(b"synthetic import inspection input")
+            for product, dependency, accepted in (
+                ("gui", "COMCTL32.dll", True),
+                ("cli", "COMCTL32.dll", False),
+                ("gui", "Unknown-Mixed_1.DlL", False),
+                ("gui", "WebView2Loader.dll", False),
+            ):
+                with self.subTest(product=product, dependency=dependency):
+                    def imports(command, env, cwd):
+                        return f"    {dependency}\n" if Path(command[-1]).name == "bili.exe" else ""
+
+                    with mock.patch("verify_package.shutil.which", return_value="dumpbin"), \
+                            mock.patch("verify_package.run", side_effect=imports):
+                        if accepted:
+                            inspect_windows(root, {}, product=product)
+                        else:
+                            with self.assertRaisesRegex(ValueError, "unbundled Windows dependency"):
+                                inspect_windows(root, {}, product=product)
 
 
 if __name__ == "__main__":

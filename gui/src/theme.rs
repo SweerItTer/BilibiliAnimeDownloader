@@ -247,17 +247,13 @@ pub fn brand_mark(painter: &egui::Painter, rect: Rect, accent: Color32) {
 
 #[derive(Clone, Copy)]
 pub enum Icon {
-    Search,
     Download,
     Check,
-    Settings,
     User,
     Arrow,
     Back,
-    Pause,
     Play,
     Close,
-    Copy,
     Refresh,
     Folder,
     Image,
@@ -266,7 +262,6 @@ pub enum Icon {
     Minus,
     Window,
     Restore,
-    Info,
 }
 
 pub fn icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -281,23 +276,13 @@ pub fn icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         ));
     };
     match icon {
-        Icon::Search => {
-            painter.circle_stroke(p(-2.0, -2.0), 6.0 * s, stroke);
-            line(&[(2.5, 2.5), (8.0, 8.0)]);
-        }
         Icon::Download => {
             line(&[(0.0, -9.0), (0.0, 3.0)]);
             line(&[(-4.0, -1.0), (0.0, 3.0), (4.0, -1.0)]);
             line(&[(-8.0, 2.0), (-8.0, 8.0), (8.0, 8.0), (8.0, 2.0)]);
         }
         Icon::Check => line(&[(-7.0, 0.0), (-2.0, 5.0), (8.0, -5.0)]),
-        Icon::Settings => {
-            for (y, x) in [(-6.0, -3.0), (0.0, 4.0), (6.0, -1.0)] {
-                line(&[(-9.0, y), (9.0, y)]);
-                painter.circle_filled(p(x, y), 2.5 * s, card());
-                painter.circle_stroke(p(x, y), 2.5 * s, stroke);
-            }
-        }
+
         Icon::User => {
             painter.circle_stroke(p(0.0, -5.0), 4.0 * s, stroke);
             line(&[
@@ -317,29 +302,13 @@ pub fn icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[(8.0, 0.0), (-8.0, 0.0)]);
             line(&[(-2.0, -6.0), (-8.0, 0.0), (-2.0, 6.0)]);
         }
-        Icon::Pause => {
-            line(&[(-4.0, -7.0), (-4.0, 7.0)]);
-            line(&[(4.0, -7.0), (4.0, 7.0)]);
-        }
+
         Icon::Play => line(&[(-5.0, -8.0), (8.0, 0.0), (-5.0, 8.0), (-5.0, -8.0)]),
         Icon::Close => {
             line(&[(-6.0, -6.0), (6.0, 6.0)]);
             line(&[(6.0, -6.0), (-6.0, 6.0)]);
         }
-        Icon::Copy => {
-            painter.rect_stroke(
-                Rect::from_min_max(p(-4.0, -4.0), p(8.0, 9.0)),
-                2.0 * s,
-                stroke,
-            );
-            line(&[
-                (-7.0, 5.0),
-                (-9.0, 5.0),
-                (-9.0, -9.0),
-                (3.0, -9.0),
-                (3.0, -7.0),
-            ]);
-        }
+
         Icon::Refresh => {
             line(&[
                 (8.0, -2.0),
@@ -400,11 +369,6 @@ pub fn icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 2.0 * s,
                 stroke,
             );
-        }
-        Icon::Info => {
-            painter.circle_stroke(c, 8.5 * s, stroke);
-            line(&[(0.0, -1.5), (0.0, 5.0)]);
-            painter.circle_filled(p(0.0, -5.0), 1.1 * s, color);
         }
     }
 }
@@ -558,54 +522,6 @@ pub fn progress(ui: &mut Ui, id: Id, value: Option<f32>, active: bool, reduced: 
         if !reduced {
             ui.ctx().request_repaint_after(Duration::from_millis(16));
         }
-    }
-}
-
-pub fn empty_art(ui: &mut Ui) {
-    let p = palette();
-    let (rect, _) = ui.allocate_exact_size(vec2(240.0, 178.0), Sense::hover());
-    let painter = ui.painter();
-    let c = rect.center();
-    painter.circle_filled(c, 76.0, p.soft);
-    painter.circle_filled(c + vec2(77.0, -40.0), 16.0, p.rose);
-    painter.circle_filled(c + vec2(-84.0, 26.0), 7.0, mix(p.soft, p.primary, 0.25));
-    let sheet = Rect::from_center_size(c + vec2(0.0, -18.0), vec2(78.0, 94.0));
-    painter.rect(
-        sheet.translate(vec2(10.0, -6.0)),
-        16.0,
-        mix(p.soft, p.primary, 0.18),
-        Stroke::NONE,
-    );
-    painter.rect(sheet, 16.0, p.card, Stroke::new(1.0_f32, p.border));
-    icon(
-        painter,
-        Rect::from_center_size(sheet.center() - vec2(0.0, 4.0), vec2(36.0, 36.0)),
-        Icon::Download,
-        p.primary,
-    );
-    let tray = Rect::from_center_size(c + vec2(0.0, 39.0), vec2(132.0, 53.0));
-    painter.rect_filled(tray, 20.0, p.primary);
-    painter.rect_filled(
-        Rect::from_center_size(tray.center() - vec2(0.0, 8.0), vec2(116.0, 21.0)),
-        12.0,
-        mix(p.primary, Color32::WHITE, 0.32),
-    );
-    painter.line_segment(
-        [
-            tray.center() + vec2(-13.0, 10.0),
-            tray.center() + vec2(13.0, 10.0),
-        ],
-        Stroke::new(3.0_f32, ON_PRIMARY),
-    );
-    for offset in [vec2(-80.0, -52.0), vec2(84.0, 50.0)] {
-        painter.line_segment(
-            [c + offset - vec2(4.0, 0.0), c + offset + vec2(4.0, 0.0)],
-            Stroke::new(1.5_f32, p.primary),
-        );
-        painter.line_segment(
-            [c + offset - vec2(0.0, 4.0), c + offset + vec2(0.0, 4.0)],
-            Stroke::new(1.5_f32, p.primary),
-        );
     }
 }
 

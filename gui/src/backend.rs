@@ -8,18 +8,75 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+#[derive(Clone)]
+pub struct PrepareInput {
+    pub input: String,
+    pub parts: Option<Vec<PartRef>>,
+    pub category: SearchCategory,
+}
+#[derive(Clone)]
+pub struct PreparedItem {
+    pub item: MediaItem,
+    pub category: SearchCategory,
+    pub selected: Vec<PartRef>,
+    pub catalogs: Vec<(PartRef, Result<QualityCatalog>)>,
+}
+#[derive(Clone)]
+pub struct AdmissionReceipt {
+    pub id: JobId,
+    pub plan: StreamPlan,
+}
+#[derive(Clone)]
+pub struct AdmissionRequest {
+    pub selection: DownloadSelection,
+    pub context: DownloadContext,
+}
+
 pub enum Operation {
     Search(SearchQuery),
     Resolve(String),
     Enqueue {
-        selections: Vec<DownloadSelection>,
+        selections: Vec<AdmissionRequest>,
         output_dir: PathBuf,
+    },
+    Prepare {
+        inputs: Vec<PrepareInput>,
+        profile: Option<String>,
+        refresh: bool,
+    },
+    Profiles,
+    SelectProfile(String),
+    ForgetProfile(String),
+    OutputInfo(JobId),
+    Remove {
+        ids: Vec<JobId>,
+        mode: RemoveMode,
+    },
+    RetargetProfile {
+        id: JobId,
+        profile: Option<String>,
+    },
+    Reveal {
+        path: PathBuf,
+        select: bool,
+    },
+    BrowseConditions(PgcSection),
+    Browse(BrowseQuery),
+    BeginVerification {
+        request: VerificationRequest,
+        profile: Option<String>,
+    },
+    CompleteVerification {
+        challenge: VerificationChallenge,
+        proof: VerificationProof,
     },
     Login {
         remember: bool,
+        activate: bool,
     },
     RestoreSession,
     Logout,
+    Anonymous,
     ValidateOutput(PathBuf),
 }
 
@@ -35,11 +92,27 @@ pub enum Outcome {
     Search(CandidatePage),
     Detail(MediaItem),
     Enqueued {
-        count: usize,
+        receipts: Vec<AdmissionReceipt>,
         cancelled: bool,
         error: Option<CoreError>,
     },
+    Prepared {
+        items: Vec<PreparedItem>,
+        profile: Option<String>,
+        refresh: bool,
+    },
+    OutputInfo(OutputInfo),
+    Removed(RemovalReport),
+    Retargeted(JobId),
+    Revealed,
+    BrowseConditions(BrowseConditions),
+    Verification(VerificationChallenge),
+    Verified,
     Auth(AuthSnapshot),
+    ProfileAdded {
+        auth: AuthSnapshot,
+        profile_id: String,
+    },
     Output(PathBuf),
 }
 
@@ -79,6 +152,23 @@ impl Owner {
 }
 
 impl Bridge {
+    #[cfg(test)]
+    pub fn test_channel() -> (Self, mpsc::Sender<Event>, mpsc::Receiver<Command>) {
+        let (commands, receiver) = mpsc::channel(16);
+        let (events_tx, events) = mpsc::channel(32);
+        let (_, snapshots) = watch::channel(Arc::new(QueueSnapshot::default()));
+        let (shutdown, _) = watch::channel(false);
+        (
+            Self {
+                commands,
+                events,
+                snapshots,
+                shutdown,
+            },
+            events_tx,
+            receiver,
+        )
+    }
     pub fn start(
         config: Result<CoreConfig>,
         runtime: &Handle,
@@ -288,71 +378,156 @@ async fn execute(
             _ = wait_cancel(&mut cancel) => Err(cancelled()),
             result = core.resolve(input.into()) => result.map(Outcome::Detail),
         },
+        Operation::Prepare {
+            inputs,
+            profile,
+            refresh,
+        } => {
+            let mut prepared = Vec::new();
+            for input in inputs {
+                let item = tokio::select! {
+                    biased;
+                    _ = wait_cancel(&mut cancel) => return Err(cancelled()),
+                    result = core.resolve_for(input.input.into(), profile.clone()) => result?,
+                };
+                let selected = input
+                    .parts
+                    .unwrap_or_else(|| item.parts.iter().map(|p| p.reference.clone()).collect());
+                let mut catalogs = Vec::new();
+                for part in &item.parts {
+                    let result = tokio::select! {
+                        biased;
+                        _ = wait_cancel(&mut cancel) => return Err(cancelled()),
+                        result = core.quality_catalog_for(part.reference.clone(), profile.clone()) => result,
+                    };
+                    catalogs.push((part.reference.clone(), result));
+                }
+                prepared.push(PreparedItem {
+                    item,
+                    category: input.category,
+                    selected,
+                    catalogs,
+                });
+            }
+            Ok(Outcome::Prepared {
+                items: prepared,
+                profile,
+                refresh,
+            })
+        }
+        Operation::Profiles => core.auth(AuthAction::ListProfiles).await.map(Outcome::Auth),
+        Operation::SelectProfile(id) => core
+            .auth(AuthAction::SelectProfile { id })
+            .await
+            .map(Outcome::Auth),
+        Operation::ForgetProfile(id) => core
+            .auth(AuthAction::ForgetProfile { id })
+            .await
+            .map(Outcome::Auth),
+        Operation::OutputInfo(id) => core.output_info(id).await.map(Outcome::OutputInfo),
+        Operation::Remove { ids, mode } => core.remove_jobs(ids, mode).await.map(Outcome::Removed),
+        Operation::RetargetProfile { id, profile } => core
+            .retarget_profile(id, profile)
+            .await
+            .map(|_| Outcome::Retargeted(id)),
+        Operation::Reveal { path, select } => {
+            tokio::task::spawn_blocking(move || reveal(path, select))
+                .await
+                .map_err(|_| CoreError::new(ErrorCode::Filesystem, "open output location"))?
+                .map(|_| Outcome::Revealed)
+        }
+        Operation::BrowseConditions(section) => core
+            .browse_conditions(section)
+            .await
+            .map(Outcome::BrowseConditions),
+        Operation::Browse(query) => tokio::select! {
+            biased;
+            _ = wait_cancel(&mut cancel) => Err(cancelled()),
+            result = core.browse(query) => result.map(Outcome::Search),
+        },
+        Operation::BeginVerification { request, profile } => core
+            .begin_verification(request, profile)
+            .await
+            .map(Outcome::Verification),
+        Operation::CompleteVerification { challenge, proof } => core
+            .complete_verification(challenge, proof)
+            .await
+            .map(|_| Outcome::Verified),
         Operation::Enqueue {
             selections,
             output_dir,
         } => {
-            let mut count = 0;
-            for selection in selections {
+            let mut receipts = Vec::new();
+            // Preflight every pending selection before admitting any item.
+            // This makes an unsupported strict quality a blocking batch error.
+            let mut plans = Vec::new();
+            for request in selections {
                 let result = tokio::select! {
                     biased;
                     _ = wait_cancel(&mut cancel) => {
-                        return Ok(Outcome::Enqueued { count, cancelled: true, error: None });
+                        return Ok(Outcome::Enqueued { receipts, cancelled: true, error: None });
                     }
-                    result = core.plan(selection) => result,
+                    result = core.plan_in_directory(request.selection, request.context, output_dir.clone()) => result,
                 };
-                let mut plan = match result {
+                let plan = match result {
                     Ok(plan) => plan,
                     Err(error) => {
                         return Ok(Outcome::Enqueued {
-                            count,
+                            receipts,
                             cancelled: false,
                             error: Some(error),
                         })
                     }
                 };
-                // Keep core's safe, identity-suffixed filename and MP4 container.
-                // Core fingerprints media/container, not the destination parent.
-                // Only presentation's user-selected output directory changes.
-                let filename = plan
-                    .destination
-                    .file_name()
-                    .ok_or_else(|| {
-                        CoreError::new(ErrorCode::InvalidInput, "core plan has no output filename")
-                    })?
-                    .to_owned();
-                plan.destination = output_dir.join(filename);
+                plans.push(plan);
+            }
+            for plan in plans {
                 if *cancel.borrow() {
                     return Ok(Outcome::Enqueued {
-                        count,
+                        receipts,
                         cancelled: true,
                         error: None,
                     });
                 }
                 // Once sent, await the durable acknowledgement even on cancel.
-                if let Err(error) = core.enqueue(plan).await {
-                    return Ok(Outcome::Enqueued {
-                        count,
-                        cancelled: false,
-                        error: Some(error),
-                    });
+                match core.enqueue(plan.clone()).await {
+                    Ok(id) => receipts.push(AdmissionReceipt { id, plan }),
+                    Err(error) => {
+                        return Ok(Outcome::Enqueued {
+                            receipts,
+                            cancelled: false,
+                            error: Some(error),
+                        })
+                    }
                 }
-                count += 1;
             }
             Ok(Outcome::Enqueued {
-                count,
+                receipts,
                 cancelled: false,
                 error: None,
             })
         }
-        Operation::Login { remember } => login(&core, remember, &mut cancel, &events, &ctx)
-            .await
-            .map(Outcome::Auth),
+        Operation::Login { remember, activate } => {
+            let snapshot = login(&core, remember, activate, &mut cancel, &events, &ctx).await?;
+            if activate {
+                Ok(Outcome::Auth(snapshot))
+            } else {
+                let profile_id = snapshot.login_profile.ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::Corruption,
+                        "completed QR profile receipt missing",
+                    )
+                })?;
+                let auth = core.auth(AuthAction::ListProfiles).await?;
+                Ok(Outcome::ProfileAdded { auth, profile_id })
+            }
+        }
         Operation::RestoreSession => core
             .auth(AuthAction::LoadStored { required: false })
             .await
             .map(Outcome::Auth),
-        Operation::Logout => core.auth(AuthAction::Anonymous).await.map(Outcome::Auth),
+        Operation::Logout => core.auth(AuthAction::Logout).await.map(Outcome::Auth),
+        Operation::Anonymous => core.auth(AuthAction::Anonymous).await.map(Outcome::Auth),
         Operation::ValidateOutput(path) => {
             tokio::task::spawn_blocking(move || validate_output(path))
                 .await
@@ -365,17 +540,31 @@ async fn execute(
 async fn login(
     core: &Core,
     remember: bool,
+    activate: bool,
     cancel: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<Event>,
     ctx: &egui::Context,
 ) -> Result<AuthSnapshot> {
+    login_with_auth(remember, activate, cancel, events, ctx, |action| {
+        core.auth(action)
+    })
+    .await
+}
+
+async fn login_with_auth<F, Response>(
+    remember: bool,
+    activate: bool,
+    cancel: &mut watch::Receiver<bool>,
+    events: &mpsc::Sender<Event>,
+    ctx: &egui::Context,
+    auth: F,
+) -> Result<AuthSnapshot>
+where
+    F: Fn(AuthAction) -> Response,
+    Response: std::future::Future<Output = Result<AuthSnapshot>>,
+{
     let result = async {
-        let start = core
-            .auth(AuthAction::StartQr {
-                remember,
-                activate: true,
-            })
-            .await?;
+        let start = auth(AuthAction::StartQr { remember, activate }).await?;
         let expires = start
             .qr
             .as_ref()
@@ -392,17 +581,18 @@ async fn login(
                 }
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
             }
-            // Auth may update the session before validating it. Let it finish,
-            // then clear on cancellation; never abandon half-installed auth.
-            let snapshot = core.auth(AuthAction::PollQr).await?;
+            // Once core has installed a new profile, report its acknowledgement
+            // even if cancellation raced that commit. A previously logged-in
+            // account alone is not completion of an add-account QR challenge.
+            let snapshot = auth(AuthAction::PollQr).await?;
+            if completed_qr(&snapshot) {
+                return Ok(snapshot);
+            }
             if *cancel.borrow() {
                 return Err(cancelled());
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(CoreError::new(ErrorCode::LoginRequired, "QR login expired"));
-            }
-            if snapshot.logged_in {
-                return Ok(snapshot);
             }
             if matches!(
                 snapshot.qr_status,
@@ -415,10 +605,15 @@ async fn login(
     }
     .await;
     if result.is_err() {
-        let _ = core.auth(AuthAction::CancelQr).await;
-        let _ = core.auth(AuthAction::Anonymous).await;
+        let _ = auth(AuthAction::CancelQr).await;
     }
     result
+}
+
+fn completed_qr(snapshot: &AuthSnapshot) -> bool {
+    snapshot.logged_in
+        && snapshot.qr_status == Some(QrStatus::Complete)
+        && snapshot.login_profile.is_some()
 }
 
 fn decode_cover(bytes: CoverBytes) -> Option<egui::ColorImage> {
@@ -429,6 +624,12 @@ fn decode_cover(bytes: CoverBytes) -> Option<egui::ColorImage> {
         [width as usize, height as usize],
         thumb.as_raw(),
     ))
+}
+
+/// Core invokes this host adapter only with its verified exact owned allowlist.
+pub(crate) fn recycle_files(paths: &[PathBuf]) -> Result<()> {
+    trash::delete_all(paths)
+        .map_err(|_| CoreError::new(ErrorCode::Filesystem, "move owned output to recycle bin"))
 }
 
 fn validate_output(path: PathBuf) -> Result<PathBuf> {
@@ -463,10 +664,65 @@ fn validate_output(path: PathBuf) -> Result<PathBuf> {
     }
 }
 
+fn reveal(path: PathBuf, select: bool) -> Result<()> {
+    if !path.is_absolute() || !path.exists() {
+        return Err(CoreError::new(
+            ErrorCode::Filesystem,
+            "output location unavailable",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        let mut command = std::process::Command::new("explorer.exe");
+        if select {
+            command.arg("/select,");
+        }
+        command.arg(&path).spawn().map_err(CoreError::io)?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let directory = if select {
+            path.parent()
+                .ok_or_else(|| CoreError::new(ErrorCode::Filesystem, "output parent unavailable"))?
+        } else {
+            path.as_path()
+        };
+        std::process::Command::new("xdg-open")
+            .arg(directory)
+            .spawn()
+            .map_err(CoreError::io)?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = select;
+        Err(CoreError::new(
+            ErrorCode::NativeCapability,
+            "file location unavailable on this platform",
+        ))
+    }
+}
+
 pub fn error_message(error: &CoreError) -> String {
+    let specific=match (error.code,error.operation.as_str()){
+        (ErrorCode::Conflict,"completed output ownership or content changed"|"refusing unowned or modified output removal"|"refusing unowned component removal"|"owned component content changed")=>Some("文件已被修改，或不属于这条下载记录，已保留文件。可以仅移除记录。"),
+        (ErrorCode::Conflict,"output already exists"|"output already exists without matching completion"|"manual output already exists"|"unowned component output exists")=>Some("保存位置已有不匹配的文件，已保留原文件。请选择其他目录后重试。"),
+        (ErrorCode::Conflict,"completed job retains its original admission settings; choose another output directory")=>Some("已有完成记录会保留原来的账号与设置。若需要新设置，请选择其他保存目录。"),
+        (ErrorCode::Conflict,"batch rate differs from admitted settings")=>Some("此批次已采用其他限速设置，请重新配置为新批次。"),
+        (ErrorCode::NativeCapability,"host recycle bin adapter unavailable")=>Some("当前平台无法使用回收站，未删除文件。可以仅移除记录。"),
+        (ErrorCode::Filesystem,"output location unavailable")=>Some("文件或目录已不存在，无法打开所在位置。"),
+        (ErrorCode::Busy,"state directory already has a writer")=>Some("下载记录正在被另一个进程使用。请先退出使用此状态目录的 CLI 或 GUI。"),
+        _=>None,
+    };
+    if let Some(message) = specific {
+        return message.into();
+    }
     let help = match error.code {
         ErrorCode::InvalidInput => "输入无效，请检查编号、链接或绝对路径。",
-        ErrorCode::VerificationRequired => "站点要求安全验证；本版本不内嵌浏览器，也不会绕过验证。",
+        ErrorCode::VerificationRequired => {
+            "站点要求安全验证。完成验证后可重试；没有可用验证入口时，请先重试获取新验证信息。"
+        }
         ErrorCode::LoginRequired => "需要登录，或二维码已失效。请重新扫码。",
         ErrorCode::EntitlementRequired => "当前账号没有此内容的观看权限。",
         ErrorCode::RegionRestricted => "内容在当前地区不可用。",
@@ -474,9 +730,10 @@ pub fn error_message(error: &CoreError) -> String {
         ErrorCode::RepresentationChanged => "媒体规格已变化，请重新解析后添加。",
         ErrorCode::Transport | ErrorCode::RetryExhausted => "网络请求未成功，请检查连接后重试。",
         ErrorCode::Filesystem => "无法访问文件。请检查目录、权限和剩余空间。",
-        ErrorCode::Conflict | ErrorCode::Busy => {
-            "资源正在使用中。若 CLI 正在运行，请先退出再重试。"
+        ErrorCode::Conflict => {
+            "此操作与当前任务或文件状态冲突，原记录与文件已保留。请查看错误信息后调整操作。"
         }
+        ErrorCode::Busy => "当前操作尚未结束，请等待或先暂停相关任务。",
         ErrorCode::NativeCapability | ErrorCode::Remux => {
             "原生媒体处理不可用，请检查配套 FFmpeg 共享库。"
         }
@@ -499,6 +756,96 @@ pub fn error_code(error: &CoreError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn adding_an_account_requires_the_new_qr_commit_not_an_existing_logged_in_session() {
+        let mut snapshot = AuthSnapshot {
+            logged_in: true,
+            account: None,
+            notice: None,
+            qr: None,
+            qr_status: Some(QrStatus::WaitingForScan),
+            profiles: vec![],
+            selected_profile: Some("existing-session".into()),
+            login_profile: None,
+        };
+        assert!(!completed_qr(&snapshot));
+        snapshot.qr_status = Some(QrStatus::Complete);
+        assert!(!completed_qr(&snapshot));
+        snapshot.login_profile = Some("new-profile".into());
+        assert!(completed_qr(&snapshot));
+        snapshot.logged_in = false;
+        assert!(!completed_qr(&snapshot));
+    }
+
+    #[tokio::test]
+    async fn cancelling_new_qr_keeps_an_existing_account_and_only_cancels_the_challenge() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+        for activate in [false, true] {
+            let old = AuthSnapshot {
+                logged_in: true,
+                account: None,
+                notice: None,
+                qr: None,
+                qr_status: None,
+                profiles: vec![],
+                selected_profile: Some("existing-profile".into()),
+                login_profile: None,
+            };
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let selected = Arc::new(AtomicBool::new(true));
+            let seen = calls.clone();
+            let current = selected.clone();
+            let (_cancel, mut cancelled) = watch::channel(true);
+            let (events, _receiver) = mpsc::channel(4);
+            let result = login_with_auth(
+                false,
+                activate,
+                &mut cancelled,
+                &events,
+                &egui::Context::default(),
+                move |action| {
+                    let snapshot = match action {
+                        AuthAction::StartQr {
+                            activate: requested,
+                            ..
+                        } => {
+                            assert_eq!(requested, activate);
+                            seen.lock().unwrap().push("start");
+                            let mut pending = old.clone();
+                            pending.logged_in = false;
+                            pending.qr = Some(bili_core::auth::QrChallenge {
+                                login_url: "https://passport.bilibili.com/test-synthetic-qr".into(),
+                                expires_in_secs: 60,
+                            });
+                            pending.qr_status = Some(QrStatus::WaitingForScan);
+                            Ok(pending)
+                        }
+                        AuthAction::CancelQr => {
+                            seen.lock().unwrap().push("cancel");
+                            Ok(old.clone())
+                        }
+                        AuthAction::Anonymous => {
+                            current.store(false, Ordering::SeqCst);
+                            seen.lock().unwrap().push("anonymous");
+                            Ok(old.clone())
+                        }
+                        _ => Err(CoreError::new(
+                            ErrorCode::InvalidInput,
+                            "unexpected synthetic auth action",
+                        )),
+                    };
+                    std::future::ready(snapshot)
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+            assert!(selected.load(Ordering::SeqCst));
+            assert_eq!(*calls.lock().unwrap(), vec!["start", "cancel"]);
+        }
+    }
 
     #[test]
     fn output_requires_absolute_path() {

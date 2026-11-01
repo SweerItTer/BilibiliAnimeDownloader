@@ -5,12 +5,14 @@ mod backend;
 mod background;
 mod covers;
 mod detail;
+mod download_config;
 mod download_panel;
 mod login;
 mod prefs;
 mod search;
 mod theme;
 mod update;
+mod verification;
 mod window;
 
 use bili_core::{CoreConfig, CoreError, ErrorCode};
@@ -82,6 +84,12 @@ fn configuration(prefs: &GuiPrefs, state_dir: Option<PathBuf>) -> bili_core::Res
         .unwrap_or_else(|| project.data_local_dir().join("downloads"));
     let output = std::path::absolute(output).map_err(CoreError::io)?;
     let mut config = CoreConfig::new(state, output);
+    #[cfg(windows)]
+    {
+        config.recycle = Some(bili_core::RecycleBin {
+            move_files: backend::recycle_files,
+        });
+    }
     // A store policy alone persists nothing: core writes only when the user
     // asks to keep the login. Nothing is loaded until the GUI explicitly sends
     // LoadStored on startup (only when the preference is enabled).

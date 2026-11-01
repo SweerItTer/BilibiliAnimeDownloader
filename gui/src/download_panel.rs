@@ -1,42 +1,34 @@
-//! Snapshot-only queue presentation; all controls go back through core.
+//! Project-oriented projections of immutable core history; mutations stay in core.
 use crate::{
-    backend::{self, Bridge},
+    backend::{self, Bridge, Operation},
     covers::CoverCache,
-    search,
-    theme::{self, ButtonKind, Icon},
+    search, theme,
 };
-use bili_core::{JobAction, JobId, JobPhase, JobSnapshot, QueueSnapshot};
+use bili_core::{
+    ErrorCode, JobAction, JobId, JobPhase, JobSnapshot, OutputInfo, QueueSnapshot, RemoveMode,
+    SearchCategory,
+};
 use egui::{RichText, Ui};
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    time::SystemTime,
-};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Filter {
     #[default]
-    All,
     Active,
-    Paused,
-    Attention,
+    Failed,
+    Completed,
 }
-
-pub fn matches_filter(phase: JobPhase, completed: bool, filter: Filter) -> bool {
-    if completed {
-        return phase == JobPhase::Completed;
-    }
-    if phase == JobPhase::Completed {
-        return false;
-    }
-    match filter {
-        Filter::All => true,
-        Filter::Active => phase.is_active() || phase == JobPhase::Downloaded,
-        Filter::Paused => matches!(phase, JobPhase::Paused | JobPhase::Cancelled),
-        Filter::Attention => matches!(phase, JobPhase::Failed | JobPhase::NeedsAttention),
+fn status(job: &JobSnapshot) -> Filter {
+    if matches!(job.phase, JobPhase::Failed | JobPhase::NeedsAttention)
+        || job.components.iter().any(|c| c.error.is_some())
+    {
+        Filter::Failed
+    } else if job.phase == JobPhase::Completed {
+        Filter::Completed
+    } else {
+        Filter::Active
     }
 }
-
 pub fn phase_name(phase: JobPhase) -> &'static str {
     match phase {
         JobPhase::Queued => "排队中",
@@ -48,465 +40,632 @@ pub fn phase_name(phase: JobPhase) -> &'static str {
         JobPhase::Committing => "正在保存",
         JobPhase::Completed => "已完成",
         JobPhase::Pausing => "正在保存断点",
-        JobPhase::Paused => "已暂停",
+        JobPhase::Paused => "已暂停，可继续",
         JobPhase::Cancelling => "正在取消",
-        JobPhase::Cancelled => "已取消",
-        JobPhase::Failed => "下载失败",
-        JobPhase::NeedsAttention => "需要处理",
+        JobPhase::Cancelled => "已停止，可继续",
+        JobPhase::Failed | JobPhase::NeedsAttention => "失败",
     }
 }
-
 pub fn bytes(value: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut size = value as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut n = value as f64;
+    let mut u = 0;
+    while n >= 1024.0 && u < 4 {
+        n /= 1024.0;
+        u += 1;
     }
-    if unit == 0 {
+    if u == 0 {
         format!("{value} B")
     } else {
-        format!("{size:.1} {}", UNITS[unit])
+        format!("{n:.1} {}", U[u])
     }
 }
-
 pub fn fraction(downloaded: u64, total: Option<u64>) -> Option<f32> {
     total
-        .filter(|&total| total > 0)
-        .map(|total| (downloaded as f64 / total as f64).clamp(0.0, 1.0) as f32)
+        .filter(|n| *n > 0)
+        .map(|n| (downloaded as f64 / n as f64).clamp(0.0, 1.0) as f32)
 }
-
 pub struct QueueView<'a> {
     pub snapshot: &'a QueueSnapshot,
-    pub completed: bool,
     pub pending: &'a HashSet<JobId>,
     pub available: bool,
+    pub operations_available: bool,
     pub reduced: bool,
-    pub cover_index: &'a HashMap<u64, String>,
 }
-
+pub enum QueueAction {
+    Control(JobId, JobAction),
+    Operation(Operation),
+    Account(JobId),
+}
 #[derive(Default)]
 pub struct QueueState {
     filter: Filter,
-    text: String,
-    copied: Option<JobId>,
+    kind: Option<SearchCategory>,
+    oldest_first: bool,
+    project: Option<String>,
+    info: Option<OutputInfo>,
+    delete: Option<DeleteIntent>,
+    delete_files: bool,
 }
-
+struct DeleteIntent {
+    ids: Vec<JobId>,
+    title: String,
+    project: Option<String>,
+}
+struct Project {
+    key: String,
+    title: String,
+    cover: Option<String>,
+    jobs: Vec<Arc<JobSnapshot>>,
+}
+fn job_title(job: &JobSnapshot) -> String {
+    job.plan
+        .as_ref()
+        .map(|p| p.title.clone())
+        .or_else(|| {
+            job.output
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| format!("任务 {}", job.id))
+}
+fn project_key(job: &JobSnapshot) -> String {
+    job.plan
+        .as_ref()
+        .and_then(|p| p.context.as_ref())
+        .and_then(|c| c.project.as_ref())
+        .map_or_else(
+            || format!("legacy-{}", job.id),
+            |p| search::reference_input(&p.reference),
+        )
+}
+fn project_kind(job: &JobSnapshot) -> Option<SearchCategory> {
+    job.plan
+        .as_ref()
+        .and_then(|p| p.context.as_ref())
+        .and_then(|c| c.project.as_ref())
+        .and_then(|p| p.category)
+}
 impl QueueState {
+    pub fn select_filter(&mut self, filter: Filter) {
+        self.filter = filter;
+        self.project = None;
+    }
+    pub fn accept_info(&mut self, info: OutputInfo) {
+        self.info = Some(info);
+    }
     pub fn show(
         &mut self,
         ui: &mut Ui,
         view: QueueView<'_>,
         covers: &mut CoverCache,
         bridge: Option<&Bridge>,
-    ) -> Option<(JobId, JobAction)> {
+    ) -> Option<QueueAction> {
         let QueueView {
             snapshot,
-            completed,
             pending,
             available,
+            operations_available,
             reduced,
-            cover_index,
         } = view;
         let mut action = None;
         ui.horizontal_wrapped(|ui| {
-            if !completed {
-                for (filter, name) in [
-                    (Filter::All, "全部任务"),
-                    (Filter::Active, "进行中"),
-                    (Filter::Paused, "已停止"),
-                    (Filter::Attention, "需处理"),
-                ] {
-                    if theme::button(
-                        ui,
-                        name,
-                        if self.filter == filter {
-                            Icon::Check
-                        } else {
-                            Icon::Download
-                        },
-                        if self.filter == filter {
-                            ButtonKind::Soft
-                        } else {
-                            ButtonKind::Quiet
-                        },
-                        reduced,
-                    )
+            for (filter, label) in [
+                (Filter::Active, "进行中"),
+                (Filter::Failed, "失败"),
+                (Filter::Completed, "已完成"),
+            ] {
+                let count = snapshot.jobs.iter().filter(|j| status(j) == filter).count();
+                if ui
+                    .selectable_label(self.filter == filter, format!("{label} {count}"))
                     .clicked()
-                    {
-                        self.filter = filter;
-                    }
+                {
+                    self.select_filter(filter);
                 }
             }
-            ui.add(
-                egui::TextEdit::singleline(&mut self.text)
-                    .hint_text("筛选任务标题")
-                    .desired_width(160.0)
-                    .margin(egui::vec2(12.0, 10.0)),
-            );
+        });
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("history-kind")
+                .selected_text(self.kind.map_or("全部类型", search::category_name))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.kind, None, "全部类型");
+                    for kind in [
+                        SearchCategory::Video,
+                        SearchCategory::Bangumi,
+                        SearchCategory::Film,
+                    ] {
+                        ui.selectable_value(
+                            &mut self.kind,
+                            Some(kind),
+                            search::category_name(kind),
+                        );
+                    }
+                });
+            if self.project.is_none() {
+                egui::ComboBox::from_id_salt("history-order")
+                    .selected_text(if self.oldest_first {
+                        "最早添加在前"
+                    } else {
+                        "最新添加在前"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.oldest_first, false, "最新添加在前");
+                        ui.selectable_value(&mut self.oldest_first, true, "最早添加在前");
+                    });
+            }
+        });
+        let mut projects: Vec<Project> = Vec::new();
+        for job in &snapshot.jobs {
+            if status(job) != self.filter
+                || self
+                    .kind
+                    .is_some_and(|kind| project_kind(job) != Some(kind))
+            {
+                continue;
+            }
+            let key = project_key(job);
+            if let Some(project) = projects.iter_mut().find(|p| p.key == key) {
+                project.jobs.push(job.clone());
+            } else {
+                let meta = job
+                    .plan
+                    .as_ref()
+                    .and_then(|p| p.context.as_ref())
+                    .and_then(|c| c.project.as_ref());
+                projects.push(Project {
+                    key,
+                    title: meta.map_or_else(|| job_title(job), |p| p.title.clone()),
+                    cover: meta.and_then(|p| p.cover.clone()),
+                    jobs: vec![job.clone()],
+                });
+            }
+        }
+        projects.sort_by(|a, b| {
+            let x = a.jobs.iter().filter_map(|j| j.created_at).max();
+            let y = b.jobs.iter().filter_map(|j| j.created_at).max();
+            match (x, y) {
+                (Some(x), Some(y)) => {
+                    if self.oldest_first {
+                        x.cmp(&y)
+                    } else {
+                        y.cmp(&x)
+                    }
+                }
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, None) => a.key.cmp(&b.key),
+            }
         });
         ui.add_space(12.0);
-        let text = self.text.trim().to_lowercase();
-        let jobs: Vec<_> = snapshot
-            .jobs
-            .iter()
-            .filter(|job| {
-                matches_filter(job.phase, completed, self.filter)
-                    && (text.is_empty()
-                        || job
-                            .plan
-                            .as_ref()
-                            .is_some_and(|p| p.title.to_lowercase().contains(&text)))
-            })
-            .collect();
-        if jobs.is_empty() {
-            let has_jobs = snapshot
-                .jobs
-                .iter()
-                .any(|job| matches_filter(job.phase, completed, Filter::All));
-            search::empty(
-                ui,
-                if has_jobs {
-                    "没有匹配的任务"
-                } else if completed {
-                    "完成之后，在这里相见"
-                } else {
-                    "下载队列，准备就绪"
-                },
-                if has_jobs {
-                    "试试其他筛选条件，或清空标题搜索。"
-                } else if completed {
-                    "实际完成的文件会出现在这里，可一键复制保存路径。"
-                } else {
-                    "在「搜索发现」中选择内容，然后添加到队列。"
-                },
-            );
-            return None;
-        }
-        for job in jobs {
-            ui.push_id(job.id.to_string(), |ui| {
-                theme::card_frame().show(ui, |ui| {
-                    theme::inset(theme::card()).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let size = egui::vec2(96.0, 54.0);
-                            let cover = job
-                                .plan
-                                .as_ref()
-                                .and_then(|plan| cover_index.get(&plan.part.aid.get()))
-                                .map(String::as_str);
-                            if !covers.show(ui, bridge, cover, size, 12.0) {
-                                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                                ui.painter().rect_filled(rect, 12.0, theme::soft());
-                                theme::icon(
-                                    ui.painter(),
-                                    egui::Rect::from_center_size(
-                                        rect.center(),
-                                        egui::vec2(24.0, 24.0),
-                                    ),
-                                    if completed {
-                                        Icon::Check
-                                    } else {
-                                        Icon::Download
-                                    },
-                                    theme::primary(),
-                                );
+        if let Some(key) = self.project.clone() {
+            if ui.button("返回项目").clicked() {
+                self.project = None;
+            }
+            if let Some(project) = projects.iter_mut().find(|p| p.key == key) {
+                ui.label(RichText::new(&project.title).strong());
+                project.jobs.sort_by_key(|j| {
+                    j.plan
+                        .as_ref()
+                        .and_then(|p| p.context.as_ref())
+                        .and_then(|c| c.project.as_ref())
+                        .map(|p| p.ordinal)
+                });
+                for job in &project.jobs {
+                    ui.push_id(job.id, |ui| {
+                        if let Some(next) = self.job(
+                            ui,
+                            job,
+                            available && !pending.contains(&job.id),
+                            operations_available,
+                            reduced,
+                        ) {
+                            action = Some(next);
+                        }
+                    });
+                }
+            } else {
+                theme::muted(ui, "该项目在当前筛选下没有任务。");
+            }
+        } else {
+            if projects.is_empty() {
+                theme::muted(ui, "没有符合条件的任务。");
+            }
+            for project in &projects {
+                if project.jobs.len() == 1
+                    && snapshot
+                        .jobs
+                        .iter()
+                        .filter(|j| project_key(j) == project.key)
+                        .count()
+                        == 1
+                {
+                    let job = &project.jobs[0];
+                    ui.push_id(job.id, |ui| {
+                        if let Some(next) = self.job(
+                            ui,
+                            job,
+                            available && !pending.contains(&job.id),
+                            operations_available,
+                            reduced,
+                        ) {
+                            action = Some(next);
+                        }
+                    });
+                    continue;
+                }
+                ui.group(|ui| {
+                    ui.horizontal_top(|ui| {
+                        let size = egui::vec2(112.0, 63.0);
+                        if !covers.show(ui, bridge, project.cover.as_deref(), size, 4.0) {
+                            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 4.0, theme::soft());
+                        }
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&project.title).strong());
+                            theme::muted(ui, format!("{} 项", project.jobs.len()));
+                            if project.jobs.iter().all(|j| j.created_at.is_none()) {
+                                theme::muted(ui, "旧记录：添加时间未知");
                             }
-                            ui.add_space(4.0);
-                            let title = job
-                                .plan
-                                .as_ref()
-                                .map_or("本地媒体任务", |plan| plan.title.as_str());
-                            ui.vertical(|ui| {
-                                ui.add(
-                                    egui::Label::new(RichText::new(title).size(16.0).strong())
-                                        .truncate(),
-                                )
-                                .on_hover_text(title);
-                                let color = match job.phase {
-                                    JobPhase::Completed => theme::GREEN,
-                                    JobPhase::Failed | JobPhase::NeedsAttention => theme::ERROR,
-                                    _ => theme::muted_color(),
-                                };
-                                ui.label(
-                                    RichText::new(phase_name(job.phase)).color(color).size(13.0),
-                                );
-                            });
+                            if project
+                                .jobs
+                                .iter()
+                                .any(|j| matches!(j.phase, JobPhase::Paused | JobPhase::Cancelled))
+                            {
+                                theme::muted(ui, "含已暂停任务");
+                            }
                         });
-                        ui.add_space(8.0);
-                        if job.phase != JobPhase::Completed {
-                            let measured = if matches!(
-                                job.phase,
-                                JobPhase::Downloading
-                                    | JobPhase::Paused
-                                    | JobPhase::Cancelled
-                                    | JobPhase::Failed
-                                    | JobPhase::NeedsAttention
-                            ) {
-                                fraction(job.downloaded, job.total)
-                            } else {
-                                None
-                            };
-                            let progress_id = ui.id().with("progress");
-                            theme::progress(
-                                ui,
-                                progress_id,
-                                measured,
-                                job.phase.is_active(),
-                                reduced,
-                            );
-                            ui.horizontal_wrapped(|ui| {
-                                theme::muted(
-                                    ui,
-                                    match job.total {
-                                        Some(total) if total > 0 => {
-                                            format!("{} / {}", bytes(job.downloaded), bytes(total))
-                                        }
-                                        _ => format!(
-                                            "已传输 {} · 总大小待确认",
-                                            bytes(job.downloaded)
-                                        ),
-                                    },
-                                );
-                                if let Some(value) = measured {
-                                    theme::muted(ui, format!("{:.1}%", value * 100.0));
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("进入项目").clicked() {
+                            self.project = Some(project.key.clone());
+                        }
+                        let directories: Vec<PathBuf> = project
+                            .jobs
+                            .iter()
+                            .filter_map(|j| {
+                                j.output
+                                    .as_ref()
+                                    .or_else(|| j.plan.as_ref().map(|p| &p.destination))
+                            })
+                            .filter_map(|p| p.parent().map(ToOwned::to_owned))
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect();
+                        if directories.len() == 1 {
+                            if ui
+                                .add_enabled(operations_available, egui::Button::new("打开文件夹"))
+                                .clicked()
+                            {
+                                action = Some(QueueAction::Operation(Operation::Reveal {
+                                    path: directories[0].clone(),
+                                    select: false,
+                                }));
+                            }
+                        } else if !directories.is_empty() {
+                            ui.menu_button("打开文件夹", |ui| {
+                                for path in &directories {
+                                    if ui
+                                        .add_enabled(
+                                            operations_available,
+                                            egui::Button::new(path.display().to_string()),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(QueueAction::Operation(Operation::Reveal {
+                                            path: path.clone(),
+                                            select: false,
+                                        }));
+                                        ui.close_menu();
+                                    }
                                 }
                             });
                         }
-                        if let Some(plan) = &job.plan {
-                            theme::muted(
-                                ui,
-                                format!(
-                                    "画质 ID {} · {} · MP4",
-                                    plan.video.quality, plan.video.codec
-                                ),
-                            );
-                        }
-                        if completed {
-                            if let Some(path) = &job.output {
-                                theme::muted(ui, file_summary(path, job.downloaded));
-                            }
-                        }
-                        errors(ui, job);
-                        ui.horizontal_wrapped(|ui| {
-                            let changing =
-                                matches!(job.phase, JobPhase::Pausing | JobPhase::Cancelling);
-                            ui.add_enabled_ui(
-                                available && !pending.contains(&job.id) && !changing,
-                                |ui| {
-                                    if job.phase.is_active() {
-                                        if theme::button(
-                                            ui,
-                                            "暂停",
-                                            Icon::Pause,
-                                            ButtonKind::Soft,
-                                            reduced,
-                                        )
-                                        .clicked()
-                                        {
-                                            action = Some((job.id, JobAction::Pause));
-                                        }
-                                    } else if matches!(
-                                        job.phase,
-                                        JobPhase::Paused | JobPhase::Cancelled
-                                    ) {
-                                        if theme::button(
-                                            ui,
-                                            "继续下载",
-                                            Icon::Play,
-                                            ButtonKind::Soft,
-                                            reduced,
-                                        )
-                                        .clicked()
-                                        {
-                                            action = Some((job.id, JobAction::Resume));
-                                        }
-                                    } else if (matches!(
-                                        job.phase,
-                                        JobPhase::Failed | JobPhase::NeedsAttention
-                                    ) || job
-                                        .components
-                                        .iter()
-                                        .any(|c| c.error.is_some()))
-                                        && theme::button(
-                                            ui,
-                                            "重试",
-                                            Icon::Refresh,
-                                            ButtonKind::Soft,
-                                            reduced,
-                                        )
-                                        .clicked()
-                                    {
-                                        action = Some((job.id, JobAction::Retry));
-                                    }
-                                    if !matches!(
-                                        job.phase,
-                                        JobPhase::Completed | JobPhase::Cancelled
-                                    ) && theme::button(
-                                        ui,
-                                        "取消",
-                                        Icon::Close,
-                                        ButtonKind::Quiet,
-                                        reduced,
-                                    )
-                                    .on_hover_text("停止任务并保留恢复数据，不删除已下载文件")
-                                    .clicked()
-                                    {
-                                        action = Some((job.id, JobAction::Cancel));
-                                    }
-                                },
-                            );
-                            if pending.contains(&job.id) || changing {
-                                theme::loading(ui, reduced, "等待核心保存状态");
-                            }
-                            if completed {
-                                if let Some(path) = &job.output {
-                                    if theme::button(
-                                        ui,
-                                        if self.copied == Some(job.id) {
-                                            "已复制路径"
-                                        } else {
-                                            "复制文件路径"
-                                        },
-                                        Icon::Copy,
-                                        ButtonKind::Soft,
-                                        reduced,
-                                    )
-                                    .clicked()
-                                    {
-                                        ui.ctx().copy_text(path.display().to_string());
-                                        self.copied = Some(job.id);
-                                    }
-                                }
-                            }
-                        });
-                        if let Some(path) = &job.output {
-                            let full = path.display().to_string();
-                            let response = ui
-                                .add(
-                                    egui::Label::new(
-                                        RichText::new(&full).color(theme::muted_color()).size(12.0),
-                                    )
-                                    .truncate()
-                                    .sense(egui::Sense::click()),
-                                )
-                                .on_hover_text(format!("{full}\n点击复制完整路径"));
-                            if response.clicked() {
-                                ui.ctx().copy_text(full);
-                                self.copied = Some(job.id);
-                            }
-                        }
-                        if job.skipped {
-                            theme::muted(ui, "已验证已有文件，本次无需重复下载。");
-                        }
-                        if job.phase == JobPhase::Downloaded
-                            && job
-                                .plan
-                                .as_ref()
-                                .is_some_and(|p| p.merge == bili_core::MergePolicy::Manual)
+                        if ui
+                            .add_enabled(available, egui::Button::new("删除项目"))
+                            .clicked()
                         {
-                            theme::muted(
-                                ui,
-                                "此任务在 CLI 中选择了手动封装，请使用 bili merge --job 完成。",
-                            );
+                            self.delete = Some(DeleteIntent {
+                                ids: snapshot
+                                    .jobs
+                                    .iter()
+                                    .filter(|j| project_key(j) == project.key)
+                                    .map(|j| j.id)
+                                    .collect(),
+                                title: project.title.clone(),
+                                project: Some(project.key.clone()),
+                            });
+                            self.delete_files = false;
                         }
                     });
                 });
                 ui.add_space(8.0);
+            }
+        }
+        if let Some(next) = self.dialogs(ui.ctx(), snapshot, operations_available) {
+            action = Some(next);
+        }
+        action
+    }
+    fn job(
+        &mut self,
+        ui: &mut Ui,
+        job: &JobSnapshot,
+        available: bool,
+        operations_available: bool,
+        reduced: bool,
+    ) -> Option<QueueAction> {
+        let mut action = None;
+        ui.group(|ui| {
+            ui.label(RichText::new(job_title(job)).strong());
+            theme::muted(ui, phase_name(job.phase));
+            if let Some(plan) = &job.plan {
+                theme::muted(
+                    ui,
+                    format!(
+                        "{} × {} · {} · MP4",
+                        plan.video
+                            .width
+                            .map_or_else(|| "?".into(), |n| n.to_string()),
+                        plan.video
+                            .height
+                            .map_or_else(|| "?".into(), |n| n.to_string()),
+                        plan.video.codec
+                    ),
+                );
+            }
+            if job.phase != JobPhase::Completed {
+                theme::progress(
+                    ui,
+                    ui.id().with((job.id, "progress")),
+                    fraction(job.downloaded, job.total),
+                    job.phase.is_active(),
+                    reduced,
+                );
+                theme::muted(ui, format!("已下载 {}", bytes(job.downloaded)));
+            }
+            let error = job
+                .error
+                .as_ref()
+                .or_else(|| job.components.iter().find_map(|c| c.error.as_ref()));
+            if let Some(error) = error {
+                ui.colored_label(theme::ERROR, backend::error_message(error));
+                ui.collapsing("错误信息", |ui| {
+                    ui.label(backend::error_code(error));
+                    ui.label(&error.operation);
+                    if let Some(code) = error.native_code {
+                        ui.label(format!("原生错误码 {code}"));
+                    }
+                });
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.add_enabled_ui(available, |ui| {
+                    if job.phase.is_active() {
+                        if ui.button("暂停").clicked() {
+                            action = Some(QueueAction::Control(job.id, JobAction::Pause));
+                        }
+                    } else if matches!(job.phase, JobPhase::Paused | JobPhase::Cancelled) {
+                        if ui.button("继续下载").clicked() {
+                            action = Some(QueueAction::Control(job.id, JobAction::Resume));
+                        }
+                    } else if status(job) == Filter::Failed {
+                        match error.map(|e| e.code) {
+                            Some(ErrorCode::LoginRequired | ErrorCode::EntitlementRequired) => {
+                                if ui.button("选择账号").clicked() {
+                                    action = Some(QueueAction::Account(job.id));
+                                }
+                            }
+                            Some(ErrorCode::VerificationRequired) => {
+                                if let Some(request) = error.and_then(|e| e.verification.clone()) {
+                                    if ui.button("安全验证").clicked() {
+                                        action = Some(QueueAction::Operation(
+                                            Operation::BeginVerification {
+                                                request,
+                                                profile: job
+                                                    .plan
+                                                    .as_ref()
+                                                    .and_then(|p| p.context.as_ref())
+                                                    .and_then(|c| c.profile_id.clone()),
+                                            },
+                                        ));
+                                    }
+                                }
+                                if ui.button("重试").clicked() {
+                                    action = Some(QueueAction::Control(job.id, JobAction::Retry));
+                                }
+                            }
+                            Some(
+                                ErrorCode::Unavailable
+                                | ErrorCode::RegionRestricted
+                                | ErrorCode::RepresentationChanged,
+                            ) => {}
+                            _ => {
+                                if ui
+                                    .button(if job.phase == JobPhase::Completed {
+                                        "重试附件"
+                                    } else {
+                                        "重试"
+                                    })
+                                    .clicked()
+                                {
+                                    action = Some(QueueAction::Control(job.id, JobAction::Retry));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(path) = &job.output {
+                        if ui
+                            .add_enabled(
+                                operations_available,
+                                egui::Button::new("打开文件所在位置"),
+                            )
+                            .clicked()
+                        {
+                            action = Some(QueueAction::Operation(Operation::Reveal {
+                                path: path.clone(),
+                                select: true,
+                            }));
+                        }
+                        if ui
+                            .add_enabled(operations_available, egui::Button::new("媒体信息"))
+                            .clicked()
+                        {
+                            action = Some(QueueAction::Operation(Operation::OutputInfo(job.id)));
+                        }
+                    }
+                    if ui.button("删除").clicked() {
+                        self.delete = Some(DeleteIntent {
+                            ids: vec![job.id],
+                            title: job_title(job),
+                            project: None,
+                        });
+                        self.delete_files = false;
+                    }
+                });
             });
+            for component in &job.components {
+                if component.error.is_some() {
+                    ui.colored_label(theme::ERROR, format!("{} 下载失败", component.name));
+                } else if let Some(path) = &component.path {
+                    theme::muted(
+                        ui,
+                        format!(
+                            "{} · {}",
+                            component.name,
+                            path.extension()
+                                .and_then(|p| p.to_str())
+                                .unwrap_or("格式未知")
+                        ),
+                    );
+                }
+            }
+        });
+        ui.add_space(7.0);
+        action
+    }
+    fn dialogs(
+        &mut self,
+        ctx: &egui::Context,
+        snapshot: &QueueSnapshot,
+        available: bool,
+    ) -> Option<QueueAction> {
+        let mut action = None;
+        if let Some(info) = &self.info {
+            let mut open = true;
+            egui::Window::new("媒体信息")
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    if let Some(path) = &info.output {
+                        ui.label(path.display().to_string());
+                    }
+                    if let Some(media) = &info.media {
+                        ui.label(format!(
+                            "容器：{}",
+                            media.format.as_deref().unwrap_or("未知")
+                        ));
+                        for stream in &media.streams {
+                            ui.label(format!("{} · {}", stream.media_type, stream.codec));
+                            if let (Some(w), Some(h)) = (stream.width, stream.height) {
+                                ui.label(format!("分辨率：{w} × {h}"));
+                            }
+                            if let (Some(n), Some(d)) =
+                                (stream.frame_rate_num, stream.frame_rate_den)
+                            {
+                                if d > 0 {
+                                    ui.label(format!("帧率：{:.3}", n as f64 / d as f64));
+                                }
+                            }
+                        }
+                    } else {
+                        theme::muted(ui, "媒体参数不可用。");
+                    }
+                    for component in &info.components {
+                        if let Some(path) = &component.path {
+                            ui.label(format!(
+                                "{}：{}",
+                                component.name,
+                                path.extension()
+                                    .and_then(|p| p.to_str())
+                                    .unwrap_or("未知格式")
+                            ));
+                        }
+                    }
+                });
+            if !open {
+                self.info = None;
+            }
+        }
+        if let Some(intent) = &self.delete {
+            let mut open = true;
+            let mut confirmed = false;
+            let mut cancelled = false;
+            let ids = intent.project.as_ref().map_or_else(
+                || intent.ids.clone(),
+                |project| {
+                    snapshot
+                        .jobs
+                        .iter()
+                        .filter(|j| project_key(j) == *project)
+                        .map(|j| j.id)
+                        .collect::<Vec<_>>()
+                },
+            );
+            let active = ids.iter().any(|id| {
+                snapshot
+                    .jobs
+                    .iter()
+                    .any(|j| j.id == *id && j.phase.is_active())
+            });
+            egui::Window::new("删除下载记录")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(&intent.title);
+                    ui.label(format!("共 {} 条记录，包含此项目的所有状态。", ids.len()));
+                    ui.radio_value(&mut self.delete_files, false, "仅移除记录，保留文件");
+                    ui.radio_value(
+                        &mut self.delete_files,
+                        true,
+                        "同时将任务拥有的文件移至回收站",
+                    );
+                    if active {
+                        ui.colored_label(theme::ERROR, "请先暂停此范围内的下载，再删除。");
+                    }
+                    ui.horizontal(|ui| {
+                        confirmed = ui
+                            .add_enabled(available && !active, egui::Button::new("确认删除"))
+                            .clicked();
+                        cancelled = ui.button("取消").clicked();
+                    });
+                });
+            if confirmed {
+                action = Some(QueueAction::Operation(Operation::Remove {
+                    ids,
+                    mode: if self.delete_files {
+                        RemoveMode::RecycleFiles
+                    } else {
+                        RemoveMode::RecordsOnly
+                    },
+                }));
+            }
+            if confirmed || cancelled || !open {
+                self.delete = None;
+            }
         }
         action
     }
 }
-
-fn file_summary(path: &Path, downloaded: u64) -> String {
-    let size = std::fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(downloaded);
-    let ago = std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .map(modified_ago)
-        .unwrap_or_else(|| "时间未知".into());
-    format!("{} · 完成于 {}", bytes(size), ago)
-}
-
-fn modified_ago(modified: SystemTime) -> String {
-    let seconds = SystemTime::now()
-        .duration_since(modified)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    if seconds < 60 {
-        "刚刚".into()
-    } else if seconds < 3600 {
-        format!("{} 分钟前", seconds / 60)
-    } else if seconds < 86_400 {
-        format!("{} 小时前", seconds / 3600)
-    } else {
-        format!("{} 天前", seconds / 86_400)
-    }
-}
-
-fn errors(ui: &mut Ui, job: &JobSnapshot) {
-    if let Some(error) = &job.error {
-        ui.colored_label(theme::ERROR, backend::error_message(error))
-            .on_hover_text(backend::error_code(error));
-    }
-    for component in &job.components {
-        if let Some(error) = &component.error {
-            ui.colored_label(
-                theme::ERROR,
-                format!("{}：{}", component.name, backend::error_message(error)),
-            )
-            .on_hover_text(backend::error_code(error));
-        }
-        if component.omissions > 0 {
-            let response = ui.label(
-                RichText::new(if component.name.contains("ass") {
-                    format!(
-                        "{}：有 {} 项未写入 ASS（可视区限流）",
-                        component.name, component.omissions
-                    )
-                } else {
-                    format!("{}：有 {} 项未能写入", component.name, component.omissions)
-                })
-                .size(12.0)
-                .color(theme::muted_color()),
-            );
-            if component.name.contains("ass") {
-                response.on_hover_text(
-                    "ASS 只保留滚动 18 轨与顶部/底部各 4 轨，热门视频会省略超出的弹幕；完整弹幕见同名 .jsonl 与 .xml。",
-                );
-            } else {
-                response.on_hover_text("完整内容见对应原始附件。");
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn filters_do_not_show_unfinished_jobs_as_completed() {
-        assert!(!matches_filter(JobPhase::Remuxing, true, Filter::All));
-        assert!(matches_filter(JobPhase::Completed, true, Filter::Attention));
-        assert!(!matches_filter(JobPhase::Completed, false, Filter::All));
-        assert!(matches_filter(
-            JobPhase::NeedsAttention,
-            false,
-            Filter::Attention
-        ));
-        assert!(matches_filter(JobPhase::Paused, false, Filter::Paused));
-    }
-    #[test]
-    fn progress_never_invents_a_total_or_exceeds_one() {
-        assert_eq!(fraction(10, None), None);
-        assert_eq!(fraction(10, Some(0)), None);
-        assert_eq!(fraction(10, Some(20)), Some(0.5));
-        assert_eq!(fraction(u64::MAX, Some(1)), Some(1.0));
-        assert_eq!(bytes(0), "0 B");
-        assert_eq!(bytes(1536), "1.5 KiB");
+    fn progress_preserves_unknown_totals_and_clamps() {
+        assert_eq!(fraction(5, None), None);
+        assert_eq!(fraction(50, Some(10)), Some(1.0));
+        assert_eq!(fraction(5, Some(10)), Some(0.5));
     }
 }

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; style-src 'unsafe-inline' https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; img-src data: blob: https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; connect-src https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; frame-src https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; base-uri 'none'; form-action 'none'">
+<title>安全验证</title>
+<style>body{margin:16px;font:14px system-ui,sans-serif}#captcha{margin-top:16px}</style>
+<p id="status" role="status">正在加载验证码…</p>
+<div id="captcha"></div>
+<script>
+const config=__CAPTCHA_CONFIG__;
+const send=(type,result)=>window.ipc.postMessage(JSON.stringify({type,nonce:config.nonce,result}));
+function start(){
+  initGeetest({gt:config.gt,challenge:config.challenge,offline:false,new_captcha:true,product:'float',https:true,width:'100%'},function(captcha){
+    captcha.appendTo('#captcha');
+    captcha.onReady(function(){document.getElementById('status').textContent='请完成验证';});
+    captcha.onSuccess(function(){send('proof',captcha.getValidate());});
+    captcha.onError(function(){send('error');});
+    captcha.onClose(function(){send('cancel');});
+  });
+}
+</script>
+<script src="https://static.geetest.com/static/js/gt.0.5.0.js" onload="start()" onerror="send('error')"></script>
+</html>
