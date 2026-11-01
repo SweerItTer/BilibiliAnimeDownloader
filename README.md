@@ -26,7 +26,7 @@ Replace `KEYWORD` with a search term and `VIDEO_ID` with an ID from the results 
 
 `qualities` inspects one part without starting a download; use `--part 3` to inspect its original part number 3. Select a listed Quality ID with `download VIDEO_ID --quality QUALITY_ID`; dimensions and Stream IDs are different values. Use `--parts 1,3-5` to choose download parts. Current source also provides `download VIDEO_ID --list-resolutions` for a multi-part catalog; Alpha 6 does not. Add `--json` for machine-readable output. On Windows source builds, use `.\bili.exe` in PowerShell with the same arguments.
 
-The CLI prints completed file paths. It does not install or launch a video player. Continue with the [full CLI guide](CLI.md), or run `./bin/bili download --help` for a command's options.
+The CLI prints completed file paths. It does not install or launch a video player. Continue with the [full CLI guide](CLI.md), or run `./bin/bili download --help` for a command's options. Source builds also support [video search sorting](CLI.md#search); the published Alpha 6 package does not.
 
 ## Checking and installing updates
 
@@ -56,7 +56,7 @@ Only download content you are authorized to save. The application does not bypas
 
 ## Limits and build
 
-Current source includes a native desktop GUI; the published Alpha still targets Linux x86_64 CLI, without Windows or GUI release assets. Aria2, verification WebView and corrupted-segment repair are not included. Stability, performance, and abnormal-exit recovery have not been fully qualified. FFmpeg is supplied as replaceable shared libraries; no FFmpeg executable or player is shipped or launched. The application is under the [MIT License with Commons Clause](LICENSE); FFmpeg and other third-party components have separate terms in the package notices.
+Current source includes a native desktop GUI and video search sorting; the published Alpha still targets Linux x86_64 CLI, without Windows or GUI release assets. Aria2, verification WebView and corrupted-segment repair are not included. Stability, performance, and abnormal-exit recovery have not been fully qualified. FFmpeg is supplied as replaceable shared libraries; no FFmpeg executable or player is shipped or launched. The application is under the [MIT License with Commons Clause](LICENSE); FFmpeg and other third-party components have separate terms in the package notices.
 
 See [BUILDING.md](BUILDING.md) for developer build requirements and commands.
 

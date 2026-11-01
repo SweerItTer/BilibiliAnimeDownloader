@@ -243,53 +243,10 @@ impl Api {
     }
 
     pub(crate) async fn search(&self, query: SearchQuery) -> Result<CandidatePage> {
-        if query.keyword.trim().is_empty()
-            || query.keyword.len() > 256
-            || query.page == 0
-            || query.page > 1000
-        {
-            return Err(invalid("invalid search query"));
-        }
-        let categories: &[(&str, SearchCategory)] = match query.category {
-            SearchCategory::All => &[
-                ("video", SearchCategory::Video),
-                ("media_bangumi", SearchCategory::Bangumi),
-                ("media_ft", SearchCategory::Film),
-            ],
-            SearchCategory::Video => &[("video", SearchCategory::Video)],
-            SearchCategory::Bangumi => &[("media_bangumi", SearchCategory::Bangumi)],
-            SearchCategory::Film => &[("media_ft", SearchCategory::Film)],
-        };
-        let futures = categories.iter().map(|(kind, category)| {
-            let kind = *kind;
-            let category = *category;
-            let keyword = query.keyword.as_str();
-            let page = query.page;
-            async move {
-                let url = api_url(
-                    "/x/web-interface/search/type",
-                    &[
-                        ("search_type", kind.to_owned()),
-                        ("keyword", keyword.to_owned()),
-                        ("page", page.to_string()),
-                    ],
-                )?;
-                let value: Value = self
-                    .get_json(self.sign_wbi(url, &[]).await?, REFERER)
-                    .await?;
-                parse_search_page(category, page, &value)
-            }
-        });
-        let mut pages = futures_util::future::join_all(futures)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        let mut seen = HashSet::new();
-        for page in &mut pages {
-            page.items
-                .retain(|item| seen.insert(item.reference.clone()));
-        }
-        Ok(CandidatePage { pages })
+        search_pages(query, |url| async move {
+            self.get_json(self.sign_wbi(url, &[]).await?, REFERER).await
+        })
+        .await
     }
 
     pub(crate) async fn cover(&self, request: CoverRequest) -> Result<CoverBytes> {
@@ -610,6 +567,62 @@ impl Api {
         )
         .await
     }
+}
+
+/// The shared search request/response path. The private fetch boundary lets
+/// deterministic tests use loopback without changing production host policy.
+async fn search_pages<F, Response>(query: SearchQuery, fetch: F) -> Result<CandidatePage>
+where
+    F: Fn(Url) -> Response,
+    Response: std::future::Future<Output = Result<Value>>,
+{
+    query.validate()?;
+    let categories: &[(&str, SearchCategory)] = match query.category {
+        SearchCategory::All => &[
+            ("video", SearchCategory::Video),
+            ("media_bangumi", SearchCategory::Bangumi),
+            ("media_ft", SearchCategory::Film),
+        ],
+        SearchCategory::Video => &[("video", SearchCategory::Video)],
+        SearchCategory::Bangumi => &[("media_bangumi", SearchCategory::Bangumi)],
+        SearchCategory::Film => &[("media_ft", SearchCategory::Film)],
+    };
+    let futures = categories.iter().map(|(kind, category)| {
+        let fetch = &fetch;
+        let keyword = query.keyword.as_str();
+        let page = query.page;
+        let sort = query.sort;
+        async move {
+            let mut params = vec![
+                ("search_type", (*kind).to_owned()),
+                ("keyword", keyword.to_owned()),
+                ("page", page.to_string()),
+            ];
+            let order = match sort {
+                SearchSort::Relevance => None,
+                SearchSort::Views => Some("click"),
+                SearchSort::Newest => Some("pubdate"),
+                SearchSort::Danmaku => Some("dm"),
+                SearchSort::Favorites => Some("stow"),
+                SearchSort::Comments => Some("scores"),
+            };
+            if let Some(order) = order {
+                params.push(("order", order.to_owned()));
+            }
+            let value = fetch(api_url("/x/web-interface/search/type", &params)?).await?;
+            parse_search_page(*category, page, &value)
+        }
+    });
+    let mut pages = futures_util::future::join_all(futures)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let mut seen = HashSet::new();
+    for page in &mut pages {
+        page.items
+            .retain(|item| seen.insert(item.reference.clone()));
+    }
+    Ok(CandidatePage { pages })
 }
 
 async fn get_json_with<T: DeserializeOwned>(

@@ -1,6 +1,265 @@
 use super::*;
 use serde_json::json;
 
+async fn search_server(responses: Vec<Value>) -> (Url, tokio::task::JoinHandle<Vec<Url>>) {
+    let count = responses.len();
+    let mut responses = responses.into_iter();
+    search_server_with(count, move |_| responses.next().unwrap()).await
+}
+
+async fn search_server_with(
+    count: usize,
+    mut respond: impl FnMut(&Url) -> Value + Send + 'static,
+) -> (Url, tokio::task::JoinHandle<Vec<Url>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let origin = endpoint.clone();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for _ in 0..count {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buffer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(count > 0 && request.len() + count <= 8192);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let target = request
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap();
+            let url = origin.join(target).unwrap();
+            let response = respond(&url);
+            requests.push(url);
+            let body = serde_json::to_vec(&response).unwrap();
+            socket.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ).as_bytes(),
+            ).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+        }
+        requests
+    });
+    (endpoint, server)
+}
+
+async fn search_loopback(query: SearchQuery, endpoint: &Url) -> Result<CandidatePage> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    search_pages(query, |original| {
+        let mut url = endpoint.clone();
+        url.set_path(original.path());
+        url.set_query(original.query());
+        let client = &client;
+        async move {
+            client
+                .get(url)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .map_err(|_| invalid("fixture JSON"))
+        }
+    })
+    .await
+}
+
+fn video_search_page(page: u32, ids: &[u64]) -> Value {
+    json!({"code":0,"data":{
+        "page":page,"pagesize":2,"numPages":2,"numResults":4,
+        "result":ids.iter().map(|id| json!({"aid":id,"title":format!("Video {id}")})).collect::<Vec<_>>()
+    }})
+}
+
+#[tokio::test]
+async fn server_sorting_preserves_two_page_order_and_parameters() {
+    let choices = [
+        (SearchSort::Relevance, None),
+        (SearchSort::Views, Some("click")),
+        (SearchSort::Newest, Some("pubdate")),
+        (SearchSort::Danmaku, Some("dm")),
+        (SearchSort::Favorites, Some("stow")),
+        (SearchSort::Comments, Some("scores")),
+    ];
+    let responses = (0..choices.len() as u64)
+        .flat_map(|index| {
+            let base = index * 10 + 1;
+            [
+                video_search_page(1, &[base + 3, base]),
+                video_search_page(2, &[base + 2, base + 1]),
+            ]
+        })
+        .collect();
+    let (endpoint, server) = search_server(responses).await;
+    let mut actual = Vec::new();
+    for (sort, _) in choices {
+        for page in 1..=2 {
+            actual.push(
+                search_loopback(
+                    SearchQuery {
+                        keyword: "动画 A B".into(),
+                        category: SearchCategory::Video,
+                        page,
+                        sort,
+                    },
+                    &endpoint,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+    }
+    let requests = server.await.unwrap();
+    for (index, (sort, parameter)) in choices.into_iter().enumerate() {
+        let base = index as u64 * 10 + 1;
+        let mut ids = Vec::new();
+        for page in 1..=2 {
+            let position = index * 2 + page - 1;
+            let response = &actual[position].pages[0];
+            let params: std::collections::HashMap<_, _> =
+                requests[position].query_pairs().into_owned().collect();
+            assert_eq!(requests[position].path(), "/x/web-interface/search/type");
+            assert_eq!(params.get("search_type").map(String::as_str), Some("video"));
+            assert_eq!(params.get("keyword").map(String::as_str), Some("动画 A B"));
+            assert_eq!(params.get("page"), Some(&page.to_string()));
+            assert_eq!(
+                params.get("order").map(String::as_str),
+                parameter,
+                "{sort:?}"
+            );
+            assert_eq!(response.page, page as u32);
+            assert_eq!(response.category, SearchCategory::Video);
+            assert_eq!(response.total, Some(4));
+            assert_eq!(response.has_more, page == 1);
+            ids.extend(response.items.iter().map(|item| item.reference.clone()));
+        }
+        assert_eq!(
+            ids,
+            [base + 3, base, base + 2, base + 1].map(|id| ContentRef::Video(Aid::new(id).unwrap()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn default_mixed_search_preserves_category_pages_and_deduplication() {
+    let (endpoint, server) = search_server_with(3, |url| {
+        let kind = url.query_pairs().find(|(key, _)| key == "search_type").unwrap().1;
+        match kind.as_ref() {
+            "video" => video_search_page(1, &[9, 3]),
+            "media_bangumi" => json!({"code":0,"data":{"numPages":1,"numResults":1,"result":[{"season_id":7,"title":"Series"}]}}),
+            "media_ft" => json!({"code":0,"data":{"numPages":1,"numResults":2,"result":[{"season_id":7,"title":"Duplicate"},{"season_id":8,"title":"Film"}]}}),
+            _ => panic!("unexpected category"),
+        }
+    }).await;
+    let response = search_loopback(
+        SearchQuery {
+            keyword: "sample".into(),
+            category: SearchCategory::All,
+            page: 1,
+            sort: SearchSort::Relevance,
+        },
+        &endpoint,
+    )
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+    assert!(requests
+        .iter()
+        .all(|request| !request.query_pairs().any(|(key, _)| key == "order")));
+    assert_eq!(
+        response
+            .pages
+            .iter()
+            .map(|page| page.category)
+            .collect::<Vec<_>>(),
+        vec![
+            SearchCategory::Video,
+            SearchCategory::Bangumi,
+            SearchCategory::Film
+        ]
+    );
+    assert_eq!(
+        response
+            .pages
+            .iter()
+            .map(|page| page.items.len())
+            .collect::<Vec<_>>(),
+        vec![2, 1, 1]
+    );
+    assert_eq!(
+        response.pages[2].items[0].reference,
+        ContentRef::Bangumi(SeasonId::new(8).unwrap())
+    );
+}
+
+#[tokio::test]
+async fn sorted_empty_and_access_failures_are_not_conflated() {
+    let responses = vec![
+        json!({"code":0,"data":{"numPages":1,"numResults":0,"result":[]}}),
+        json!({"code":0,"data":{"v_voucher":"opaque"}}),
+        json!({"code":-101}),
+    ];
+    let (endpoint, server) = search_server(responses).await;
+    let query = SearchQuery {
+        keyword: "sample".into(),
+        category: SearchCategory::Video,
+        page: 1,
+        sort: SearchSort::Newest,
+    };
+    let empty = search_loopback(query.clone(), &endpoint).await.unwrap();
+    let challenge = search_loopback(query.clone(), &endpoint).await.unwrap_err();
+    let login = search_loopback(query, &endpoint).await.unwrap_err();
+    let _ = server.await.unwrap();
+    assert!(empty.pages[0].items.is_empty());
+    assert!(!empty.pages[0].has_more);
+    assert_eq!(challenge.code, ErrorCode::VerificationRequired);
+    assert_eq!(login.code, ErrorCode::LoginRequired);
+}
+
+#[tokio::test]
+async fn unsupported_sort_never_calls_the_fetch_boundary() {
+    for category in [
+        SearchCategory::All,
+        SearchCategory::Bangumi,
+        SearchCategory::Film,
+    ] {
+        for &sort in SearchSort::available_for(SearchCategory::Video)
+            .iter()
+            .skip(1)
+        {
+            let query = SearchQuery {
+                keyword: "sample".into(),
+                category,
+                page: 1,
+                sort,
+            };
+            let result = search_pages(query, |_| async {
+                panic!("invalid sort must fail before fetching or signing")
+            })
+            .await;
+            assert_eq!(result.unwrap_err().code, ErrorCode::InvalidInput);
+        }
+    }
+}
+
 #[test]
 fn accepts_only_strict_supported_identifier_forms() {
     assert!(matches!(

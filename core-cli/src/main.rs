@@ -449,22 +449,24 @@ async fn execute(core: &Core, cli: &Cli, config: &CoreConfig) -> Result<u8> {
             query,
             category,
             page,
+            sort,
             auth,
         } => {
-            authenticate(core, auth).await?;
             let category = match category {
                 Category::All => SearchCategory::All,
                 Category::Video => SearchCategory::Video,
                 Category::Bangumi => SearchCategory::Bangumi,
                 Category::Film => SearchCategory::Film,
             };
-            let results = core
-                .search(SearchQuery {
-                    keyword: query.clone(),
-                    category,
-                    page: *page,
-                })
-                .await?;
+            let query = SearchQuery {
+                keyword: query.clone(),
+                category,
+                page: *page,
+                sort: (*sort).into(),
+            };
+            query.validate()?;
+            authenticate(core, auth).await?;
+            let results = core.search(query).await?;
             output::result("search", &results, cli.json)?;
         }
         Command::Info { input, auth } => {
@@ -842,6 +844,55 @@ mod tests {
         assert!(!settings.update.check_updates);
         assert!(!settings.update.auto_update);
         assert!(serde_json::from_str::<Settings>(r#"{"unknown_field":1}"#).is_err());
+    }
+
+    #[test]
+    fn search_sort_arguments_forward_the_selected_core_value_and_page() {
+        for (argument, expected) in [
+            ("relevance", SearchSort::Relevance),
+            ("views", SearchSort::Views),
+            ("newest", SearchSort::Newest),
+            ("danmaku", SearchSort::Danmaku),
+            ("favorites", SearchSort::Favorites),
+            ("comments", SearchSort::Comments),
+        ] {
+            let cli = Cli::try_parse_from([
+                "bili", "search", "sample", "--type", "video", "--page", "2", "--sort", argument,
+            ])
+            .unwrap();
+            let Command::Search { sort, page, .. } = cli.command else {
+                panic!("search command")
+            };
+            assert_eq!(bili_core::SearchSort::from(sort), expected);
+            assert_eq!(page, 2);
+        }
+        let cli = Cli::try_parse_from(["bili", "search", "sample"]).unwrap();
+        let Command::Search { sort, .. } = cli.command else {
+            panic!("search command")
+        };
+        assert_eq!(bili_core::SearchSort::from(sort), SearchSort::Relevance);
+        assert!(Cli::try_parse_from(["bili", "search", "sample", "--sort", "random"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_search_sort_is_checked_before_stored_authentication() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = CoreConfig::new(root.path().join("state"), root.path().join("output"));
+        config.state_mode = StateMode::ReadOnly;
+        // MemoryOnly deliberately prevents even a regression from opening the
+        // user's OS keyring. Stored auth would fail instead of accessing it.
+        config.credential_store = bili_core::cookie::StorePolicy::MemoryOnly;
+        let core = Core::new(config.clone(), tokio::runtime::Handle::current()).unwrap();
+        let cli = Cli::try_parse_from([
+            "bili", "search", "sample", "--type", "film", "--sort", "newest", "--auth", "stored",
+        ])
+        .unwrap();
+        assert_eq!(
+            execute(&core, &cli, &config).await.unwrap_err().code,
+            ErrorCode::InvalidInput
+        );
+        core.shutdown(StopMode::Pause).await.unwrap();
+        assert!(!root.path().join("state").exists());
     }
 
     fn part(ordinal: u32) -> Part {

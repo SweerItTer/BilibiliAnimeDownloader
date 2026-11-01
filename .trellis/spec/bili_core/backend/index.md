@@ -11,6 +11,7 @@
 | [Directory structure](./directory-structure.md) | Public library boundary, private adapters, module ownership and supervised lifetime |
 | [Durable state](./database-guidelines.md) | OS writer ownership, immutable checkpoint versions, resource-offset authority and no-clobber output promotion |
 | [Error handling](./error-handling.md) | Typed safe failures, strict selection, cancellation and explicit partial component results |
+| [Search sorting](./search-sorting.md) | Shared typed category/order support, pre-auth validation, source paging and shell contracts |
 | [Quality guidelines](./quality-guidelines.md) | Behavioral tests, source-built shared FFmpeg, stream preservation and no competing implementations |
 | [Logging guidelines](./logging-guidelines.md) | Credential-free diagnostics, bounded events and truthful progress |
 | [Update protocol](./update-protocol.md) | Shared static HTTPS discovery, release descriptor, identity checks, install layout and verification limits; shells must not reimplement either |

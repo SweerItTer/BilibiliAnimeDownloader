@@ -29,6 +29,9 @@ pub enum Command {
         category: Category,
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
+        /// Server-side order; non-default choices require --type video.
+        #[arg(long, value_enum, default_value = "relevance")]
+        sort: SearchSort,
         #[command(flatten)]
         auth: AuthOptions,
     },
@@ -141,6 +144,27 @@ pub enum Category {
     Video,
     Bangumi,
     Film,
+}
+#[derive(Clone, Copy, ValueEnum)]
+pub enum SearchSort {
+    Relevance,
+    Views,
+    Newest,
+    Danmaku,
+    Favorites,
+    Comments,
+}
+impl From<SearchSort> for bili_core::SearchSort {
+    fn from(sort: SearchSort) -> Self {
+        match sort {
+            SearchSort::Relevance => Self::Relevance,
+            SearchSort::Views => Self::Views,
+            SearchSort::Newest => Self::Newest,
+            SearchSort::Danmaku => Self::Danmaku,
+            SearchSort::Favorites => Self::Favorites,
+            SearchSort::Comments => Self::Comments,
+        }
+    }
 }
 #[derive(Clone, Copy, ValueEnum)]
 pub enum MergeMode {

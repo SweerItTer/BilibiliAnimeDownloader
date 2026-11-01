@@ -2,7 +2,7 @@
 
 English | [简体中文](CLI.zh-CN.md) | [Project overview](README.md)
 
-This guide describes the current source version of `bili`. The published [v2.0.0-alpha.6](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.6) is a Linux x86_64 CLI package and does **not** have `update` or `download --list-resolutions`. Use its `qualities` command to inspect one part. Windows and native GUI builds are available from source/CI, not as assets of that release. Build instructions belong in [BUILDING.md](BUILDING.md).
+This guide describes the current source version of `bili`. The published [v2.0.0-alpha.6](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.6) is a Linux x86_64 CLI package and does **not** have `update`, `download --list-resolutions`, or `search --sort`. Use its `qualities` command to inspect one part. Windows and native GUI builds are available from source/CI, not as assets of that release. Build instructions belong in [BUILDING.md](BUILDING.md).
 
 Go to: [invocation](#invocation), [first download](#first-download), [commands](#commands), [search](#search), [quality and parts](#quality), [login](#login), [download options](#download-options), [resume](#resume), [merge](#merge), [cleanup](#cleanup), [configuration](#configuration), [updates](#updates), [output and errors](#output).
 
@@ -60,7 +60,7 @@ Square brackets below mean optional arguments, and `INPUT...` means one or more 
 
 | Command | Purpose and command-specific options |
 |---|---|
-| `search QUERY` | Search by keyword; `--type all\|video\|bangumi\|film`, `--page N`, authentication options |
+| `search QUERY` | Search by keyword; `--type all\|video\|bangumi\|film`, `--page N`, `--sort ORDER`, authentication options |
 | `info INPUT` | Resolve content and list its parts/episodes; authentication options |
 | `qualities INPUT` | Inspect one part's quality catalog; `--part N`, authentication options |
 | `download INPUT...` | Download selected parts; all [download options](#download-options) below |
@@ -80,14 +80,27 @@ Square brackets below mean optional arguments, and `INPUT...` means one or more 
 Authentication options are `--auth MODE` and explicit `--remember`; they apply to `search`, `info`, `qualities`, `download` and `resume`, not to every command.
 
 <a id="search"></a>
-## Search
+## Search and sorting
 
-`--type` defaults to `all` and `--page` to `1`. Pages are numbered 1–1000. Queries must be nonempty and at most 256 UTF-8 bytes. The `all` type returns separate video, bangumi and film category pages; it is not one globally ranked list.
+`--type` defaults to `all`, `--page` to `1`, and `--sort` to `relevance`. Pages are numbered 1–1000. Queries must be nonempty and at most 256 UTF-8 bytes. The `all` type returns separate video, bangumi and film category pages; it is not one globally ranked list.
+
+Current source supports these video sort orders:
+
+| `--sort` | Order |
+|---|---|
+| `relevance` | Existing server default; valid with every type |
+| `views` | Most views |
+| `newest` | Newest publication |
+| `danmaku` | Most danmaku |
+| `favorites` | Most favorites |
+| `comments` | Most comments |
 
 ```sh
-./bin/bili search "KEYWORD" --type video --page 1 --auth anonymous
-./bin/bili search "KEYWORD" --type video --page 2 --auth anonymous
+./bin/bili search "KEYWORD" --type video --sort newest --page 1 --auth anonymous
+./bin/bili search "KEYWORD" --type video --sort newest --page 2 --auth anonymous
 ```
+
+Non-default sorting requires `--type video`. Combining it with `all`, `bangumi` or `film` is an error, rather than silently falling back. Results retain server order and pagination; the application does not sort only the current page. Live public-service sorting behavior has not been verified.
 
 <a id="quality"></a>
 ## Choose parts and quality
@@ -294,4 +307,4 @@ With `update.check_updates` enabled (default), interactive search/info/qualities
 
 A batch reports each result and returns the highest relevant exit code. Video success with a failed subtitle/danmaku component is still nonzero. Use `resume JOB_ID` to retry after correcting access/network/storage problems. For `Busy`, stop the other writer using that state directory; for missing jobs, check `--config`, `--state-dir` and your working directory. For `unknown argument`, inspect `--version` and that binary's `--help` before using a newer source-only option. Native loader/startup problems need the complete package, not an `ffmpeg` installation; build troubleshooting is in [BUILDING.md](BUILDING.md).
 
-Recovery and throughput are not fully qualified across all supported systems. Aria2, precise damaged-segment repair and challenge WebView are not current CLI capabilities. The app uses the [MIT License with Commons Clause](LICENSE); FFmpeg remains separately LGPL-2.1-or-later with the package's matching notices and source materials.
+Recovery, throughput and public-service sorting are not fully qualified across all supported systems. Aria2, precise damaged-segment repair and challenge WebView are not current CLI capabilities. The app uses the [MIT License with Commons Clause](LICENSE); FFmpeg remains separately LGPL-2.1-or-later with the package's matching notices and source materials.

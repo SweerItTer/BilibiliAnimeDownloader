@@ -2,7 +2,7 @@
 
 [English](CLI.md) | 简体中文 | [项目首页](README.zh-CN.md)
 
-本指南对应当前源码中的 `bili`。已发布的 [v2.0.0-alpha.6](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.6) 是 Linux x86_64 CLI 软件包，**没有** `update` 和 `download --list-resolutions`，可用 `qualities` 查询单个分 P。Windows 和原生 GUI 可从源码或 CI 构建获取，不是该版本的发布资产。开发构建方法见 [BUILDING.md](BUILDING.md)。
+本指南对应当前源码中的 `bili`。已发布的 [v2.0.0-alpha.6](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.6) 是 Linux x86_64 CLI 软件包，**没有** `update`、`download --list-resolutions` 和 `search --sort`，可用 `qualities` 查询单个分 P。Windows 和原生 GUI 可从源码或 CI 构建获取，不是该版本的发布资产。开发构建方法见 [BUILDING.md](BUILDING.md)。
 
 跳转到：[运行方式](#invocation)、[首次下载](#first-download)、[命令表](#commands)、[搜索](#search)、[清晰度与分 P](#quality)、[登录](#login)、[下载参数](#download-options)、[恢复](#resume)、[合并](#merge)、[清理](#cleanup)、[配置](#configuration)、[更新](#updates)、[输出与错误](#output)。
 
@@ -60,7 +60,7 @@ PowerShell 中对应的下载命令：
 
 | 命令 | 用途与专用参数 |
 |---|---|
-| `search QUERY` | 按关键词搜索；`--type all\|video\|bangumi\|film`、`--page N`、登录参数 |
+| `search QUERY` | 按关键词搜索；`--type all\|video\|bangumi\|film`、`--page N`、`--sort ORDER`、登录参数 |
 | `info INPUT` | 解析内容，查看分 P 或分集；登录参数 |
 | `qualities INPUT` | 查询单个分 P 的清晰度；`--part N`、登录参数 |
 | `download INPUT...` | 下载选中的内容；见下方[下载参数](#download-options) |
@@ -80,14 +80,27 @@ PowerShell 中对应的下载命令：
 登录参数指 `--auth MODE` 和显式的 `--remember`，适用于 `search`、`info`、`qualities`、`download`、`resume`，并非所有命令都接受。
 
 <a id="search"></a>
-## 搜索
+## 搜索与排序
 
-`--type` 默认 `all`，`--page` 默认 `1`。页码范围为 1–1000；搜索词不能为空，且不超过 256 个 UTF-8 字节。`all` 分别返回视频、番剧和影视的分类页，不把三类拼成一个全局排名。
+`--type` 默认 `all`，`--page` 默认 `1`，`--sort` 默认 `relevance`。页码范围为 1–1000；搜索词不能为空，且不超过 256 个 UTF-8 字节。`all` 分别返回视频、番剧和影视的分类页，不把三类拼成一个全局排名。
+
+当前源码支持以下视频排序：
+
+| `--sort` | 顺序 |
+|---|---|
+| `relevance` | 保持原有服务端默认排序，所有类型均可使用 |
+| `views` | 最多播放 |
+| `newest` | 最新发布 |
+| `danmaku` | 最多弹幕 |
+| `favorites` | 最多收藏 |
+| `comments` | 最多评论 |
 
 ```sh
-./bin/bili search "KEYWORD" --type video --page 1 --auth anonymous
-./bin/bili search "KEYWORD" --type video --page 2 --auth anonymous
+./bin/bili search "KEYWORD" --type video --sort newest --page 1 --auth anonymous
+./bin/bili search "KEYWORD" --type video --sort newest --page 2 --auth anonymous
 ```
+
+非默认排序必须配合 `--type video`。与 `all`、`bangumi` 或 `film` 组合时会明确报错，不会悄悄改回默认排序。程序保留服务端顺序与分页，不在本地只对当前一页重新排序。公开服务的实际排序效果尚未在线验收。
 
 <a id="quality"></a>
 ## 选择分 P 与清晰度
@@ -294,4 +307,4 @@ PowerShell 使用 `.\bili.exe update ...`。默认稳定渠道只考虑稳定版
 
 批量命令保留各项结果，并返回相关结果中的最高退出码。视频成功但请求的字幕或弹幕失败，仍返回非零。解决权限、网络、存储问题后，可用 `resume JOB_ID` 重试。遇到 `Busy`，先停止使用同一状态目录的其他写入进程；任务找不到时，检查 `--config`、`--state-dir` 与工作目录。遇到 `unknown argument`，先看 `--version` 和该可执行程序的 `--help`，确认是否使用了新版源码专有参数。原生库加载或启动问题应检查完整软件包，不是安装一个 `ffmpeg` 命令；构建排查见 [BUILDING.md](BUILDING.md)。
 
-恢复和吞吐表现尚未在全部支持系统上充分验收。Aria2、精准损坏段修复和验证 WebView 不是当前 CLI 能力。应用程序采用[附加 Commons Clause 的 MIT 许可证](LICENSE)；FFmpeg 独立适用 LGPL-2.1-or-later，保留随包对应的声明和源码材料。
+恢复、吞吐表现和公开服务排序尚未在全部支持系统上充分验收。Aria2、精准损坏段修复和验证 WebView 不是当前 CLI 能力。应用程序采用[附加 Commons Clause 的 MIT 许可证](LICENSE)；FFmpeg 独立适用 LGPL-2.1-or-later，保留随包对应的声明和源码材料。

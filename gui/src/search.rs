@@ -4,7 +4,7 @@ use crate::{
     covers::CoverCache,
     theme::{self, ButtonKind, Icon},
 };
-use bili_core::{CandidatePage, ContentRef, SearchCategory, SearchQuery};
+use bili_core::{CandidatePage, ContentRef, SearchCategory, SearchQuery, SearchSort};
 use egui::{RichText, Ui};
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,17 @@ pub fn category_name(category: SearchCategory) -> &'static str {
     }
 }
 
+fn sort_name(sort: SearchSort) -> &'static str {
+    match sort {
+        SearchSort::Relevance => "综合排序",
+        SearchSort::Views => "最多播放",
+        SearchSort::Newest => "最新发布",
+        SearchSort::Danmaku => "最多弹幕",
+        SearchSort::Favorites => "最多收藏",
+        SearchSort::Comments => "最多评论",
+    }
+}
+
 pub fn duration(ms: Option<u64>) -> String {
     match ms {
         Some(ms) => {
@@ -78,6 +89,7 @@ pub fn duration(ms: Option<u64>) -> String {
 pub struct SearchState {
     pub input: String,
     category: SearchCategory,
+    sort: SearchSort,
     pub results: Option<CandidatePage>,
     submitted: Option<SearchQuery>,
     requested: Option<SearchQuery>,
@@ -91,6 +103,7 @@ impl Default for SearchState {
         Self {
             input: String::new(),
             category: SearchCategory::All,
+            sort: SearchSort::Relevance,
             results: None,
             submitted: None,
             requested: None,
@@ -134,6 +147,35 @@ impl SearchState {
         if self.results.is_some() {
             self.stale = true;
         }
+    }
+
+    fn choose_category(&mut self, category: SearchCategory) {
+        self.category = category;
+        if !SearchSort::available_for(category).contains(&self.sort) {
+            self.sort = SearchSort::Relevance;
+        }
+    }
+
+    fn submit_search(&mut self) -> Option<Operation> {
+        let query = SearchQuery {
+            keyword: self.input.trim().to_owned(),
+            category: self.category,
+            page: 1,
+            sort: self.sort,
+        };
+        if classify_input(&self.input) != InputKind::Keyword || query.validate().is_err() {
+            return None;
+        }
+        self.requested = Some(query.clone());
+        Some(Operation::Search(query))
+    }
+
+    fn choose_sort(&mut self, sort: SearchSort) -> Option<Operation> {
+        if sort == self.sort || !SearchSort::available_for(self.category).contains(&sort) {
+            return None;
+        }
+        self.sort = sort;
+        self.submit_search()
     }
 
     pub fn show(
@@ -207,11 +249,33 @@ impl SearchState {
                             )
                             .clicked()
                             {
-                                self.category = category;
+                                self.choose_category(category);
                             }
                         }
                     });
-                    theme::muted(ui, "仅在提交后联网");
+                    theme::muted(ui, "提交搜索或选择排序后联网");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("排序");
+                    let mut sort = self.sort;
+                    ui.add_enabled_ui(
+                        available && classify_input(&self.input) != InputKind::Content,
+                        |ui| {
+                            egui::ComboBox::from_id_salt("search_sort")
+                                .selected_text(sort_name(sort))
+                                .show_ui(ui, |ui| {
+                                    for &choice in SearchSort::available_for(self.category) {
+                                        ui.selectable_value(&mut sort, choice, sort_name(choice));
+                                    }
+                                });
+                        },
+                    );
+                    if let Some(search) = self.choose_sort(sort) {
+                        action = Some(search);
+                    }
+                    if self.category != SearchCategory::Video {
+                        theme::muted(ui, "该分类仅支持综合排序；选择视频可使用更多排序。");
+                    }
                 });
                 if enter && available {
                     match classify_input(&self.input) {
@@ -219,13 +283,7 @@ impl SearchState {
                             action = Some(Operation::Resolve(self.input.trim().to_owned()))
                         }
                         InputKind::Keyword => {
-                            let query = SearchQuery {
-                                keyword: self.input.trim().to_owned(),
-                                category: self.category,
-                                page: 1,
-                            };
-                            self.requested = Some(query.clone());
-                            action = Some(Operation::Search(query));
+                            action = self.submit_search();
                         }
                         InputKind::Empty => {}
                     }
@@ -241,8 +299,9 @@ impl SearchState {
                     theme::muted(
                         ui,
                         format!(
-                            "{} · {} · 第 {} 页 · {} 项",
+                            "{} · {} · {} · 第 {} 页 · {} 项",
                             category_name(query.category),
+                            sort_name(query.sort),
                             query.keyword,
                             query.page,
                             count
@@ -480,6 +539,7 @@ mod tests {
                 keyword: "动画".into(),
                 category: SearchCategory::Bangumi,
                 page: 1,
+                sort: SearchSort::Relevance,
             }),
             ..SearchState::default()
         };
@@ -488,11 +548,79 @@ mod tests {
             keyword: "动画".into(),
             category: SearchCategory::Bangumi,
             page: 2,
+            sort: SearchSort::Relevance,
         });
         state.discard_request();
         assert_eq!(state.submitted.as_ref().unwrap().page, 1);
         assert!(state.requested.is_none());
         assert!(state.results.is_some());
+    }
+
+    #[test]
+    fn changing_sort_restarts_page_one_and_failed_request_preserves_prior_results() {
+        let mut state = SearchState {
+            input: "动画".into(),
+            category: SearchCategory::Video,
+            sort: SearchSort::Views,
+            requested: Some(SearchQuery {
+                keyword: "动画".into(),
+                category: SearchCategory::Video,
+                page: 4,
+                sort: SearchSort::Views,
+            }),
+            ..SearchState::default()
+        };
+        state.accept_results(CandidatePage { pages: Vec::new() });
+        let Some(Operation::Search(query)) = state.choose_sort(SearchSort::Newest) else {
+            panic!("sort selection must submit a new query");
+        };
+        assert_eq!(query.keyword, "动画");
+        assert_eq!(query.category, SearchCategory::Video);
+        assert_eq!(query.page, 1);
+        assert_eq!(query.sort, SearchSort::Newest);
+        assert_eq!(state.requested_query(), Some(&query));
+        assert_eq!(state.submitted.as_ref().unwrap().page, 4);
+        assert_eq!(state.submitted.as_ref().unwrap().sort, SearchSort::Views);
+        state.discard_request();
+        state.mark_stale();
+        assert!(state.stale);
+        assert_eq!(state.submitted.as_ref().unwrap().sort, SearchSort::Views);
+        assert!(state.results.is_some());
+        assert!(state.choose_sort(SearchSort::Favorites).is_some());
+        state.accept_results(CandidatePage { pages: Vec::new() });
+        assert_eq!(
+            state.submitted.as_ref().unwrap().sort,
+            SearchSort::Favorites
+        );
+        assert_eq!(state.submitted.as_ref().unwrap().page, 1);
+        assert!(!state.stale);
+    }
+
+    #[test]
+    fn switching_to_nonvideo_resolves_sort_and_link_input_does_not_search() {
+        let mut state = SearchState {
+            input: "sample".into(),
+            category: SearchCategory::Video,
+            sort: SearchSort::Newest,
+            ..SearchState::default()
+        };
+        for category in [
+            SearchCategory::All,
+            SearchCategory::Bangumi,
+            SearchCategory::Film,
+        ] {
+            state.choose_category(category);
+            assert_eq!(state.sort, SearchSort::Relevance);
+            assert!(state.choose_sort(SearchSort::Views).is_none());
+            let Some(Operation::Search(query)) = state.submit_search() else {
+                panic!("keyword search")
+            };
+            assert_eq!(query.category, category);
+            query.validate().unwrap();
+        }
+        state.choose_category(SearchCategory::Video);
+        state.input = "av170001".into();
+        assert!(state.choose_sort(SearchSort::Comments).is_none());
     }
 }
 
@@ -546,6 +674,110 @@ mod layout_tests {
                     .collect(),
             }],
         }
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        state: &mut SearchState,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, Option<Operation>) {
+        let mut action = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1100.0, 900.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = state.show(ui, true, true, &mut CoverCache::default(), None);
+                });
+            },
+        );
+        (output, action)
+    }
+
+    fn click(
+        ctx: &egui::Context,
+        state: &mut SearchState,
+        at: Pos2,
+    ) -> (egui::FullOutput, Option<Operation>) {
+        frame(
+            ctx,
+            state,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        frame(
+            ctx,
+            state,
+            vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        )
+    }
+
+    #[test]
+    fn sort_control_emits_page_one_and_pagination_retains_selected_sort() {
+        let ctx = egui::Context::default();
+        let mut state = SearchState {
+            input: "sample".into(),
+            category: SearchCategory::Video,
+            ..SearchState::default()
+        };
+        frame(&ctx, &mut state, Vec::new());
+        let (output, _) = frame(&ctx, &mut state, Vec::new());
+        let at = texts(&output)
+            .into_iter()
+            .find(|(text, _)| text == "综合排序")
+            .unwrap()
+            .1
+            .center();
+        let (_, action) = click(&ctx, &mut state, at);
+        assert!(action.is_none());
+        // Egui sizes a newly opened popup invisibly on its first frame.
+        // Let it paint before finding and clicking an actual option.
+        let (output, _) = frame(&ctx, &mut state, Vec::new());
+        let at = texts(&output)
+            .into_iter()
+            .find(|(text, _)| text == "最新发布")
+            .unwrap()
+            .1
+            .center();
+        let (_, action) = click(&ctx, &mut state, at);
+        let Some(Operation::Search(query)) = action else {
+            panic!("sort selection query")
+        };
+        assert_eq!(query.sort, SearchSort::Newest);
+        assert_eq!(query.page, 1);
+        let mut first = results();
+        first.pages[0].has_more = true;
+        state.accept_results(first);
+        let (output, _) = frame(&ctx, &mut state, Vec::new());
+        let at = texts(&output)
+            .into_iter()
+            .find(|(text, _)| text == "下一页")
+            .unwrap()
+            .1
+            .center();
+        let (_, action) = click(&ctx, &mut state, at);
+        let Some(Operation::Search(next)) = action else {
+            panic!("pagination query")
+        };
+        assert_eq!(next.sort, SearchSort::Newest);
+        assert_eq!(next.page, 2);
+        assert_eq!(next.keyword, query.keyword);
+        assert_eq!(next.category, query.category);
     }
 
     #[test]

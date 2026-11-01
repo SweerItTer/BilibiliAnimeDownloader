@@ -6,7 +6,7 @@ Applies to `core-cli`, pinned FFmpeg source builds, separate matched Rust SDKs a
 
 ## 2. Signatures
 
-- `bili search QUERY --type all|video|bangumi|film --page N [--auth MODE]`
+- `bili search QUERY --type all|video|bangumi|film --page N [--sort relevance|views|newest|danmaku|favorites|comments] [--auth MODE]`; see [shared search sorting](../../bili_core/backend/search-sorting.md) for Video-only non-default orders and pre-auth validation.
 - `bili info INPUT [--auth MODE]`; `bili qualities INPUT [--part N] [--auth MODE]`
 - `bili download INPUT... --list-resolutions [--parts all|1,3-5] [--auth MODE] [--connections N]`: read-only catalog query; explicit output/quality/representation/codec/HDR/sidecar/merge/jobs/keep-temp options conflict, while download defaults do not.
 - `bili login qr [--remember]`; `bili login cookie [--stdin] [--remember]`; `bili login status`; `bili logout`

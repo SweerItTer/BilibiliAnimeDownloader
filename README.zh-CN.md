@@ -26,7 +26,7 @@
 
 `qualities` 查询单个分 P，不开始下载；加 `--part 3` 可查询原始序号为 3 的分 P。选好后使用 `download VIDEO_ID --quality QUALITY_ID`，像素尺寸和 Stream ID 不是清晰度档位 ID。用 `--parts 1,3-5` 选择下载分 P。当前源码还提供 `download VIDEO_ID --list-resolutions` 批量列出各分 P 清晰度，Alpha 6 没有此参数。加 `--json` 可获得机器可读输出。Windows 源码构建在 PowerShell 中使用 `.\bili.exe`，参数相同。
 
-CLI 会显示已完成文件的路径；不会安装或启动播放器。接下来可阅读[完整 CLI 指南](CLI.zh-CN.md)，或运行 `./bin/bili download --help` 查看某条命令的参数。
+CLI 会显示已完成文件的路径；不会安装或启动播放器。接下来可阅读[完整 CLI 指南](CLI.zh-CN.md)，或运行 `./bin/bili download --help` 查看某条命令的参数。源码构建还支持[视频搜索排序](CLI.zh-CN.md#search)，已发布的 Alpha 6 软件包没有此功能。
 
 ## 检查和安装更新
 
@@ -56,7 +56,7 @@ CLI 会显示已完成文件的路径；不会安装或启动播放器。接下�
 
 ## 限制与构建
 
-当前源码包含原生桌面 GUI；已发布的 Alpha 仍为 Linux x86_64 CLI，没有 Windows 或 GUI 发布包。Aria2、验证 WebView 和损坏分段修复尚未包含；稳定性、性能和异常退出恢复还没有充分验收。FFmpeg 以可替换共享库形式提供；不会随包提供或启动 FFmpeg 可执行文件，也不会启动播放器。应用程序采用[附加 Commons Clause 的 MIT 许可证](LICENSE)；FFmpeg 和其他第三方组件适用软件包声明中的独立条款。
+当前源码包含原生桌面 GUI 和视频搜索排序；已发布的 Alpha 仍为 Linux x86_64 CLI，没有 Windows 或 GUI 发布包。Aria2、验证 WebView 和损坏分段修复尚未包含；稳定性、性能和异常退出恢复还没有充分验收。FFmpeg 以可替换共享库形式提供；不会随包提供或启动 FFmpeg 可执行文件，也不会启动播放器。应用程序采用[附加 Commons Clause 的 MIT 许可证](LICENSE)；FFmpeg 和其他第三方组件适用软件包声明中的独立条款。
 
 开发构建要求和命令见 [BUILDING.md](BUILDING.md)。
 

@@ -4,6 +4,7 @@
 
 ### ✨ Features
 
+- Add shared video search sorting to Core, CLI and GUI: relevance, views, newest, danmaku, favorites and comments. Preserve server pagination and reject unsupported category/order combinations before authentication or network requests.
 - Add the native GUI, including search, queues, session login and appearance settings. GUI updating now uses the shared static catalog, GUI identity, headless native validation and core installation transaction.
 - Add `download --list-resolutions` and readable `qualities` output: one table per part retains descriptions, dimensions, frame rate and codecs, with separate login/VIP requirements and returned-address evidence. Queries create no download jobs and keep machine-readable JSON output.
 - Add a shared update protocol in `bili_core` and the `bili update [--check] [--pre-release[=true|false]]` command on top of it: per-product release descriptors, SemVer-precedence selection across stable and pre-release channels, verified archive download, a versioned install layout with an atomic `CURRENT` pointer, and a throttled reminder that announces each available version at most once per channel.
@@ -22,6 +23,7 @@
 
 ### 💥 Breaking Changes
 
+- Add `sort` to the public Rust `SearchQuery` struct. Source callers must supply `SearchSort` and rebuild matched consumers; serialized queries without the field retain the default order.
 - The stable package entry remains unchanged, but the CLI and native runtime now live under `versions/<id>/`, selected by `CURRENT`. `2.0.0-alpha.6` cannot update to this layout; manually extract the first compatible package into a new directory rather than overwriting an Alpha 6 installation. No automatic migration is provided.
 
 ### 📝 Documentation

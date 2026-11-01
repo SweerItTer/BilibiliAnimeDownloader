@@ -209,11 +209,62 @@ pub enum SearchCategory {
     Bangumi,
     Film,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchSort {
+    #[default]
+    Relevance,
+    Views,
+    Newest,
+    Danmaku,
+    Favorites,
+    Comments,
+}
+impl SearchSort {
+    /// Only video searches currently have a supported non-default server order.
+    pub fn available_for(category: SearchCategory) -> &'static [Self] {
+        if category == SearchCategory::Video {
+            &[
+                Self::Relevance,
+                Self::Views,
+                Self::Newest,
+                Self::Danmaku,
+                Self::Favorites,
+                Self::Comments,
+            ]
+        } else {
+            &[Self::Relevance]
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchQuery {
     pub keyword: String,
     pub category: SearchCategory,
     pub page: u32,
+    #[serde(default)]
+    pub sort: SearchSort,
+}
+impl SearchQuery {
+    /// Validate before authentication, signing, or submitting a network request.
+    pub fn validate(&self) -> Result<()> {
+        if self.keyword.trim().is_empty()
+            || self.keyword.len() > 256
+            || self.page == 0
+            || self.page > 1000
+        {
+            return Err(CoreError::new(
+                ErrorCode::InvalidInput,
+                "invalid search query",
+            ));
+        }
+        if !SearchSort::available_for(self.category).contains(&self.sort) {
+            return Err(CoreError::new(
+                ErrorCode::InvalidInput,
+                "non-default search sorting requires video category",
+            ));
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
