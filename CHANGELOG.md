@@ -51,6 +51,10 @@
 - Rebuild and deploy the complete static update catalog after qualified release publication, with an index-only manual entry in the same workflow; preserve ordinary tag/main release gates and the six-asset release bundle.
 
 
+### ✅ Tests
+
+- Add an offline child-process crash regression for committed job recovery, uncommitted media tails and Range continuation with ETag and SHA-256 checks. This covers process termination, not physical power-loss qualification.
+
 ## [2.0.0-alpha.6] - 2026-10-29
 
 ### ✨ Features

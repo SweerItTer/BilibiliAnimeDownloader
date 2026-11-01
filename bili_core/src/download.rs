@@ -845,4 +845,7 @@ impl TransferFailure {
 }
 
 #[cfg(test)]
+#[path = "download/process_recovery.rs"]
+mod process_recovery;
+#[cfg(test)]
 mod transfer_recovery;
