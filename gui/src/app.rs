@@ -1603,7 +1603,7 @@ impl App {
                     "只影响后续新任务；已有任务保持原路径。请填写或选择绝对目录。",
                 );
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.output_input)
+                    theme::singleline_input(ui,&mut self.output_input,"",ui.spacing().interact_size.y)
                         .desired_width(f32::INFINITY)
                         .margin(egui::vec2(12.0, 12.0)),
                 );
@@ -2468,6 +2468,391 @@ mod layout_tests {
         JobSnapshot, MediaItem, Part, PartRef, SearchCategory, SearchSort,
     };
     use egui::{Pos2, Rect, Vec2};
+
+    /// Manual native inspection uses only synthetic in-memory data and the
+    /// actual App painters. It never constructs Core, loads prefs or saves them.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "opens a bounded offline native layout review window"]
+    fn native_layout_review() {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        struct Review {
+            app: App,
+            category: SearchCategory,
+            items: Vec<MediaItem>,
+            started: Instant,
+            lifetime: Duration,
+            captures: Option<PathBuf>,
+            scene: usize,
+            scene_frames: usize,
+            capture_requested: bool,
+            captured: Arc<std::sync::atomic::AtomicUsize>,
+            _root: tempfile::TempDir,
+        }
+        fn image(size: [usize; 2]) -> egui::ColorImage {
+            let mut image = egui::ColorImage::new(size, egui::Color32::from_rgb(228, 231, 235));
+            let w = size[0] as f32;
+            let h = size[1] as f32;
+            let small = w.min(h);
+            let radius = small * 0.18;
+            let center = if h > w {
+                egui::pos2(w * 0.5, h * 0.25)
+            } else {
+                egui::pos2(w * 0.25, h * 0.5)
+            };
+            let side = small * 0.32;
+            let square = if h > w {
+                Rect::from_center_size(egui::pos2(w * 0.5, h * 0.73), Vec2::splat(side))
+            } else {
+                Rect::from_center_size(egui::pos2(w * 0.73, h * 0.5), Vec2::splat(side))
+            };
+            for y in 0..size[1] {
+                for x in 0..size[0] {
+                    let p = egui::pos2(x as f32, y as f32);
+                    if p.distance(center) <= radius {
+                        image[(x, y)] = egui::Color32::from_rgb(80, 120, 190);
+                    }
+                    if square.contains(p) {
+                        image[(x, y)] = egui::Color32::from_rgb(190, 90, 80);
+                    }
+                }
+            }
+            image
+        }
+        impl Review {
+            fn capture_scene(&mut self) {
+                self.app.config.open = false;
+                self.app.search.input.clear();
+                self.load(match self.scene {
+                    2 => SearchCategory::Film,
+                    3 => SearchCategory::Video,
+                    _ => SearchCategory::Bangumi,
+                });
+                match self.scene {
+                    1 => self.app.search.input = "测试输入 ABC 123".into(),
+                    4 => self.app.detail = Some(DetailState::new(self.items[0].clone())),
+                    5 => self.configuration(),
+                    6 => {
+                        self.app.navigate(Page::Settings);
+                        self.app.settings_jump = Some(2);
+                    }
+                    _ => {}
+                }
+            }
+
+            fn load(&mut self, category: SearchCategory) {
+                self.category = category;
+                self.app.home();
+                self.app.search.category = category;
+                self.items = (0..4)
+                    .map(|i| {
+                        let mut item = media_item();
+                        let id = Aid::new(1000 + i).unwrap();
+                        let reference = if category == SearchCategory::Video {
+                            ContentRef::Video(id)
+                        } else {
+                            ContentRef::Bangumi(bili_core::SeasonId::new(1000 + i).unwrap())
+                        };
+                        item.reference = reference.clone();
+                        item.title = format!(
+                            "离线{}封面 {}",
+                            crate::search::category_name(category),
+                            i + 1
+                        );
+                        item.cover = Some(
+                            if category == SearchCategory::Video {
+                                "fixture:landscape"
+                            } else {
+                                "fixture:portrait"
+                            }
+                            .into(),
+                        );
+                        item.parts[0].reference.content = reference.clone();
+                        item.parts[0].reference.aid = id;
+                        item.parts[0].reference.cid = Cid::new(2000 + i).unwrap();
+                        item.parts[0].title = "第 1 项".into();
+                        item.source = Some(bili_core::SourceProject {
+                            reference,
+                            title: item.title.clone(),
+                            category: Some(category),
+                            cover: item.cover.clone(),
+                            ordinal: 1,
+                        });
+                        item.description = Some("仅用于检查图片比例和输入框的本地样例。".into());
+                        item.author = Some("离线样例".into());
+                        item
+                    })
+                    .collect();
+                self.app.search.set_requested(SearchQuery {
+                    keyword: "offline layout sample".into(),
+                    category,
+                    page: 1,
+                    sort: bili_core::SearchSort::Relevance,
+                    filter: Default::default(),
+                });
+                self.app.search.accept_results(CandidatePage {
+                    pages: vec![CategoryPage {
+                        category,
+                        page: 1,
+                        total: Some(96),
+                        has_more: true,
+                        page_size: Some(20),
+                        total_pages: Some(5),
+                        items: self
+                            .items
+                            .iter()
+                            .map(|item| Candidate {
+                                reference: item.reference.clone(),
+                                category,
+                                title: item.title.clone(),
+                                cover: item.cover.clone(),
+                                duration_ms: item.duration_ms,
+                                author: item.author.clone(),
+                                published_at: None,
+                                plays: Some(12000),
+                                danmaku: Some(100),
+                            })
+                            .collect(),
+                    }],
+                });
+            }
+            fn configuration(&mut self) {
+                let item = self.items[0].clone();
+                let part = item.parts[0].reference.clone();
+                let catalog = bili_core::QualityCatalog {
+                    part: part.clone(),
+                    advertised: vec![bili_core::QualityEntry {
+                        id: 64,
+                        label: "720P".into(),
+                        rank: 64,
+                        availability: bili_core::Availability::Obtainable,
+                        requires_login: None,
+                        requires_vip: None,
+                        has_video_url: true,
+                        advertised_codecs: vec!["avc1".into()],
+                    }],
+                    representations: vec![bili_core::RepresentationKey {
+                        part: part.clone(),
+                        id: 64,
+                        quality: 64,
+                        codec: "avc1".into(),
+                        width: Some(1280),
+                        height: Some(720),
+                        fps: None,
+                        dynamic_range: None,
+                        color: None,
+                        bandwidth: 1000,
+                        audio: false,
+                        sample_rate: None,
+                        channels: None,
+                        language: None,
+                    }],
+                    revision: 1,
+                    preview: false,
+                };
+                self.app.config.accept(
+                    vec![crate::backend::PreparedItem {
+                        item,
+                        category: self.category,
+                        selected: vec![part.clone()],
+                        catalogs: vec![(part, Ok(catalog))],
+                    }],
+                    None,
+                    &self.app.output,
+                    false,
+                );
+            }
+        }
+        impl eframe::App for Review {
+            fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+                if let Some(directory) = self.captures.clone() {
+                    let screenshot = ctx.input(|input| {
+                        input.events.iter().find_map(|event| {
+                            if let egui::Event::Screenshot { image, .. } = event {
+                                Some(image.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                    if let Some(image) = screenshot {
+                        let pixels: Vec<u8> =
+                            image.pixels.iter().flat_map(|p| p.to_array()).collect();
+                        let file = directory.join(format!("{:02}.png", self.scene));
+                        image::save_buffer(
+                            &file,
+                            &pixels,
+                            image.size[0] as u32,
+                            image.size[1] as u32,
+                            image::ColorType::Rgba8,
+                        )
+                        .unwrap();
+                        println!("Native rendered scene: {}", file.display());
+                        self.captured
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        self.scene += 1;
+                        self.scene_frames = 0;
+                        self.capture_requested = false;
+                        if self.scene == 7 {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            return;
+                        }
+                        self.capture_scene();
+                    }
+                }
+                if self.started.elapsed() >= self.lifetime {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+                egui::TopBottomPanel::bottom("offline-review-controls").show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("离线检查：");
+                        for (category, label) in [
+                            (SearchCategory::Bangumi, "番剧样例"),
+                            (SearchCategory::Film, "影视样例"),
+                            (SearchCategory::Video, "视频样例"),
+                        ] {
+                            if ui.button(label).clicked() {
+                                self.load(category);
+                            }
+                        }
+                        if ui.button("详情样例").clicked() {
+                            self.app.home();
+                            self.app.detail = Some(DetailState::new(self.items[0].clone()));
+                        }
+                        if ui.button("下载目录样例").clicked() {
+                            self.configuration();
+                        }
+                        if ui.button("设置样例").clicked() {
+                            self.app.navigate(Page::Settings);
+                            self.app.settings_jump = Some(2);
+                        }
+                    });
+                });
+                self.app.header(ctx);
+                if self.app.search.category != self.category && self.app.page == Page::Discover {
+                    self.load(self.app.search.category);
+                }
+                // Permit real cover clicks to enter the matching synthetic detail,
+                // without a Bridge or an alternate production backend.
+                match self.app.retry_resolve.take() {
+                    Some(Retry::Resolve(input)) => {
+                        if let Some(item) = self
+                            .items
+                            .iter()
+                            .find(|item| crate::search::reference_input(&item.reference) == input)
+                        {
+                            self.app.detail = Some(DetailState::new(item.clone()));
+                        }
+                    }
+                    Some(Retry::Prepare { .. }) => self.configuration(),
+                    _ => {}
+                }
+                self.app.central(ctx);
+                if let Some(operation) = self.app.config.show(ctx, self.app.available(), None) {
+                    self.app.send(operation);
+                }
+                self.app.accounts(ctx);
+                self.app.prefs_dirty = false;
+                ctx.output_mut(|output| output.open_url = None);
+                if self.captures.is_some() {
+                    self.scene_frames += 1;
+                    if self.scene_frames >= 4 && !self.capture_requested {
+                        self.capture_requested = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+                    }
+                }
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+        let lifetime = std::env::var("BILI_GUI_LAYOUT_REVIEW_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(180)
+            .clamp(5, 300);
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/native-gui-checks/layout-review");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("isolated-")
+            .tempdir_in(&base)
+            .unwrap();
+        assert!(root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .starts_with(base.canonicalize().unwrap()));
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_title("BiliDL offline layout review")
+                .with_inner_size([1180.0, 800.0])
+                .with_min_inner_size([900.0, 640.0])
+                .with_active(false),
+            persist_window: false,
+            persistence_path: Some(root.path().join("eframe")),
+            event_loop_builder: Some(Box::new(|builder| {
+                builder.with_any_thread(true);
+            })),
+            ..Default::default()
+        };
+        let captures = std::env::var_os("BILI_GUI_LAYOUT_CAPTURE").map(|_| {
+            let directory = base.join("captures").join(root.path().file_name().unwrap());
+            std::fs::create_dir_all(&directory).unwrap();
+            directory
+        });
+        let capture_enabled = captures.is_some();
+        let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = captured.clone();
+        eframe::run_native(
+            "BiliDL offline layout review",
+            options,
+            Box::new(move |cc| {
+                theme::install(&cc.egui_ctx, theme::system_fonts());
+                let mut app = App::new(
+                    None,
+                    root.path().join("downloads"),
+                    root.path().join("state"),
+                    false,
+                    None,
+                    GuiPrefs::default(),
+                );
+                app.ready = true;
+                app.covers.insert(
+                    &cc.egui_ctx,
+                    "fixture:portrait".into(),
+                    Some(image([300, 420])),
+                );
+                app.covers.insert(
+                    &cc.egui_ctx,
+                    "fixture:landscape".into(),
+                    Some(image([420, 236])),
+                );
+                let mut review = Review {
+                    app,
+                    category: SearchCategory::Bangumi,
+                    items: vec![],
+                    started: Instant::now(),
+                    lifetime: Duration::from_secs(lifetime),
+                    captures,
+                    scene: 0,
+                    scene_frames: 0,
+                    capture_requested: false,
+                    captured,
+                    _root: root,
+                };
+                review.capture_scene();
+                Ok(Box::new(review))
+            }),
+        )
+        .unwrap();
+        if capture_enabled {
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::SeqCst),
+                7,
+                "native renderer must return every requested scene"
+            );
+        }
+    }
 
     fn test_app() -> App {
         let prefs = GuiPrefs::default();

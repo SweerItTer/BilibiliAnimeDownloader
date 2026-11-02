@@ -215,6 +215,30 @@ pub fn hint(ui: &mut Ui, text: impl Into<String>) {
     ui.label(egui::RichText::new(text).size(12.0).color(muted_color()));
 }
 
+/// Single-line controls share text metrics even when a caller gives the frame
+/// extra height. Explicit hint color avoids inheriting the app's ink override.
+pub fn singleline_input<'a>(
+    ui: &Ui,
+    text: &'a mut dyn egui::TextBuffer,
+    hint: &str,
+    height: f32,
+) -> egui::TextEdit<'a> {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let row_height = ui.fonts(|fonts| fonts.row_height(&font));
+    let height = height.max(row_height + 4.0);
+    // egui 0.29 hit testing starts at the inner rect's top. Put the extra
+    // height in symmetric margins so painting and pointer coordinates agree.
+    egui::TextEdit::singleline(text)
+        .font(font)
+        .margin(vec2(4.0, (height - row_height) * 0.5))
+        .hint_text_font(egui::TextStyle::Body)
+        .hint_text(
+            egui::RichText::new(hint)
+                .text_style(egui::TextStyle::Body)
+                .color(muted_color()),
+        )
+}
+
 pub fn section(ui: &mut Ui, title: &str, description: &str) {
     ui.label(egui::RichText::new(title).size(17.0).strong());
     ui.add_space(3.0);
@@ -539,5 +563,131 @@ mod tests {
         let color = alpha(Color32::from_rgb(10, 20, 30), 0.5);
         assert_eq!(color.a(), 128);
         assert_eq!(alpha(ON_PRIMARY, 2.0).a(), 255);
+    }
+
+    fn input_frame(
+        ctx: &egui::Context,
+        text: &mut String,
+        height: f32,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, egui::text_edit::TextEditOutput) {
+        let mut edit = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(600.0, 250.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    edit = Some(
+                        ui.allocate_ui_with_layout(
+                            vec2(240.0, height),
+                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                            |ui| {
+                                singleline_input(ui, text, "Search hint", height)
+                                    .id_salt("input-under-test")
+                                    .show(ui)
+                            },
+                        )
+                        .inner,
+                    );
+                });
+            },
+        );
+        (output, edit.unwrap())
+    }
+    #[test]
+    fn singleline_text_and_hint_are_centered_with_distinct_normal_hint_color() {
+        for height in [30.0, 34.0, 54.0] {
+            for value in ["", "Entered value"] {
+                let ctx = egui::Context::default();
+                apply_style(&ctx, false);
+                let mut text = value.to_owned();
+                let (output, edit) = input_frame(&ctx, &mut text, height, vec![]);
+                let expected = if value.is_empty() {
+                    "Search hint"
+                } else {
+                    value
+                };
+                fn find(
+                    shapes: &[egui::epaint::ClippedShape],
+                    text: &str,
+                ) -> Option<egui::epaint::TextShape> {
+                    fn shape(node: &egui::Shape, text: &str) -> Option<egui::epaint::TextShape> {
+                        match node {
+                            egui::Shape::Text(t) if t.galley.job.text == text => Some(t.clone()),
+                            egui::Shape::Vec(v) => v.iter().find_map(|s| shape(s, text)),
+                            _ => None,
+                        }
+                    }
+                    shapes.iter().find_map(|s| shape(&s.shape, text))
+                }
+                let painted = find(&output.shapes, expected).expect("painted input text");
+                let bounds = painted.galley.rect.translate(painted.pos.to_vec2());
+                assert!(
+                    (bounds.center().y - edit.response.rect.center().y).abs() < 0.6,
+                    "{height}: {bounds:?} in {:?}",
+                    edit.response.rect
+                );
+                let format = &painted.galley.job.sections[0].format;
+                assert_eq!(format.font_id, egui::TextStyle::Body.resolve(&ctx.style()));
+                assert_eq!(
+                    format.color,
+                    if value.is_empty() {
+                        muted_color()
+                    } else {
+                        ink()
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn pointer_clicks_in_both_halves_of_centered_text_insert_at_the_clicked_character() {
+        for height in [30.0, 34.0, 54.0] {
+            for y in [0.25, 0.5, 0.8] {
+                for index in [0, 4, 10] {
+                    let ctx = egui::Context::default();
+                    apply_style(&ctx, false);
+                    let mut text = "abcdefghij".to_owned();
+                    let (_, edit) = input_frame(&ctx, &mut text, height, vec![]);
+                    let caret = edit
+                        .galley
+                        .pos_from_ccursor(egui::text::CCursor::new(index));
+                    let pos = edit.galley_pos + vec2(caret.left() + 0.1, edit.galley.size().y * y);
+                    let _ = input_frame(
+                        &ctx,
+                        &mut text,
+                        height,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                    );
+                    let _ = input_frame(
+                        &ctx,
+                        &mut text,
+                        height,
+                        vec![egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        }],
+                    );
+                    let _ =
+                        input_frame(&ctx, &mut text, height, vec![egui::Event::Text("|".into())]);
+                    let mut expected = "abcdefghij".to_owned();
+                    expected.insert(index, '|');
+                    assert_eq!(text, expected, "height={height}, y={y}, index={index}");
+                }
+            }
+        }
     }
 }

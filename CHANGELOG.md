@@ -14,6 +14,8 @@
 
 ### 🐞 Fixes
 
+- Preserve portrait and landscape cover proportions in the GUI, use poster slots for Bangumi/Film, remove the redundant category caption, and center single-line input text with clearly muted placeholders.
+- Restrict the Windows recycle-bin adapter to its supported platform so Linux GUI workspace checks can compile.
 - Keep packaging-time diagnostic profiles in an independent system temporary directory, so Windows extended staging paths do not make the CLI doctor reject its private profile.
 - Ignore a null or non-numeric top-level play URL quality when matching returned-address evidence, falling back to the direct segment quality as the representation parser already does.
 - Fill a missing `support_formats` description from the same-ID accepted-quality description instead of exposing a placeholder label; richer per-format descriptions still win.

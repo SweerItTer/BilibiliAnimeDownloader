@@ -58,8 +58,16 @@ impl DetailState {
         let back = ui.button("返回搜索").clicked();
         ui.add_space(12.0);
         ui.horizontal_top(|ui| {
-            let width = (ui.available_width() * 0.36).clamp(120.0, 320.0);
-            let size = egui::vec2(width, width * 9.0 / 16.0);
+            let maximum = if matches!(
+                self.category,
+                SearchCategory::Bangumi | SearchCategory::Film
+            ) {
+                210.0
+            } else {
+                320.0
+            };
+            let width = (ui.available_width() * 0.36).clamp(120.0, maximum);
+            let size = crate::covers::cover_size(self.category, width);
             if !covers.show(ui, bridge, self.item.cover.as_deref(), size, 4.0) {
                 let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
                 ui.painter().rect_filled(rect, 4.0, theme::soft());

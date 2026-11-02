@@ -337,11 +337,25 @@ impl ConfigState {
                         ui.add_enabled_ui(available, |ui| {
                             ui.label("保存目录");
                             ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.directory)
-                                        .desired_width((ui.available_width() - 78.0).max(100.0)),
+                                let picker = egui::WidgetText::from("选择目录").into_galley(
+                                    ui,
+                                    Some(egui::TextWrapMode::Extend),
+                                    f32::INFINITY,
+                                    egui::TextStyle::Button,
                                 );
-                                if ui.button("选择目录").clicked() {
+                                let picker_width = (picker.size().x
+                                    + 2.0 * ui.spacing().button_padding.x)
+                                    .max(ui.spacing().interact_size.x);
+                                let height = ui.spacing().interact_size.y;
+                                let width = (ui.available_width()
+                                    - picker_width
+                                    - ui.spacing().item_spacing.x)
+                                    .max(0.0);
+                                ui.add_sized(
+                                    [width, height],
+                                    theme::singleline_input(ui, &mut self.directory, "", height),
+                                );
+                                if ui.button(picker).clicked() {
                                     if let Some(path) = rfd::FileDialog::new()
                                         .set_directory(&self.directory)
                                         .pick_folder()

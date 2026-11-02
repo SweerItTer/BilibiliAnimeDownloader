@@ -274,7 +274,7 @@ impl SearchState {
         ui.horizontal(|ui| {
             let response = ui.add_sized(
                 [width.max(90.0), 34.0],
-                egui::TextEdit::singleline(&mut self.input).hint_text("搜索，或粘贴链接"),
+                theme::singleline_input(ui, &mut self.input, "搜索，或粘贴链接", 34.0),
             );
             if self.request_focus {
                 response.request_focus();
@@ -390,9 +390,6 @@ impl SearchState {
                         }
                     }
                 }
-                if self.browse.is_some() {
-                    theme::muted(ui, "分类浏览");
-                }
             }
         });
 
@@ -476,7 +473,7 @@ impl SearchState {
                     column.push_id(reference_input(&item.reference), |ui| {
                         let selected = self.selected.iter().any(|c| c.reference == item.reference);
                         let width = ui.available_width();
-                        let size = egui::vec2(width, width * 9.0 / 16.0);
+                        let size = crate::covers::cover_size(item.category, width);
                         let response = ui
                             .allocate_ui_with_layout(
                                 size,
@@ -574,7 +571,7 @@ impl SearchState {
                 if let Some(draft) = &mut self.page_edit {
                     let response = ui.add_sized(
                         [48.0, 30.0],
-                        egui::TextEdit::singleline(draft).id_salt("page-number"),
+                        theme::singleline_input(ui, draft, "", 30.0).id_salt("page-number"),
                     );
                     if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         navigate = Some(draft.clone());

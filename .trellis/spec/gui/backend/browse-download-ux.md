@@ -12,6 +12,8 @@ The approved native egui interaction, without a palette/appearance redesign. Rea
 
 The BiliDL-only logo returns home. Header categories, shorter search and right-aligned equal circular avatar/history replace the sidebar. Settings is an avatar submenu. Covers open details; only explicit bulk mode selects cards across pages/categories. Video owns channels/sorts; PGC has source-provided genre/section browsing separate from keyword search. Pagination is `< current/total >`; current is editable in place, Enter validates, Escape cancels, and unknown totals remain unknown.
 
+Cover painting retains the decoded texture's intrinsic dimensions. Video cards use landscape slots and Bangumi/Film use portrait slots; contain and center the actual image without changing its aspect ratio. Keep the full slot as the card hit target. Never pass target-slot dimensions as a texture's source size. Category controls need no redundant “分类浏览” caption. Single-line fields share vertically centered normal body text and explicitly muted placeholder text; inherited global ink must not make a hint look like entered content. Text, caret and pointer selection must agree after alignment.
+
 Unique/explicit resolved parts initially select themselves; whole multi-part details start empty. Detail and bulk use the same configuration model. A deliberately selected whole bulk content includes its unadmitted parts, adjustable before admission. Per-part catalogs and `QualityCatalog::select` determine red blocking rows, including previews/login/VIP restrictions. Highest-available and skipping are explicit. Server planning revalidates all pending parts before any admission.
 
 Batch directory changes remain separate from opt-in default changes. Capture directory/default intent, batch rate/profile/sidecars/quality when submitting. Only acknowledged parts leave selection. Keep receipts independent from mutable retry settings and wait for admitted IDs to appear in snapshots before conflicting actions. Partial failure/cancel/reentry retains remaining intent. Refresh updates catalogs without replacing deliberately changed parts. Failed preparations/browses retry their original typed intent.
@@ -42,6 +44,8 @@ Good: continue adding while acknowledged receipts remain visible and account cha
 ## 6. Tests required
 
 Input-driven egui tests cover header/layout, search/detail/config/admission/history flow, scroll return, inline paging, mixed strict quality, cancelled/new part intent, partial acknowledgement, late-result/cancel races, typed retry, account isolation and QR cancellation. Core tests own transfer/durability/credential/filesystem semantics. A separate ignored native Windows test loads only an in-memory local page to exercise actual WebView creation/IPC/destruction; it never solves a real CAPTCHA. Report executed tests and remaining live-service/platform limits separately.
+
+Layout changes also need native rendered inspection with representative portrait and landscape textures, empty and populated inputs, focus/caret, details and directory fields. Geometry/existence assertions alone do not establish acceptable rendering. Use an isolated test host with default in-memory preferences, no bridge/update owner and no credential or service access; do not launch the production host with its real remembered profile merely to inspect layout. Keep manual inspection evidence separate from automated pass counts.
 
 ## 7. Wrong versus correct
 
