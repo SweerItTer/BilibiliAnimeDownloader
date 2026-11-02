@@ -4,7 +4,7 @@
 
 The BiliDL logo returns to search. Video, Bangumi and Film are the three top-level categories. Search accepts keywords or a video/episode link; category browsing uses its own filters. Click a cover to open details, then select the parts to download. For several results, enable bulk selection and open the same download configuration dialog.
 
-The dialog checks each selected part with the chosen account. An unavailable quality stays marked until you choose another quality, explicitly select the best available, or skip that item. The rate limit is shared by the batch. A directory change applies to this batch; “Set as default” separately changes the starting directory for future content. Adding tasks keeps the current workflow open and shows the acknowledged result with a Download History entry. Failed admissions keep their selections for retry.
+The floating download dialog checks each selected part with the chosen account. Quality menus list concrete obtainable choices from the returned streams, such as 1080P or 720P; the initial selection is the highest obtainable choice. An explicit common choice that another item cannot provide stays marked until you choose a supported quality for that item or skip it. Advanced options start collapsed and contain the batch rate limit. New drafts inherit the default download rate from Settings (0 means unlimited); changing this draft's rate does not change the default or existing tasks. The rate is shared by the batch. A directory change applies to this batch; “Set as default” separately changes the starting directory for future content. Adding tasks keeps the current workflow open and shows the acknowledged result with a Download History entry. Failed admissions keep their selections for retry.
 
 The two circles at the upper right open the account menu and Download History. The account menu includes account switching and Settings. New logins remain in memory unless you explicitly choose to remember them. Account changes apply to future tasks; an existing failed task can explicitly select replacement credentials. An unknown credential expiry is shown as unknown.
 
@@ -13,6 +13,8 @@ Download History has In Progress, Failed and Completed views, with content-type 
 Completed files can be located in Windows Explorer. Media Information shows actual available media/attachment parameters, with missing values left unknown. Removal distinguishes deleting the record from moving verified owned files to the system Recycle Bin. Modified or unrelated files are retained; recovery of recycled files uses the system Recycle Bin. A project with several output directories offers those actual directories.
 
 These source features have not been published as a GUI release. Local/offline checks do not establish live-site availability or solve a real verification challenge.
+
+Background opacity controls the original image's transparency. At 100% it retains its source colors; partial opacity blends over a neutral background. Theme changes affect interface controls without tinting the image. Crop and blur remain separate choices.
 
 ## Build and updates
 

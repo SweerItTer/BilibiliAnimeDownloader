@@ -14,8 +14,8 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QualityChoice {
     Common,
-    Highest,
     Exact(u32),
+    Unavailable,
 }
 #[derive(Clone)]
 struct Row {
@@ -40,6 +40,7 @@ pub struct ConfigState {
     pub directory: String,
     pub make_default: bool,
     rate_mib: f64,
+    pub(crate) advanced_open: bool,
     subtitles: bool,
     danmaku: bool,
     quality: Option<u32>,
@@ -62,6 +63,7 @@ impl Default for ConfigState {
             directory: String::new(),
             make_default: false,
             rate_mib: 0.0,
+            advanced_open: false,
             subtitles: true,
             danmaku: true,
             quality: None,
@@ -121,6 +123,7 @@ impl ConfigState {
         items: Vec<PreparedItem>,
         profile: Option<String>,
         default: &std::path::Path,
+        default_rate_mib: f64,
         refresh: bool,
     ) {
         let same = (refresh || self.matches_intent(&items))
@@ -138,6 +141,7 @@ impl ConfigState {
             let intent = Self::intent_key(&items);
             *self = Self {
                 directory: default.display().to_string(),
+                rate_mib: crate::prefs::sanitize_download_rate(default_rate_mib),
                 batch_id: format!("gui-{}", bili_core::JobId::new()),
                 intent,
                 ..Self::default()
@@ -147,15 +151,27 @@ impl ConfigState {
                 .map(|prepared| Row {
                     selected: prepared.selected.clone(),
                     prepared,
-                    choice: QualityChoice::Common,
+                    choice: QualityChoice::Unavailable,
                     skip: false,
                     fulfilled: false,
                 })
                 .collect();
         }
+        for index in 0..self.rows.len() {
+            if self.rows[index].choice == QualityChoice::Unavailable {
+                if let Some(quality) = self.preferred_quality(&self.rows[index]) {
+                    self.rows[index].choice = QualityChoice::Exact(quality);
+                }
+            }
+        }
         self.catalog_profile = profile;
         self.error = None;
-        self.verification = None;
+        self.verification = self
+            .rows
+            .iter()
+            .flat_map(|row| &row.prepared.catalogs)
+            .filter_map(|(_, result)| result.as_ref().err())
+            .find_map(|error| error.verification.clone());
         self.open = true;
     }
     pub fn exclude_admitted(&mut self, parts: Vec<PartRef>) {
@@ -178,9 +194,17 @@ impl ConfigState {
     fn quality_for(&self, row: &Row) -> Option<u32> {
         match row.choice {
             QualityChoice::Common => self.quality,
-            QualityChoice::Highest => None,
             QualityChoice::Exact(id) => Some(id),
+            QualityChoice::Unavailable => None,
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn review_rate_override(&mut self, rate: f64) {
+        self.advanced_open = true;
+        self.set_rate_override(rate);
+    }
+    fn set_rate_override(&mut self, rate: f64) {
+        self.rate_mib = crate::prefs::sanitize_download_rate(rate);
     }
     fn catalog<'a>(row: &'a Row, part: &PartRef) -> Result<&'a QualityCatalog, String> {
         row.prepared
@@ -190,6 +214,85 @@ impl ConfigState {
             .ok_or_else(|| "画质尚未检查。".into())
             .and_then(|(_, r)| r.as_ref().map_err(backend::error_message))
     }
+    fn usable_qualities(&self, row: &Row) -> Vec<(u32, String)> {
+        let Some(first) = row.selected.first() else {
+            return Vec::new();
+        };
+        let Ok(catalog) = Self::catalog(row, first) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<_> = catalog
+            .representations
+            .iter()
+            .filter(|r| !r.audio)
+            .map(|r| r.quality)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.retain(|id| {
+            row.selected.iter().all(|reference| {
+                let Some(part) = row
+                    .prepared
+                    .item
+                    .parts
+                    .iter()
+                    .find(|p| &p.reference == reference)
+                else {
+                    return false;
+                };
+                let Ok(catalog) = Self::catalog(row, reference) else {
+                    return false;
+                };
+                let mut selection = self.selection(row, part);
+                selection.quality = Some(*id);
+                catalog.select(&selection).is_ok()
+            })
+        });
+        ids.into_iter()
+            .rev()
+            .map(|id| (id, quality_label(id, &self.rows)))
+            .collect()
+    }
+    fn usable_union(&self) -> Vec<(u32, String)> {
+        let mut choices = Vec::new();
+        for row in self.rows.iter().filter(|r| !r.skip) {
+            for choice in self.usable_qualities(row) {
+                if !choices.iter().any(|(id, _)| *id == choice.0) {
+                    choices.push(choice);
+                }
+            }
+        }
+        choices.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
+        choices
+    }
+    fn preferred_quality(&self, row: &Row) -> Option<u32> {
+        let choices = self.usable_qualities(row);
+        let first = row.selected.first()?;
+        let part = row
+            .prepared
+            .item
+            .parts
+            .iter()
+            .find(|p| &p.reference == first)?;
+        let mut catalog = Self::catalog(row, first).ok()?.clone();
+        catalog
+            .representations
+            .retain(|r| r.audio || choices.iter().any(|(id, _)| *id == r.quality));
+        let mut selection = self.selection(row, part);
+        selection.quality = None;
+        catalog
+            .select(&selection)
+            .ok()
+            .map(|(video, _)| video.quality)
+    }
+    fn apply_common_quality(&mut self, quality: u32) {
+        self.quality = Some(quality);
+        for row in &mut self.rows {
+            if !row.skip && !row.selected.is_empty() {
+                row.choice = QualityChoice::Common;
+            }
+        }
+    }
     fn row_error(&self, row: &Row) -> Option<String> {
         if row.skip || (row.fulfilled && row.selected.is_empty()) {
             return None;
@@ -197,32 +300,32 @@ impl ConfigState {
         if row.selected.is_empty() {
             return Some("请选择分集，或跳过此内容。".into());
         }
-        let quality = self.quality_for(row);
-        for part in &row.selected {
-            let catalog = match Self::catalog(row, part) {
-                Ok(c) => c,
-                Err(e) => return Some(e),
+        let mut parts = Vec::new();
+        for reference in &row.selected {
+            let catalog = match Self::catalog(row, reference) {
+                Ok(catalog) => catalog,
+                Err(error) => return Some(error),
             };
-            let Some(source_part) = row
+            let Some(part) = row
                 .prepared
                 .item
                 .parts
                 .iter()
-                .find(|p| p.reference == *part)
+                .find(|part| &part.reference == reference)
             else {
                 return Some("分集已变化，请重新选择。".into());
             };
-            if catalog.select(&self.selection(row, source_part)).is_err() {
-                let label =
-                    quality.map_or_else(|| "可下载画质".into(), |id| quality_label(id, &self.rows));
+            parts.push((part, catalog));
+        }
+        let Some(quality) = self.quality_for(row) else {
+            return Some("没有可下载的画质，请重新检查内容或账号。".into());
+        };
+        for (part, catalog) in parts {
+            if catalog.select(&self.selection(row, part)).is_err() {
                 return Some(format!(
-                    "{}没有可获取的 {label}；请选择其他画质或跳过。",
-                    row.prepared
-                        .item
-                        .parts
-                        .iter()
-                        .find(|p| p.reference == *part)
-                        .map_or_else(String::new, |p| format!("第 {} 项", p.ordinal))
+                    "第 {} 项没有可获取的 {}；请选择其他画质或跳过。",
+                    part.ordinal,
+                    quality_label(quality, &self.rows)
                 ));
             }
         }
@@ -300,19 +403,53 @@ impl ConfigState {
         if !self.open {
             return None;
         }
-        let mut open = self.open;
+        let bounds = dialog_bounds(ctx.screen_rect());
+        let inner = (bounds.size() - egui::Vec2::splat(32.0)).max(egui::Vec2::splat(1.0));
+        let stacked_footer = inner.x < 500.0 && !self.receipts.is_empty();
+        let footer_rows = if stacked_footer { 3.0 } else { 1.0 };
         let mut action = None;
         egui::Window::new("下载配置")
             .id(egui::Id::new("download-config"))
-            .open(&mut open)
+            .title_bar(false)
             .collapsible(false)
-            .resizable(true)
-            .default_width(720.0)
-            .max_width((ctx.screen_rect().width() - 40.0).max(280.0))
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .resizable(false)
+            .frame(egui::Frame::window(&ctx.style()).inner_margin(16.0))
+            .fixed_pos(bounds.min)
+            .fixed_size(inner)
+            .min_size(egui::Vec2::ZERO)
+            .max_size(inner)
+            .constrain_to(bounds)
             .show(ctx, |ui| {
+                ui.set_width(inner.x);
+                let button_height = ui
+                    .fonts(|fonts| fonts.row_height(&egui::TextStyle::Button.resolve(ui.style())))
+                    .ceil()
+                    + 2.0 * ui.spacing().button_padding.y;
+                let row_height = button_height.max(ui.spacing().interact_size.y);
+                let header = ui.allocate_ui_with_layout(
+                    egui::vec2(inner.x, row_height),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui.small_button("关闭").clicked() {
+                            self.open = false;
+                        }
+                    },
+                );
+                // A Window can offer an unbounded available height while measuring its
+                // contents. Budget the scroll body from the finite viewport instead so
+                // the close row and admission controls always remain inside the frame.
+                let footer_height =
+                    row_height * footer_rows + ui.spacing().item_spacing.y * (footer_rows - 1.0);
+                let body_height = (inner.y
+                    - header.response.rect.height()
+                    - footer_height
+                    - 2.0 * ui.spacing().item_spacing.y)
+                    .max(0.0);
+
                 egui::ScrollArea::vertical()
-                    .max_height((ctx.screen_rect().height() - 165.0).max(180.0))
+                    .id_salt("download-config-body")
+                    .auto_shrink([false, false])
+                    .max_height(body_height)
                     .show(ui, |ui| {
                         if let Some(result) = &self.result {
                             ui.label(result);
@@ -364,104 +501,56 @@ impl ConfigState {
                                     }
                                 }
                             });
-                            ui.checkbox(&mut self.make_default, "添加成功后设为默认目录");
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("统一画质");
-                                let choices = qualities(&self.rows);
-                                egui::ComboBox::from_id_salt("common-quality")
-                                    .selected_text(self.quality.map_or_else(
-                                        || "最高可用画质".into(),
-                                        |q| quality_label(q, &self.rows),
-                                    ))
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut self.quality,
-                                            None,
-                                            "最高可用画质",
-                                        );
-                                        for (id, label) in choices {
-                                            ui.selectable_value(&mut self.quality, Some(id), label);
-                                        }
-                                    });
-                                ui.label("批次总限速");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.rate_mib)
-                                        .range(0.0..=10240.0)
-                                        .speed(0.1)
-                                        .suffix(" MiB/s"),
-                                );
-                                theme::muted(ui, "0 不限速");
-                            });
+                            if self.rows.len() > 1 {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("批量画质");
+                                    let choices = self.usable_union();
+                                    let mut selected = None;
+                                    egui::ComboBox::from_id_salt("common-quality")
+                                        .selected_text(self.quality.map_or_else(
+                                            || "选择画质".into(),
+                                            |id| quality_label(id, &self.rows),
+                                        ))
+                                        .show_ui(ui, |ui| {
+                                            for (id, label) in choices {
+                                                if ui
+                                                    .selectable_label(
+                                                        self.quality == Some(id),
+                                                        label,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    selected = Some(id);
+                                                }
+                                            }
+                                        });
+                                    if let Some(quality) = selected {
+                                        self.apply_common_quality(quality);
+                                    }
+                                });
+                            }
                             ui.horizontal_wrapped(|ui| {
                                 ui.checkbox(&mut self.subtitles, "字幕");
                                 ui.checkbox(&mut self.danmaku, "弹幕");
                             });
-                            let previous = self.account.clone();
-                            egui::ComboBox::from_id_salt("batch-account")
-                                .selected_text(match &self.account {
-                                    AccountChoice::Follow => "跟随当前账号".into(),
-                                    AccountChoice::Anonymous => "匿名".into(),
-                                    AccountChoice::Profile(id) => profile_label(id, auth),
-                                })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.account,
-                                        AccountChoice::Follow,
-                                        "跟随当前账号",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.account,
-                                        AccountChoice::Anonymous,
-                                        "匿名",
-                                    );
-                                    if let Some(auth) = auth {
-                                        for profile in &auth.profiles {
-                                            ui.selectable_value(
-                                                &mut self.account,
-                                                AccountChoice::Profile(profile.id.clone()),
-                                                &profile.account.name,
-                                            );
-                                        }
-                                    }
-                                });
-                            if self.account != previous {
-                                action = Some(Operation::Prepare {
-                                    refresh: true,
-                                    inputs: self.inputs(),
-                                    profile: self.effective_profile(auth),
-                                });
-                            }
                         });
-                        if ui
-                            .add_enabled(available, egui::Button::new("重新检查画质"))
-                            .clicked()
-                        {
-                            action = Some(Operation::Prepare {
-                                refresh: true,
-                                inputs: self.inputs(),
-                                profile: self.effective_profile(auth),
-                            });
-                        }
                         let profile = self.effective_profile(auth);
                         let profile_stale = profile != self.catalog_profile;
                         if profile_stale {
-                            ui.colored_label(theme::ERROR, "账号已变化，请重新检查画质。");
-                            if ui
-                                .add_enabled(available, egui::Button::new("检查当前账号画质"))
-                                .clicked()
-                            {
-                                action = Some(Operation::Prepare {
-                                    refresh: true,
-                                    inputs: self.inputs(),
-                                    profile,
-                                });
-                            }
+                            ui.colored_label(
+                                theme::ERROR,
+                                "账号已变化，请在高级设置中重新检查画质。",
+                            );
                         }
                         ui.separator();
-                        let labels = qualities(&self.rows);
-                        let common = self.quality;
                         for index in 0..self.rows.len() {
                             let error = self.row_error(&self.rows[index]);
+                            let choices = self.usable_qualities(&self.rows[index]);
+                            let selected_quality = self.quality_for(&self.rows[index]);
+                            let selected_text = selected_quality.map_or_else(
+                                || "没有可用画质".into(),
+                                |quality| quality_label(quality, &self.rows),
+                            );
                             let row = &mut self.rows[index];
                             let frame = egui::Frame::group(ui.style()).stroke(egui::Stroke::new(
                                 1.0_f32,
@@ -479,48 +568,24 @@ impl ConfigState {
                                     });
                                 });
                                 ui.add_enabled_ui(available && !row.skip, |ui| {
-                                    egui::ComboBox::from_id_salt(("row-quality", index))
-                                        .selected_text(match row.choice {
-                                            QualityChoice::Common => format!(
-                                                "统一设置 · {}",
-                                                common.map_or_else(
-                                                    || "最高可用".into(),
-                                                    |q| labels
-                                                        .iter()
-                                                        .find(|(id, _)| *id == q)
-                                                        .map_or_else(
-                                                            || format!("画质 {q}"),
-                                                            |(_, l)| l.clone()
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("画质");
+                                        egui::ComboBox::from_id_salt(("row-quality", index))
+                                            .selected_text(selected_text)
+                                            .show_ui(ui, |ui| {
+                                                for (id, label) in choices {
+                                                    if ui
+                                                        .selectable_label(
+                                                            selected_quality == Some(id),
+                                                            label,
                                                         )
-                                                )
-                                            ),
-                                            QualityChoice::Highest => "本项最高可用".into(),
-                                            QualityChoice::Exact(q) => {
-                                                labels.iter().find(|(id, _)| *id == q).map_or_else(
-                                                    || format!("画质 {q}"),
-                                                    |(_, l)| l.clone(),
-                                                )
-                                            }
-                                        })
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut row.choice,
-                                                QualityChoice::Common,
-                                                "跟随统一设置",
-                                            );
-                                            ui.selectable_value(
-                                                &mut row.choice,
-                                                QualityChoice::Highest,
-                                                "本项最高可用",
-                                            );
-                                            for (id, label) in &labels {
-                                                ui.selectable_value(
-                                                    &mut row.choice,
-                                                    QualityChoice::Exact(*id),
-                                                    label,
-                                                );
-                                            }
-                                        });
+                                                        .clicked()
+                                                    {
+                                                        row.choice = QualityChoice::Exact(id);
+                                                    }
+                                                }
+                                            });
+                                    });
                                     ui.horizontal(|ui| {
                                         if ui.small_button("全选").clicked() {
                                             row.selected = row
@@ -573,6 +638,9 @@ impl ConfigState {
                             });
                             ui.add_space(6.0);
                         }
+                        if let Some(operation) = self.advanced_options(ui, available, auth) {
+                            action = Some(operation);
+                        }
                         if !self.receipts.is_empty() {
                             ui.separator();
                             ui.label("已添加");
@@ -597,41 +665,135 @@ impl ConfigState {
                     .map(|r| r.selected.len())
                     .sum::<usize>();
                 let blocked = !self.can_submit(auth);
-                ui.horizontal(|ui| {
-                    if !self.receipts.is_empty() && ui.button("查看下载").clicked() {
-                        self.history_requested = true;
-                    }
-                    if ui
-                        .add_enabled(
-                            available && count > 0 && !blocked,
-                            egui::Button::new(format!("开始下载 · {count} 项")),
-                        )
-                        .clicked()
-                    {
-                        self.batch_id = format!("gui-{}", bili_core::JobId::new());
-                        let selections = self.requests(auth);
-                        self.result = None;
-                        self.error = None;
-                        action = Some(Operation::Enqueue {
-                            selections,
-                            output_dir: PathBuf::from(&self.directory),
-                        });
-                    }
-                    if ui
-                        .button(if self.receipts.is_empty() {
-                            "关闭"
-                        } else {
-                            "继续添加其他内容"
-                        })
-                        .clicked()
-                    {
-                        self.open = false;
-                    }
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(inner.x, footer_height),
+                    if stacked_footer {
+                        egui::Layout::top_down(egui::Align::Min)
+                    } else {
+                        egui::Layout::left_to_right(egui::Align::Center)
+                    },
+                    |ui| {
+                        if !self.receipts.is_empty() && ui.button("查看下载").clicked() {
+                            self.history_requested = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                available && count > 0 && !blocked,
+                                egui::Button::new(format!("开始下载 · {count} 项")),
+                            )
+                            .clicked()
+                        {
+                            self.batch_id = format!("gui-{}", bili_core::JobId::new());
+                            let selections = self.requests(auth);
+                            self.result = None;
+                            self.error = None;
+                            action = Some(Operation::Enqueue {
+                                selections,
+                                output_dir: PathBuf::from(&self.directory),
+                            });
+                        }
+                        if !self.receipts.is_empty() && ui.button("继续添加其他内容").clicked()
+                        {
+                            self.open = false;
+                        }
+                    },
+                );
             });
-        self.open &= open;
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.open = false;
+        }
+        action
+    }
+    fn advanced_options(
+        &mut self,
+        ui: &mut egui::Ui,
+        available: bool,
+        auth: Option<&AuthSnapshot>,
+    ) -> Option<Operation> {
+        let advanced = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let icon_width = ui.spacing().icon_width;
+                let (icon_rect, icon_response) = ui.allocate_exact_size(
+                    egui::vec2(icon_width, ui.spacing().interact_size.y),
+                    egui::Sense::click(),
+                );
+                let response =
+                    icon_response.union(ui.selectable_label(self.advanced_open, "高级设置"));
+                egui::collapsing_header::paint_default_icon(
+                    ui,
+                    if self.advanced_open { 1.0 } else { 0.0 },
+                    &response.clone().with_new_rect(egui::Rect::from_center_size(
+                        icon_rect.center(),
+                        egui::Vec2::splat(icon_width),
+                    )),
+                );
+                response
+            })
+            .inner;
+        if advanced.clicked() {
+            self.advanced_open = !self.advanced_open;
+        }
+        let mut action = None;
+        if self.advanced_open {
+            let options = ui.add_enabled_ui(available, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("本次下载限速");
+                    let mut rate = self.rate_mib;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut rate)
+                                .range(0.0..=crate::prefs::MAX_DOWNLOAD_RATE_MIB)
+                                .speed(0.1)
+                                .suffix(" MiB/s"),
+                        )
+                        .changed()
+                    {
+                        self.set_rate_override(rate);
+                    }
+                    theme::muted(ui, "0 不限速");
+                });
+                ui.checkbox(&mut self.make_default, "添加成功后设为默认目录");
+                let previous = self.account.clone();
+                egui::ComboBox::from_id_salt("batch-account")
+                    .selected_text(match &self.account {
+                        AccountChoice::Follow => "跟随当前账号".into(),
+                        AccountChoice::Anonymous => "匿名".into(),
+                        AccountChoice::Profile(id) => profile_label(id, auth),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.account,
+                            AccountChoice::Follow,
+                            "跟随当前账号",
+                        );
+                        ui.selectable_value(&mut self.account, AccountChoice::Anonymous, "匿名");
+                        if let Some(auth) = auth {
+                            for profile in &auth.profiles {
+                                ui.selectable_value(
+                                    &mut self.account,
+                                    AccountChoice::Profile(profile.id.clone()),
+                                    &profile.account.name,
+                                );
+                            }
+                        }
+                    });
+                let recheck = ui.button("重新检查画质").clicked();
+                if self.account != previous || recheck {
+                    action = Some(Operation::Prepare {
+                        refresh: true,
+                        inputs: self.inputs(),
+                        profile: self.effective_profile(auth),
+                    });
+                }
+            });
+            if advanced.clicked() {
+                ui.scroll_to_rect_animation(
+                    advanced.rect.union(options.response.rect),
+                    Some(egui::Align::Min),
+                    egui::style::ScrollAnimation::none(),
+                );
+            }
         }
         action
     }
@@ -700,27 +862,49 @@ impl ConfigState {
             .collect()
     }
 }
-fn qualities(rows: &[Row]) -> Vec<(u32, String)> {
-    let mut out = Vec::new();
+fn dialog_bounds(screen: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        screen.center(),
+        egui::vec2(
+            (screen.width() * 0.8).clamp(1.0, 720.0),
+            (screen.height() * 0.8).clamp(1.0, 720.0),
+        ),
+    )
+}
+fn quality_label(id: u32, rows: &[Row]) -> String {
     for row in rows {
         for (_, result) in &row.prepared.catalogs {
             if let Ok(catalog) = result {
-                for entry in &catalog.advertised {
-                    if !out.iter().any(|(id, _)| *id == entry.id) {
-                        out.push((entry.id, entry.label.clone()));
+                if let Some(entry) = catalog
+                    .advertised
+                    .iter()
+                    .find(|entry| entry.id == id && !entry.label.trim().is_empty())
+                {
+                    return entry.label.clone();
+                }
+            }
+        }
+    }
+    for row in rows {
+        for (_, result) in &row.prepared.catalogs {
+            if let Ok(catalog) = result {
+                if let Some(video) = catalog
+                    .representations
+                    .iter()
+                    .find(|representation| !representation.audio && representation.quality == id)
+                {
+                    match (video.width, video.height) {
+                        (Some(width), Some(height)) if width > 0 && height > 0 => {
+                            return format!("{width} × {height}");
+                        }
+                        (_, Some(height)) if height > 0 => return format!("{height}P"),
+                        _ => {}
                     }
                 }
             }
         }
     }
-    out.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
-    out
-}
-fn quality_label(id: u32, rows: &[Row]) -> String {
-    qualities(rows)
-        .into_iter()
-        .find(|(q, _)| *q == id)
-        .map_or_else(|| format!("画质 {id}"), |(_, l)| l)
+    format!("画质 {id}")
 }
 fn profile_label(id: &str, auth: Option<&AuthSnapshot>) -> String {
     auth.and_then(|a| a.profiles.iter().find(|p| p.id == id))
@@ -751,7 +935,14 @@ mod tests {
                 .iter()
                 .map(|q| QualityEntry {
                     id: *q,
-                    label: format!("画质 {q}"),
+                    label: match *q {
+                        120 => "4K",
+                        112 => "1080P 高码率",
+                        80 => "1080P",
+                        64 => "720P",
+                        _ => "其他画质",
+                    }
+                    .into(),
                     rank: *q,
                     availability: Availability::Obtainable,
                     requires_login: None,
@@ -767,12 +958,24 @@ mod tests {
                     id: u64::from(*q),
                     quality: *q,
                     codec: "avc1".into(),
-                    width: Some(1280),
-                    height: Some(720),
+                    width: Some(if *q >= 120 {
+                        3840
+                    } else if *q >= 80 {
+                        1920
+                    } else {
+                        1280
+                    }),
+                    height: Some(if *q >= 120 {
+                        2160
+                    } else if *q >= 80 {
+                        1080
+                    } else {
+                        720
+                    }),
                     fps: None,
                     dynamic_range: None,
                     color: None,
-                    bandwidth: 1000,
+                    bandwidth: u64::from(*q) * 1000,
                     audio: false,
                     sample_rate: None,
                     channels: None,
@@ -844,16 +1047,17 @@ mod tests {
             vec![prepared(1, &[64]), prepared(2, &[112, 80, 64])],
             None,
             &root,
+            0.0,
             false,
         );
-        config.quality = Some(112);
+        config.apply_common_quality(112);
         assert!(config.row_error(&config.rows[0]).is_some());
         assert!(config.row_error(&config.rows[1]).is_none());
         assert!(!config.can_submit(None));
-        config.rows[0].choice = QualityChoice::Highest;
+        config.rows[0].choice = QualityChoice::Exact(64);
         assert!(config.can_submit(None));
         let requests = config.requests(None);
-        assert_eq!(requests[0].selection.quality, None);
+        assert_eq!(requests[0].selection.quality, Some(64));
         assert_eq!(requests[1].selection.quality, Some(112));
         assert_eq!(requests[0].context.project.as_ref().unwrap().ordinal, 3);
         config.rows[0].choice = QualityChoice::Exact(80);
@@ -869,8 +1073,8 @@ mod tests {
         item.catalogs[0].1.as_mut().unwrap().advertised[0].availability =
             Availability::EntitlementRequired;
         let mut config = ConfigState::default();
-        config.accept(vec![item], None, &root, false);
-        config.quality = Some(112);
+        config.accept(vec![item], None, &root, 0.0, false);
+        config.apply_common_quality(112);
         assert!(
             !config.can_submit(None),
             "metadata alone must not make a gated representation selectable"
@@ -902,7 +1106,7 @@ mod tests {
         let root = std::env::temp_dir().join("bili-receipt-tests");
         let mut config = ConfigState::default();
         let items = vec![prepared(1, &[64]), prepared(2, &[64])];
-        config.accept(items.clone(), None, &root, false);
+        config.accept(items.clone(), None, &root, 0.0, false);
         let request = config.requests(None).remove(0);
         let admitted = receipt(&request, root.join("original.mp4"));
         let original = serde_json::to_value(&admitted.plan).unwrap();
@@ -918,13 +1122,13 @@ mod tests {
             .display()
             .to_string();
         config.rate_mib = 4.5;
-        config.quality = Some(112);
+        config.apply_common_quality(112);
         assert_eq!(
             serde_json::to_value(&config.receipts[0].plan).unwrap(),
             original
         );
         config.open = false;
-        config.accept(items, None, &root, false);
+        config.accept(items, None, &root, 0.0, false);
         assert_eq!(config.rate_mib, 4.5);
         assert!(config.rows[1].selected.is_empty());
         assert_eq!(
@@ -944,20 +1148,371 @@ mod tests {
         second.ordinal = 4;
         first.item.parts.push(second.clone());
         let mut config = ConfigState::default();
-        config.accept(vec![first.clone()], None, &root, false);
+        config.accept(vec![first.clone()], None, &root, 0.0, false);
         config.directory = std::env::temp_dir()
             .join("deliberate-draft")
             .display()
             .to_string();
         config.rate_mib = 2.0;
-        config.accept(vec![first.clone()], None, &root, true);
+        config.accept(vec![first.clone()], None, &root, 0.0, true);
         assert_eq!(config.rate_mib, 2.0);
         let mut changed = first;
         changed.selected = vec![second.reference.clone()];
         assert!(!config.matches_intent(std::slice::from_ref(&changed)));
-        config.accept(vec![changed], None, &root, false);
+        config.accept(vec![changed], None, &root, 0.0, false);
         assert_eq!(config.rows[0].selected, vec![second.reference]);
         assert_eq!(config.directory, root.display().to_string());
         assert_eq!(config.rate_mib, 0.0);
+    }
+    #[test]
+    fn advertised_only_quality_is_absent_and_single_content_defaults_to_concrete_obtainable_quality(
+    ) {
+        let root = std::env::temp_dir().join("bili-usable-quality");
+        let mut item = prepared(1, &[80, 64]);
+        let mut advertised = item.catalogs[0].1.as_ref().unwrap().advertised[0].clone();
+        advertised.id = 120;
+        advertised.label = "4K".into();
+        advertised.rank = 120;
+        advertised.has_video_url = false;
+        item.catalogs[0]
+            .1
+            .as_mut()
+            .unwrap()
+            .advertised
+            .push(advertised);
+        let mut config = ConfigState::default();
+        config.accept(vec![item], None, &root, 0.0, false);
+        assert_eq!(config.quality_for(&config.rows[0]), Some(80));
+        assert_eq!(
+            config
+                .usable_qualities(&config.rows[0])
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![80, 64]
+        );
+        assert!(config.can_submit(None));
+        let ctx = egui::Context::default();
+        theme::apply_style(&ctx, false);
+        let size = egui::vec2(1180.0, 800.0);
+        let _ = frame(&ctx, &mut config, size, vec![]);
+        let output = frame(&ctx, &mut config, size, vec![]);
+        let labels = texts(&output);
+        assert_eq!(labels.iter().filter(|(text, _)| text == "1080P").count(), 1);
+        assert!(!labels.iter().any(|(text, _)| text.contains("最高")
+            || text.contains("批量画质")
+            || text == "下载配置"));
+        click(&ctx, &mut config, size, "1080P");
+        let output = frame(&ctx, &mut config, size, vec![]);
+        let labels = texts(&output);
+        assert!(labels.iter().any(|(text, _)| text == "720P"));
+        assert!(!labels.iter().any(|(text, _)| text == "4K"));
+        config.rows[0].prepared.catalogs[0]
+            .1
+            .as_mut()
+            .unwrap()
+            .advertised
+            .clear();
+        assert_eq!(quality_label(80, &config.rows), "1920 × 1080");
+    }
+    #[test]
+    fn available_intersection_and_account_refresh_never_silently_replace_an_explicit_quality() {
+        let root = std::env::temp_dir().join("bili-quality-refresh");
+        let item = prepared(1, &[120, 80, 64]);
+        let mut config = ConfigState::default();
+        config.accept(vec![item.clone()], None, &root, 0.0, false);
+        config.rows[0].choice = QualityChoice::Exact(120);
+        let mut gated = item.clone();
+        gated.catalogs[0].1.as_mut().unwrap().advertised[0].availability =
+            Availability::EntitlementRequired;
+        config.accept(vec![gated], None, &root, 0.0, true);
+        assert_eq!(config.quality_for(&config.rows[0]), Some(120));
+        assert!(config.row_error(&config.rows[0]).is_some());
+        assert_eq!(
+            config
+                .usable_qualities(&config.rows[0])
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![80, 64]
+        );
+        let mut multipart = prepared(2, &[80, 64]);
+        let mut part = multipart.item.parts[0].clone();
+        part.reference.cid = Cid::new(900).unwrap();
+        part.ordinal = 4;
+        let mut lower = prepared(3, &[64]).catalogs.remove(0).1.unwrap();
+        lower.part = part.reference.clone();
+        for representation in &mut lower.representations {
+            representation.part = part.reference.clone();
+        }
+        multipart.selected.push(part.reference.clone());
+        multipart.catalogs.push((part.reference.clone(), Ok(lower)));
+        multipart.item.parts.push(part);
+        config.accept(vec![multipart], None, &root, 0.0, false);
+        assert_eq!(
+            config
+                .usable_qualities(&config.rows[0])
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![64]
+        );
+        assert_eq!(config.quality_for(&config.rows[0]), Some(64));
+    }
+    #[test]
+    fn catalog_failures_keep_the_actionable_reason_even_without_a_concrete_quality() {
+        let root = std::env::temp_dir().join("bili-catalog-failure");
+        let mut item = prepared(1, &[80]);
+        let error = bili_core::CoreError::new(bili_core::ErrorCode::Transport, "fixture catalog");
+        let message = backend::error_message(&error);
+        item.catalogs[0].1 = Err(error);
+        let mut config = ConfigState::default();
+        config.accept(vec![item], None, &root, 0.0, false);
+        assert_eq!(config.row_error(&config.rows[0]), Some(message));
+        assert!(!config.can_submit(None));
+        let mut multipart = prepared(2, &[80]);
+        let mut part = multipart.item.parts[0].clone();
+        part.reference.cid = Cid::new(901).unwrap();
+        part.ordinal = 4;
+        multipart.selected.push(part.reference.clone());
+        multipart.item.parts.push(part.clone());
+        let error = bili_core::CoreError::new(
+            bili_core::ErrorCode::LoginRequired,
+            "fixture second catalog",
+        );
+        let expected = backend::error_message(&error);
+        multipart.catalogs.push((part.reference, Err(error)));
+        config.accept(vec![multipart], None, &root, 0.0, false);
+        assert_eq!(config.row_error(&config.rows[0]), Some(expected));
+    }
+    #[test]
+    fn new_drafts_inherit_the_global_rate_but_overrides_and_receipts_remain_local() {
+        let root = std::env::temp_dir().join("bili-rate-default");
+        let prefs = crate::prefs::GuiPrefs {
+            default_download_rate_mib: 10.0,
+            ..Default::default()
+        };
+        let first = prepared(1, &[80]);
+        let mut config = ConfigState::default();
+        config.accept(
+            vec![first.clone()],
+            None,
+            &root,
+            prefs.default_download_rate_mib,
+            false,
+        );
+        assert_eq!(config.rate_mib, 10.0);
+        assert!(!config.advanced_open);
+        config.review_rate_override(100.0);
+        let request = config.requests(None).remove(0);
+        assert_eq!(
+            request.context.batch.as_ref().unwrap().rate_limit,
+            Some(100 * 1048576)
+        );
+        let receipt = receipt(&request, root.join("first.mp4"));
+        let recorded = serde_json::to_value(&receipt.plan).unwrap();
+        config.receipts.push(receipt);
+        config.open = false;
+        config.accept(
+            vec![first],
+            None,
+            &root,
+            prefs.default_download_rate_mib,
+            false,
+        );
+        assert_eq!(config.rate_mib, 100.0);
+        assert!(config.advanced_open);
+        assert_eq!(prefs.default_download_rate_mib, 10.0);
+        config.set_rate_override(5.0);
+        assert_eq!(
+            serde_json::to_value(&config.receipts[0].plan).unwrap(),
+            recorded
+        );
+        config.accept(
+            vec![prepared(2, &[80])],
+            None,
+            &root,
+            prefs.default_download_rate_mib,
+            false,
+        );
+        assert_eq!(config.rate_mib, 10.0);
+        assert!(!config.advanced_open);
+        assert_eq!(
+            config.requests(None)[0]
+                .context
+                .batch
+                .as_ref()
+                .unwrap()
+                .rate_limit,
+            Some(10 * 1048576)
+        );
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        config: &mut ConfigState,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                let _ = config.show(ctx, true, None);
+            },
+        )
+    }
+    fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn visit(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => out.push((
+                    text.galley.job.text.clone(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                )),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for shape in &output.shapes {
+            visit(&shape.shape, &mut out);
+        }
+        out
+    }
+    fn click(ctx: &egui::Context, config: &mut ConfigState, size: egui::Vec2, label: &str) {
+        let output = frame(ctx, config, size, vec![]);
+        let pos = texts(&output)
+            .into_iter()
+            .find(|(text, _)| text == label)
+            .unwrap_or_else(|| panic!("missing {label}"))
+            .1
+            .center();
+        let _ = frame(
+            ctx,
+            config,
+            size,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        let _ = frame(
+            ctx,
+            config,
+            size,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+    }
+    #[test]
+    fn dialog_stays_centered_inside_safe_margins_and_advanced_is_inline_and_retained() {
+        let root = std::env::temp_dir().join("bili-config-layout");
+        for size in [
+            egui::vec2(1180.0, 800.0),
+            egui::vec2(900.0, 640.0),
+            egui::vec2(320.0, 480.0),
+        ] {
+            let ctx = egui::Context::default();
+            theme::apply_style(&ctx, false);
+            let mut config = ConfigState::default();
+            let item = prepared(1, &[80, 64]);
+            config.accept(vec![item.clone()], None, &root, 10.0, false);
+            let _ = frame(&ctx, &mut config, size, vec![]);
+            let output = frame(&ctx, &mut config, size, vec![]);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let bounds = ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("download-config")))
+                .unwrap();
+            assert!(
+                screen.shrink(20.0).contains_rect(bounds),
+                "{size:?}: {bounds:?}"
+            );
+            assert!(
+                bounds.width() <= 720.1
+                    && bounds.width() <= size.x * 0.8 + 1.0
+                    && bounds.height() <= size.y * 0.8 + 1.0
+            );
+            assert!(
+                (bounds.center() - screen.center()).length() < 1.0,
+                "{size:?}: {bounds:?}"
+            );
+            let labels = texts(&output);
+            for label in ["关闭", "开始下载 · 1 项"] {
+                let rect = labels
+                    .iter()
+                    .find(|(text, _)| text == label)
+                    .unwrap_or_else(|| panic!("missing {label}"))
+                    .1;
+                assert!(bounds.expand(1.0).contains_rect(rect));
+            }
+            assert!(!labels.iter().any(|(text, _)| matches!(
+                text.as_str(),
+                "下载配置"
+                    | "本次下载限速"
+                    | "跟随当前账号"
+                    | "重新检查画质"
+                    | "添加成功后设为默认目录"
+            )));
+            if size.x >= 900.0 {
+                for label in ["保存目录", "字幕", "弹幕", "视频 1", "1080P"] {
+                    let rect = labels
+                        .iter()
+                        .find(|(text, _)| text == label)
+                        .unwrap_or_else(|| panic!("{size:?}: primary {label} must be visible"))
+                        .1;
+                    assert!(bounds.contains_rect(rect), "{size:?}: {label}: {rect:?}");
+                }
+            } else {
+                // On tiny viewports the primary content scrolls normally. Reach the
+                // final Advanced row with actual pointer wheel input before opening it.
+                let _ = frame(
+                    &ctx,
+                    &mut config,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(bounds.center()),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -500.0),
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+                for _ in 0..30 {
+                    let _ = frame(&ctx, &mut config, size, vec![]);
+                }
+            }
+            click(&ctx, &mut config, size, "高级设置");
+            assert!(config.advanced_open);
+            // egui 0.29 positions scroll contents before applying a queued target
+            // offset, including a non-animated target. Paint the settled next frame.
+            let _ = frame(&ctx, &mut config, size, vec![]);
+            let output = frame(&ctx, &mut config, size, vec![]);
+            let rate = texts(&output)
+                .into_iter()
+                .find(|(text, _)| text == "本次下载限速")
+                .unwrap_or_else(|| panic!("{size:?}: expanded Advanced rate must be visible"))
+                .1;
+            assert!(bounds.contains_rect(rate), "{size:?}: {rate:?}");
+            config.open = false;
+            config.accept(vec![item], None, &root, 10.0, false);
+            assert!(config.advanced_open);
+        }
     }
 }

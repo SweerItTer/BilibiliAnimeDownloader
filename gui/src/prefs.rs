@@ -120,6 +120,15 @@ pub enum UpdateChannel {
     Beta,
 }
 
+pub const MAX_DOWNLOAD_RATE_MIB: f64 = 10240.0;
+pub fn sanitize_download_rate(rate: f64) -> f64 {
+    if rate.is_finite() {
+        rate.clamp(0.0, MAX_DOWNLOAD_RATE_MIB)
+    } else {
+        0.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuiPrefs {
@@ -140,6 +149,8 @@ pub struct GuiPrefs {
     /// Opt-in marker only: the credential itself lives in the OS keyring.
     pub remember_login: bool,
     pub output: Option<PathBuf>,
+    /// Initial shared batch rate in MiB/s for new drafts; zero is unlimited.
+    pub default_download_rate_mib: f64,
     /// Shared protocol preferences; this file never contains account credentials.
     pub update: bili_core::update::UpdateSettings,
     /// Unix seconds of the last successful or failed check. No credentials.
@@ -162,6 +173,7 @@ impl Default for GuiPrefs {
             confirm_close: true,
             remember_login: false,
             output: None,
+            default_download_rate_mib: 0.0,
             update: bili_core::update::UpdateSettings::default(),
             last_check: 0,
         }
@@ -193,6 +205,7 @@ impl GuiPrefs {
         self.opacity = self.opacity.clamp(0.0, 100.0);
         self.blur = self.blur.clamp(0.0, 100.0);
         self.ui_scale = self.ui_scale.clamp(0.8, 1.3);
+        self.default_download_rate_mib = sanitize_download_rate(self.default_download_rate_mib);
         self
     }
 
@@ -246,6 +259,38 @@ impl GuiPrefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn download_rate_default_is_persistent_bounded_and_backward_compatible() {
+        let older: GuiPrefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(older.default_download_rate_mib, 0.0);
+        let prefs = GuiPrefs {
+            default_download_rate_mib: 10.0,
+            ..Default::default()
+        };
+        let restored: GuiPrefs =
+            serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(restored.default_download_rate_mib, 10.0);
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -10.0] {
+            assert_eq!(
+                GuiPrefs {
+                    default_download_rate_mib: value,
+                    ..Default::default()
+                }
+                .sanitized()
+                .default_download_rate_mib,
+                0.0
+            );
+        }
+        assert_eq!(
+            GuiPrefs {
+                default_download_rate_mib: MAX_DOWNLOAD_RATE_MIB * 2.0,
+                ..Default::default()
+            }
+            .sanitized()
+            .default_download_rate_mib,
+            MAX_DOWNLOAD_RATE_MIB
+        );
+    }
 
     #[test]
     fn sanitize_clamps_crop_and_scale() {

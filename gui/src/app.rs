@@ -310,8 +310,10 @@ impl App {
 
     fn reset_appearance(&mut self) {
         let output = self.prefs.output.clone();
+        let default_download_rate_mib = self.prefs.default_download_rate_mib;
         self.prefs = GuiPrefs {
             output,
+            default_download_rate_mib,
             ..GuiPrefs::default()
         };
         self.reduced = self.prefs.reduced_motion;
@@ -682,7 +684,13 @@ impl App {
                                 self.config =
                                     self.config_drafts.remove(&next_key).unwrap_or_default();
                             }
-                            self.config.accept(items, profile, &self.output, refresh);
+                            self.config.accept(
+                                items,
+                                profile,
+                                &self.output,
+                                self.prefs.default_download_rate_mib,
+                                refresh,
+                            );
                             self.config.exclude_admitted(
                                 self.snapshot
                                     .jobs
@@ -901,6 +909,9 @@ impl App {
         self.navigate(Page::Discover);
     }
     fn header(&mut self, ctx: &egui::Context) {
+        if self.config.open {
+            self.account_menu = false;
+        }
         let available = self.available();
         let mut action = None;
         let mut avatar_rect = egui::Rect::NOTHING;
@@ -911,6 +922,9 @@ impl App {
                     .inner_margin(egui::vec2(18.0, 10.0)),
             )
             .show(ctx, |ui| {
+                if self.config.open {
+                    ui.disable();
+                }
                 ui.horizontal(|ui| {
                     if ui
                         .add(
@@ -1107,7 +1121,7 @@ impl App {
     }
 
     fn accounts(&mut self, ctx: &egui::Context) {
-        if !self.account_manager {
+        if !self.account_manager || self.config.open {
             return;
         }
         let mut open = self.account_manager;
@@ -1331,6 +1345,9 @@ impl App {
                 }
                 if let Some(banner) = self.error.clone() {
                     theme::inset(theme::rose()).show(ui, |ui| {
+                        if self.config.open {
+                            ui.disable();
+                        }
                         ui.set_width(ui.available_width());
                         ui.horizontal_top(|ui| {
                             let width = (ui.available_width() - 30.0).max(120.0);
@@ -1393,6 +1410,9 @@ impl App {
                     !(notice.open_about && (self.error.is_some() || self.page == Page::About))
                 }) {
                     theme::inset(theme::soft()).show(ui, |ui| {
+                        if self.config.open {
+                            ui.disable();
+                        }
                         ui.set_width(ui.available_width());
                         ui.horizontal_top(|ui| {
                             let width = (ui.available_width() - 30.0).max(120.0);
@@ -1644,6 +1664,26 @@ impl App {
                 });
                 ui.add_space(6.0);
                 theme::hint(ui, format!("当前生效：{}", self.output.display()));
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("默认下载限速");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.prefs.default_download_rate_mib)
+                                .range(0.0..=crate::prefs::MAX_DOWNLOAD_RATE_MIB)
+                                .speed(0.1)
+                                .suffix(" MiB/s"),
+                        )
+                        .changed()
+                    {
+                        self.prefs.default_download_rate_mib = crate::prefs::sanitize_download_rate(
+                            self.prefs.default_download_rate_mib,
+                        );
+                        self.touch_prefs();
+                    }
+                    theme::muted(ui, "0 不限速");
+                });
+                theme::hint(ui, "新下载使用此默认值，可在下载时展开高级设置单独修改。");
                 ui.add_space(18.0);
                 ui.separator();
                 ui.add_space(14.0);
@@ -2057,6 +2097,9 @@ impl App {
                     .inner_margin(18.0),
             )
             .show(ctx, |ui| {
+                if self.config.open {
+                    ui.disable();
+                }
                 self.banners(ui);
                 if self.page == Page::Settings && !self.background.crop_open {
                     self.settings_nav(ui);
@@ -2311,7 +2354,9 @@ impl eframe::App for App {
                 self.begin_close(ctx);
             }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) && !self.closing
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K))
+            && !self.closing
+            && !self.config.open
         {
             if self.page != Page::Discover {
                 self.error = None;
@@ -2353,24 +2398,26 @@ impl eframe::App for App {
         self.toasts(ctx);
         let available = self.available();
         let login_running = self.busy == Some(Busy::Login);
-        if let Some(action) = self.login.show(
-            ctx,
-            crate::login::LoginView {
-                auth: self.auth.as_ref(),
-                remembered: self.prefs.remember_login,
-                available,
-                running: login_running,
-                cancelling: self.cancelling,
-                reduced: self.reduced,
-            },
-        ) {
-            match action {
-                LoginAction::Start { remember } => self.send(Operation::Login {
-                    remember,
-                    activate: self.auth_target.is_none(),
-                }),
-                LoginAction::Cancel => self.cancel(),
-                LoginAction::Logout => self.send(Operation::Logout),
+        if !self.config.open {
+            if let Some(action) = self.login.show(
+                ctx,
+                crate::login::LoginView {
+                    auth: self.auth.as_ref(),
+                    remembered: self.prefs.remember_login,
+                    available,
+                    running: login_running,
+                    cancelling: self.cancelling,
+                    reduced: self.reduced,
+                },
+            ) {
+                match action {
+                    LoginAction::Start { remember } => self.send(Operation::Login {
+                        remember,
+                        activate: self.auth_target.is_none(),
+                    }),
+                    LoginAction::Cancel => self.cancel(),
+                    LoginAction::Logout => self.send(Operation::Logout),
+                }
             }
         }
         if self.confirming_close {
@@ -2479,6 +2526,7 @@ mod layout_tests {
             started: Instant,
             lifetime: Duration,
             captures: Option<PathBuf>,
+            settings_review: bool,
             scene: usize,
             scene_frames: usize,
             capture_requested: bool,
@@ -2516,7 +2564,51 @@ mod layout_tests {
             image
         }
         impl Review {
+            fn scene_count(&self) -> usize {
+                if self.settings_review {
+                    12
+                } else {
+                    7
+                }
+            }
+
             fn capture_scene(&mut self) {
+                if self.settings_review {
+                    self.app.config = ConfigState::default();
+                    self.app.search.input.clear();
+                    self.load(SearchCategory::Video);
+                    self.app.prefs.theme = match self.scene {
+                        1 | 6 => "sunset",
+                        2..=4 | 8 => "matcha",
+                        _ => "violet",
+                    }
+                    .into();
+                    self.app.prefs.opacity = match self.scene {
+                        3 => 50.0,
+                        4 => 0.0,
+                        _ => 100.0,
+                    };
+                    match self.scene {
+                        5 | 6 | 8 | 9 | 11 => {
+                            if self.scene == 8 {
+                                self.items.rotate_left(1);
+                            }
+                            self.configuration();
+                            if self.scene == 6 {
+                                self.app.config.review_rate_override(100.0);
+                            } else if self.scene == 8 {
+                                self.app.config.advanced_open = true;
+                            }
+                        }
+                        7 => {
+                            self.app.navigate(Page::Settings);
+                            self.app.settings_jump = Some(2);
+                        }
+                        10 => self.app.detail = Some(DetailState::new(self.items[0].clone())),
+                        _ => {}
+                    }
+                    return;
+                }
                 self.app.config.open = false;
                 self.app.search.input.clear();
                 self.load(match self.scene {
@@ -2615,7 +2707,7 @@ mod layout_tests {
             fn configuration(&mut self) {
                 let item = self.items[0].clone();
                 let part = item.parts[0].reference.clone();
-                let catalog = bili_core::QualityCatalog {
+                let mut catalog = bili_core::QualityCatalog {
                     part: part.clone(),
                     advertised: vec![bili_core::QualityEntry {
                         id: 64,
@@ -2646,15 +2738,52 @@ mod layout_tests {
                     revision: 1,
                     preview: false,
                 };
-                self.app.config.accept(
-                    vec![crate::backend::PreparedItem {
+                if self.settings_review {
+                    let mut full_hd = catalog.representations[0].clone();
+                    full_hd.id = 80;
+                    full_hd.quality = 80;
+                    full_hd.width = Some(1920);
+                    full_hd.height = Some(1080);
+                    catalog.representations.push(full_hd);
+                    for (id, label, returned) in [(80, "1080P", true), (120, "4K", false)] {
+                        catalog.advertised.push(bili_core::QualityEntry {
+                            id,
+                            label: label.into(),
+                            rank: id,
+                            availability: bili_core::Availability::Obtainable,
+                            requires_login: None,
+                            requires_vip: None,
+                            has_video_url: returned,
+                            advertised_codecs: vec!["avc1".into()],
+                        });
+                    }
+                }
+                let mut prepared = vec![crate::backend::PreparedItem {
+                    item,
+                    category: self.category,
+                    selected: vec![part.clone()],
+                    catalogs: vec![(part, Ok(catalog.clone()))],
+                }];
+                if self.settings_review && self.scene == 11 {
+                    let item = self.items[1].clone();
+                    let part = item.parts[0].reference.clone();
+                    catalog.part = part.clone();
+                    catalog.representations.retain(|r| r.quality == 64);
+                    for representation in &mut catalog.representations {
+                        representation.part = part.clone();
+                    }
+                    prepared.push(crate::backend::PreparedItem {
                         item,
                         category: self.category,
                         selected: vec![part.clone()],
                         catalogs: vec![(part, Ok(catalog))],
-                    }],
+                    });
+                }
+                self.app.config.accept(
+                    prepared,
                     None,
                     &self.app.output,
+                    self.app.prefs.default_download_rate_mib,
                     false,
                 );
             }
@@ -2672,6 +2801,34 @@ mod layout_tests {
                         })
                     });
                     if let Some(image) = screenshot {
+                        if self.settings_review && self.scene <= 4 {
+                            for (x, source) in [
+                                (8, [100_u8, 180, 235, 255]),
+                                (590, [255, 255, 255, 255]),
+                                (1172, [16, 20, 30, 255]),
+                            ] {
+                                let pixel = image.pixels[(450 * image.size[1] / 800)
+                                    * image.size[0]
+                                    + x * image.size[0] / 1180]
+                                    .to_array();
+                                let expected = match self.scene {
+                                    3 => source.map(|v| {
+                                        ((f32::from(v) * 128.0 / 255.0) + 127.0).round() as u8
+                                    }),
+                                    4 => theme::background().to_array(),
+                                    _ => source,
+                                };
+                                assert!(
+                                    pixel.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2),
+                                    "native scene {} pixel x{x}: {pixel:?} != {expected:?}",
+                                    self.scene
+                                );
+                                println!(
+                                    "Native background scene {} pixel x{x}: {pixel:?}",
+                                    self.scene
+                                );
+                            }
+                        }
                         let pixels: Vec<u8> =
                             image.pixels.iter().flat_map(|p| p.to_array()).collect();
                         let file = directory.join(format!("{:02}.png", self.scene));
@@ -2689,17 +2846,26 @@ mod layout_tests {
                         self.scene += 1;
                         self.scene_frames = 0;
                         self.capture_requested = false;
-                        if self.scene == 7 {
+                        if self.scene == self.scene_count() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             return;
                         }
                         self.capture_scene();
+                        if self.settings_review && self.scene == 9 {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                                900.0, 640.0,
+                            )));
+                        }
                     }
                 }
                 if self.started.elapsed() >= self.lifetime {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
                 }
+                self.app.sync_appearance(ctx);
+                self.app
+                    .background
+                    .paint(ctx, ctx.screen_rect(), &self.app.prefs);
                 egui::TopBottomPanel::bottom("offline-review-controls").show(ctx, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("离线检查：");
@@ -2797,6 +2963,7 @@ mod layout_tests {
             directory
         });
         let capture_enabled = captures.is_some();
+        let settings_review = std::env::var_os("BILI_GUI_SETTINGS_REVIEW").is_some();
         let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = captured.clone();
         eframe::run_native(
@@ -2813,6 +2980,20 @@ mod layout_tests {
                     GuiPrefs::default(),
                 );
                 app.ready = true;
+                if settings_review {
+                    let path = root.path().join("background.png");
+                    image::RgbaImage::from_fn(1180, 800, |x, _| {
+                        image::Rgba(match x {
+                            0..=392 => [100, 180, 235, 255],
+                            393..=786 => [255, 255, 255, 255],
+                            _ => [16, 20, 30, 255],
+                        })
+                    })
+                    .save(&path)
+                    .unwrap();
+                    app.prefs.background = Some(path);
+                    app.prefs.default_download_rate_mib = 10.0;
+                }
                 app.covers.insert(
                     &cc.egui_ctx,
                     "fixture:portrait".into(),
@@ -2830,6 +3011,7 @@ mod layout_tests {
                     started: Instant::now(),
                     lifetime: Duration::from_secs(lifetime),
                     captures,
+                    settings_review,
                     scene: 0,
                     scene_frames: 0,
                     capture_requested: false,
@@ -2844,7 +3026,7 @@ mod layout_tests {
         if capture_enabled {
             assert_eq!(
                 count.load(std::sync::atomic::Ordering::SeqCst),
-                7,
+                if settings_review { 12 } else { 7 },
                 "native renderer must return every requested scene"
             );
         }
@@ -2863,6 +3045,53 @@ mod layout_tests {
         app.ready = true;
         app.initializing = false;
         app
+    }
+
+    #[test]
+    fn resetting_appearance_keeps_the_download_rate_default() {
+        let mut app = test_app();
+        app.prefs.default_download_rate_mib = 10.0;
+        app.prefs.theme = "matcha".into();
+        app.reset_appearance();
+        assert_eq!(app.prefs.default_download_rate_mib, 10.0);
+        assert_eq!(app.prefs.theme, GuiPrefs::default().theme);
+    }
+
+    #[test]
+    fn download_dialog_blocks_background_clicks_and_prior_keyboard_focus() {
+        let size = Vec2::new(1180.0, 800.0);
+        let mut ctx = egui::Context::default();
+        let mut app = test_app();
+        app.page = Page::Queue;
+        app.search.input = "unchanged search".into();
+        click_text(&mut ctx, &mut app, size, "unchanged search");
+        app.config.open = true;
+        frame(&mut ctx, &mut app, size, vec![]);
+        frame(
+            &mut ctx,
+            &mut app,
+            size,
+            vec![egui::Event::Text("blocked".into())],
+        );
+        assert_eq!(app.search.input, "unchanged search");
+        click_text(&mut ctx, &mut app, size, "BiliDL");
+        assert_eq!(app.page, Page::Queue);
+        assert!(app.config.open);
+        frame(
+            &mut ctx,
+            &mut app,
+            size,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(!app.config.open);
+        click_text(&mut ctx, &mut app, size, "BiliDL");
+        assert_eq!(app.page, Page::Discover);
     }
 
     fn frame(
@@ -2966,6 +3195,7 @@ mod layout_tests {
         let size = Vec2::new(1180.0, 800.0);
         let mut ctx = egui::Context::default();
         let mut app = test_app();
+        app.prefs.default_download_rate_mib = 10.0;
         let (bridge, events, mut commands) = Bridge::test_channel();
         app.bridge = Some(bridge);
         let item = media_item();
@@ -3069,6 +3299,11 @@ mod layout_tests {
         };
         assert_eq!(selections.len(), 1);
         assert_eq!(selections[0].selection.part, part);
+        assert_eq!(
+            selections[0].context.batch.as_ref().unwrap().rate_limit,
+            Some(10 * 1_048_576),
+            "new download preparation inherits the persisted GUI default"
+        );
         let request = &selections[0];
         let plan = bili_core::StreamPlan {
             schema_version: 1,
@@ -3654,8 +3889,13 @@ mod layout_tests {
             category: SearchCategory::Video,
             catalogs: vec![],
         };
-        app.config
-            .accept(vec![prepared.clone()], None, &app.output, false);
+        app.config.accept(
+            vec![prepared.clone()],
+            None,
+            &app.output,
+            app.prefs.default_download_rate_mib,
+            false,
+        );
         app.config.directory = std::env::temp_dir()
             .join("preserved-refresh-draft")
             .display()

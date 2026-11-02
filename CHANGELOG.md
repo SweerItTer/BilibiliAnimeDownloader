@@ -14,6 +14,8 @@
 
 ### 🐞 Fixes
 
+- Blend GUI background opacity once over a neutral base so full opacity preserves original colors and theme changes do not tint the image.
+- Bound download preparation to a floating dialog, move batch limits into collapsed advanced options, and inherit a separately saved default limit for new drafts. Show concrete obtainable quality choices instead of advertised-only or duplicate highest options.
 - Preserve portrait and landscape cover proportions in the GUI, use poster slots for Bangumi/Film, remove the redundant category caption, and center single-line input text with clearly muted placeholders.
 - Restrict the Windows recycle-bin adapter to its supported platform so Linux GUI workspace checks can compile.
 - Keep packaging-time diagnostic profiles in an independent system temporary directory, so Windows extended staging paths do not make the CLI doctor reject its private profile.
