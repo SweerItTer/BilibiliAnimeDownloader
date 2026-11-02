@@ -627,6 +627,7 @@ fn decode_cover(bytes: CoverBytes) -> Option<egui::ColorImage> {
 }
 
 /// Core invokes this host adapter only with its verified exact owned allowlist.
+#[cfg(windows)]
 pub(crate) fn recycle_files(paths: &[PathBuf]) -> Result<()> {
     trash::delete_all(paths)
         .map_err(|_| CoreError::new(ErrorCode::Filesystem, "move owned output to recycle bin"))
