@@ -347,12 +347,8 @@ impl App {
     }
 
     fn surface(&self, covers_image: bool) -> egui::Color32 {
-        let base = theme::background();
-        if !covers_image || !self.background.has_image() {
-            return base;
-        }
-        let alpha = (238.0 - self.prefs.opacity * 0.85).clamp(120.0, 255.0);
-        theme::alpha(base, alpha / 255.0)
+        self.background
+            .surface_fill(covers_image, &self.prefs, theme::background())
     }
 
     fn available(&self) -> bool {

@@ -7,6 +7,8 @@ const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PIXELS: u64 = 40_000_000;
 const BASE_WIDTH: u32 = 1600;
 const BLUR_WIDTH: u32 = 720;
+// Image opacity fades into a neutral surface, independently of the UI palette.
+const IMAGE_BASE: Color32 = Color32::WHITE;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CropEvent {
@@ -100,6 +102,14 @@ fn cover_rect(target: Rect, image: Vec2) -> Rect {
     Rect::from_center_size(target.center(), size)
 }
 
+fn visibility(opacity: f32) -> f32 {
+    if opacity.is_finite() {
+        (opacity / 100.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 impl Background {
     pub fn has_image(&self) -> bool {
         self.texture.is_some()
@@ -115,7 +125,18 @@ impl Background {
 
     /// True when the image should show behind the given column.
     pub fn visible_for(&self, prefs: &GuiPrefs, sidebar: bool) -> bool {
-        self.has_image() && (sidebar && prefs.background_scope == BackgroundScope::Full || !sidebar)
+        self.has_image()
+            && visibility(prefs.opacity) > 0.0
+            && (sidebar && prefs.background_scope == BackgroundScope::Full || !sidebar)
+    }
+
+    /// Leave image-covered surfaces clear; opacity is applied once by `paint`.
+    pub fn surface_fill(&self, covers_image: bool, prefs: &GuiPrefs, fallback: Color32) -> Color32 {
+        if covers_image && self.visible_for(prefs, false) {
+            Color32::TRANSPARENT
+        } else {
+            fallback
+        }
     }
 
     pub fn sync(&mut self, ctx: &egui::Context, prefs: &GuiPrefs) {
@@ -218,17 +239,23 @@ impl Background {
         let Some(texture) = &self.texture else {
             return;
         };
-        let visibility = (prefs.opacity / 100.0).clamp(0.0, 1.0);
+        let visibility = visibility(prefs.opacity);
         if visibility <= 0.0 || clip.width() <= 1.0 || clip.height() <= 1.0 {
             return;
         }
-        let painter = ctx.layer_painter(egui::LayerId::background());
+        let painter = ctx
+            .layer_painter(egui::LayerId::background())
+            .with_clip_rect(clip.intersect(ctx.screen_rect()));
+        painter.rect_filled(clip, 0.0, IMAGE_BASE);
         let rect = cover_rect(clip, self.tex_size);
         painter.image(
             texture.id(),
             rect,
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::from_white_alpha((visibility * 255.0).round() as u8),
+            // egui_glow multiplies texture/tint and blends in gamma space.
+            // from_white_alpha premultiplies in linear space and brightens
+            // partially opaque images instead of applying uniform opacity.
+            Color32::WHITE.gamma_multiply(visibility),
         );
     }
 
@@ -442,6 +469,183 @@ fn handle_at(rect: Rect, pos: egui::Pos2) -> Drag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SOURCE_COLORS: [[u8; 4]; 3] = [[0, 0, 0, 255], [255, 255, 255, 255], [22, 121, 227, 255]];
+    const CLEAR: Color32 = Color32::from_rgb(19, 23, 31);
+
+    fn input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0))),
+            ..Default::default()
+        }
+    }
+
+    fn loaded_background() -> (
+        tempfile::TempDir,
+        egui::Context,
+        Background,
+        GuiPrefs,
+        egui::ColorImage,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("color-bands.png");
+        image::RgbaImage::from_fn(192, 64, |x, _| image::Rgba(SOURCE_COLORS[x as usize / 64]))
+            .save(&path)
+            .unwrap();
+        let prefs = GuiPrefs {
+            background: Some(path),
+            opacity: 100.0,
+            blur: 0.0,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut background = Background::default();
+        let output = ctx.run(input(), |ctx| background.sync(ctx, &prefs));
+        let id = background.texture.as_ref().unwrap().id();
+        let uploaded = output
+            .textures_delta
+            .set
+            .iter()
+            .find(|(texture, _)| *texture == id)
+            .unwrap();
+        let egui::ImageData::Color(image) = &uploaded.1.image else {
+            panic!("background must upload a color image");
+        };
+        (dir, ctx, background, prefs, image.as_ref().clone())
+    }
+
+    // Sample the actual submitted image mesh and surface rectangles using the
+    // pinned egui_glow shader's gamma-channel tint and premultiplied source-over.
+    // Samples lie inside uniform bands, so linear filtering cannot change them.
+    fn sample(
+        output: &egui::FullOutput,
+        texture: egui::TextureId,
+        image: &egui::ColorImage,
+        point: egui::Pos2,
+    ) -> [u8; 4] {
+        let normalized = |color: Color32| color.to_array().map(|v| f32::from(v) / 255.0);
+        let mut pixel = normalized(CLEAR);
+        for clipped in &output.shapes {
+            if !clipped.clip_rect.contains(point) {
+                continue;
+            }
+            let source = match &clipped.shape {
+                egui::Shape::Rect(rect) if rect.rect.contains(point) => normalized(rect.fill),
+                egui::Shape::Mesh(mesh)
+                    if mesh.texture_id == texture && mesh.calc_bounds().contains(point) =>
+                {
+                    let bounds = mesh.calc_bounds();
+                    let uv = (point - bounds.min) / bounds.size();
+                    let x = ((uv.x * image.size[0] as f32) as usize).min(image.size[0] - 1);
+                    let y = ((uv.y * image.size[1] as f32) as usize).min(image.size[1] - 1);
+                    assert!(mesh
+                        .vertices
+                        .iter()
+                        .all(|v| v.color == mesh.vertices[0].color));
+                    let tint = normalized(mesh.vertices[0].color);
+                    let texel = normalized(image.pixels[y * image.size[0] + x]);
+                    std::array::from_fn(|channel| texel[channel] * tint[channel])
+                }
+                _ => continue,
+            };
+            pixel =
+                std::array::from_fn(|channel| source[channel] + pixel[channel] * (1.0 - source[3]));
+        }
+        pixel.map(|v| (v * 255.0).round() as u8)
+    }
+
+    #[test]
+    fn original_colors_and_partial_opacity_are_independent_of_theme() {
+        let (_dir, ctx, mut background, mut prefs, image) = loaded_background();
+        let texture = background.texture.as_ref().unwrap().id();
+        let clip = Rect::from_min_size(pos2(10.0, 20.0), vec2(192.0, 64.0));
+        for theme in crate::prefs::THEMES {
+            prefs.theme = theme.id.to_owned();
+            for opacity in [0.0, 50.0, 100.0] {
+                prefs.opacity = opacity;
+                let output = ctx.run(input(), |ctx| {
+                    background.sync(ctx, &prefs);
+                    background.paint(ctx, clip, &prefs);
+                    ctx.layer_painter(egui::LayerId::background()).rect_filled(
+                        clip,
+                        0.0,
+                        background.surface_fill(true, &prefs, theme.palette.background),
+                    );
+                });
+                assert_eq!(background.texture.as_ref().unwrap().id(), texture);
+                assert!(!output
+                    .textures_delta
+                    .set
+                    .iter()
+                    .any(|(id, _)| *id == texture));
+                for (band, original) in SOURCE_COLORS.into_iter().enumerate() {
+                    let expected = if opacity == 0.0 {
+                        theme.palette.background.to_array()
+                    } else if opacity == 100.0 {
+                        original
+                    } else {
+                        // 50% rounds to alpha128; blend over a fixed white base.
+                        original.map(|v| ((u32::from(v) * 128 + 255 * 127 + 127) / 255) as u8)
+                    };
+                    assert_eq!(
+                        sample(
+                            &output,
+                            texture,
+                            &image,
+                            pos2(42.0 + band as f32 * 64.0, 52.0)
+                        ),
+                        expected,
+                        "theme={} opacity={opacity} band={band}",
+                        theme.id,
+                    );
+                }
+                assert_eq!(
+                    sample(&output, texture, &image, pos2(8.0, 52.0)),
+                    CLEAR.to_array()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cover_paint_is_clipped_and_only_visible_surfaces_are_transparent() {
+        let (_dir, ctx, mut background, mut prefs, image) = loaded_background();
+        let texture = background.texture.as_ref().unwrap().id();
+        let clip = Rect::from_min_size(pos2(-10.0, 20.0), vec2(96.0, 96.0));
+        let output = ctx.run(input(), |ctx| background.paint(ctx, clip, &prefs));
+        let image_shape = output.shapes.iter().find(|shape| {
+            matches!(&shape.shape, egui::Shape::Mesh(mesh) if mesh.texture_id == texture)
+        }).unwrap();
+        assert_eq!(image_shape.clip_rect, clip.intersect(ctx.screen_rect()));
+        assert!(image_shape.shape.visual_bounding_rect().width() > clip.width());
+        assert_eq!(
+            sample(&output, texture, &image, pos2(90.0, 52.0)),
+            CLEAR.to_array()
+        );
+
+        prefs.background_scope = BackgroundScope::WithoutSidebar;
+        assert!(!background.visible_for(&prefs, true));
+        assert!(background.visible_for(&prefs, false));
+        assert_eq!(background.surface_fill(false, &prefs, CLEAR), CLEAR);
+        assert_eq!(
+            background.surface_fill(true, &prefs, CLEAR),
+            Color32::TRANSPARENT
+        );
+        prefs.background_scope = BackgroundScope::Full;
+        assert!(background.visible_for(&prefs, true));
+        for opacity in [0.0, f32::NAN] {
+            prefs.opacity = opacity;
+            assert!(!background.visible_for(&prefs, false));
+            assert_eq!(background.surface_fill(true, &prefs, CLEAR), CLEAR);
+            let output = ctx.run(input(), |ctx| background.paint(ctx, clip, &prefs));
+            assert!(!output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Mesh(mesh) if mesh.texture_id == texture)
+            }));
+        }
+        prefs.background = None;
+        let _ = ctx.run(input(), |ctx| background.sync(ctx, &prefs));
+        assert_eq!(background.surface_fill(true, &prefs, CLEAR), CLEAR);
+    }
 
     #[test]
     fn crop_rect_stays_inside_the_image() {
