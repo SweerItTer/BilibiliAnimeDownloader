@@ -66,6 +66,17 @@ pub struct Core {
 
 impl Core {
     pub fn new(config: CoreConfig, runtime: Handle) -> Result<Self> {
+        if config.api_replay.is_some()
+            && !matches!(
+                &config.credential_store,
+                crate::cookie::StorePolicy::MemoryOnly
+            )
+        {
+            return Err(CoreError::new(
+                ErrorCode::InvalidInput,
+                "offline API replay requires memory-only authentication",
+            ));
+        }
         if config.max_jobs == 0
             || config.max_jobs > 128
             || config.max_connections == 0
@@ -103,21 +114,28 @@ impl Core {
             }
         }
         // No automatic redirect can replay account headers to another origin.
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(config.timeout)
-            .user_agent(crate::api::USER_AGENT)
-            .build()
-            .map_err(|_| CoreError::new(ErrorCode::Transport, "create API client"))?;
-        let media_client = media_client(config.timeout)?;
+        let replaying = config.api_replay.is_some();
+        let client = replay_transport(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(config.timeout)
+                .user_agent(crate::api::USER_AGENT),
+            replaying,
+        )?
+        .build()
+        .map_err(|_| CoreError::new(ErrorCode::Transport, "create API client"))?;
+        let media_client = media_client(config.timeout, replaying)?;
         let credentials = Arc::new(RwLock::new(CredentialJar::default()));
         let connections = Arc::new(Semaphore::new(config.max_connections));
-        let api = Arc::new(Api::new(
-            client.clone(),
-            credentials.clone(),
-            connections.clone(),
-            config.retry.clone(),
-        ));
+        let api = Arc::new(
+            Api::new(
+                client.clone(),
+                credentials.clone(),
+                connections.clone(),
+                config.retry.clone(),
+            )
+            .with_replay(config.api_replay.clone()),
+        );
         let auth = Arc::new(Mutex::new(AuthManager::new(
             client.clone(),
             credentials.clone(),
@@ -449,14 +467,34 @@ impl Core {
     }
 }
 
-fn media_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(timeout)
-        .read_timeout(timeout)
-        .user_agent(crate::api::USER_AGENT)
-        .build()
-        .map_err(|_| CoreError::new(ErrorCode::Transport, "create anonymous media client"))
+fn replay_transport(
+    builder: reqwest::ClientBuilder,
+    replaying: bool,
+) -> Result<reqwest::ClientBuilder> {
+    if replaying {
+        let proxy = reqwest::Proxy::all("http://127.0.0.1:0").map_err(|_| {
+            CoreError::new(ErrorCode::InvalidInput, "create offline replay transport")
+        })?;
+        // An explicit proxy disables inherited/system proxy matching. Core's
+        // auth, cover, sidecar and media paths must stay local even if the host
+        // environment is missing its independent GUI isolation settings.
+        Ok(builder.proxy(proxy))
+    } else {
+        Ok(builder)
+    }
+}
+
+fn media_client(timeout: std::time::Duration, replaying: bool) -> Result<reqwest::Client> {
+    replay_transport(
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
+            .user_agent(crate::api::USER_AGENT),
+        replaying,
+    )?
+    .build()
+    .map_err(|_| CoreError::new(ErrorCode::Transport, "create anonymous media client"))
 }
 fn validate_context(context: &DownloadContext) -> Result<()> {
     let invalid_profile = context
@@ -2393,7 +2431,7 @@ mod lifecycle_tests {
 
 #[cfg(test)]
 mod media_client_timeout_tests {
-    use super::media_client;
+    use super::{media_client, replay_transport};
     use std::time::Duration;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -2404,12 +2442,40 @@ mod media_client_timeout_tests {
     const CLIENT_TIMEOUT: Duration = Duration::from_secs(1);
     const CONTINUOUS_BODY: &[u8] = b"0123456789abcdefghij";
     #[tokio::test]
+    async fn replay_clients_never_connect_directly_to_a_reachable_destination() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let control = TcpStream::connect(address).await.unwrap();
+        let _accepted = listener.accept().await.unwrap();
+        drop(control);
+        let api = replay_transport(reqwest::Client::builder().timeout(CLIENT_TIMEOUT), true)
+            .unwrap()
+            .build()
+            .unwrap();
+        let media = media_client(CLIENT_TIMEOUT, true).unwrap();
+        for client in [api, media] {
+            for scheme in ["http", "https"] {
+                assert!(client
+                    .get(format!("{scheme}://{address}/"))
+                    .send()
+                    .await
+                    .is_err());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn continuous_body_longer_than_timeout_completes() {
         let (url, listener) = local_listener().await;
         let mut server = tokio::spawn(async move {
             continuous_server(listener).await;
         });
-        let client = match media_client(CLIENT_TIMEOUT) {
+        let client = match media_client(CLIENT_TIMEOUT, false) {
             Ok(client) => client,
             Err(_) => {
                 server.abort();
@@ -2438,7 +2504,7 @@ mod media_client_timeout_tests {
         let mut server = tokio::spawn(async move {
             stalled_server(listener).await;
         });
-        let client = match media_client(CLIENT_TIMEOUT) {
+        let client = match media_client(CLIENT_TIMEOUT, false) {
             Ok(client) => client,
             Err(_) => {
                 server.abort();

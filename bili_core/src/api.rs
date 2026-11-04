@@ -16,6 +16,9 @@ use tokio::{
     time::Instant,
 };
 
+mod offline_replay;
+pub use offline_replay::OfflineApiReplay;
+
 const API: &str = "https://api.bilibili.com";
 pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 const REFERER: &str = "https://www.bilibili.com/";
@@ -63,6 +66,7 @@ pub(crate) struct Api {
     credentials: Arc<RwLock<CredentialJar>>,
     connections: Arc<Semaphore>,
     retry: RetryPolicy,
+    replay: Option<OfflineApiReplay>,
     wbi_key: Arc<Mutex<Option<(Instant, String)>>>,
     pgc_conditions: Arc<Mutex<std::collections::HashMap<PgcSection, BrowseConditions>>>,
 }
@@ -74,6 +78,7 @@ impl Api {
             credentials,
             connections: self.connections.clone(),
             retry: self.retry.clone(),
+            replay: self.replay.clone(),
             wbi_key: self.wbi_key.clone(),
             pgc_conditions: self.pgc_conditions.clone(),
         }
@@ -89,9 +94,15 @@ impl Api {
             credentials,
             connections,
             retry,
+            replay: None,
             wbi_key: Arc::new(Mutex::new(None)),
             pgc_conditions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    pub(crate) fn with_replay(mut self, replay: Option<OfflineApiReplay>) -> Self {
+        self.replay = replay;
+        self
     }
 
     pub(crate) async fn resolve(&self, input: ContentInput) -> Result<MediaItem> {
@@ -622,6 +633,10 @@ impl Api {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, url: Url, referer: &str) -> Result<T> {
+        if let Some(replay) = &self.replay {
+            // Replay is an explicit response source, never an HTTP fallback.
+            return replay.response(&url).await;
+        }
         get_json_with(
             &self.client,
             &self.credentials,

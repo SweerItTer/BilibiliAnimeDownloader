@@ -744,6 +744,9 @@ pub struct CoreConfig {
     /// None rejects recycling; it must never fall back to permanent deletion.
     pub recycle: Option<RecycleBin>,
     pub credential_store: crate::cookie::StorePolicy,
+    /// Explicit local API JSON responses for offline inspection. Core-owned
+    /// HTTP clients are restricted to closed loopback; requires memory-only auth.
+    pub api_replay: Option<crate::OfflineApiReplay>,
 }
 impl CoreConfig {
     pub fn new(state_dir: PathBuf, output_dir: PathBuf) -> Self {
@@ -758,6 +761,7 @@ impl CoreConfig {
             rate_limit: None,
             recycle: None,
             credential_store: crate::cookie::StorePolicy::MemoryOnly,
+            api_replay: None,
         }
     }
 }

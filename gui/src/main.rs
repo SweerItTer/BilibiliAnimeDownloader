@@ -7,6 +7,7 @@ mod covers;
 mod detail;
 mod download_config;
 mod download_panel;
+mod isolation;
 mod login;
 mod prefs;
 mod search;
@@ -143,8 +144,21 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let prefs = GuiPrefs::load();
-    let config = configuration(&prefs, state_dir);
+    let isolation = match isolation::DebugIsolation::from_environment(state_dir.as_deref()) {
+        Ok(isolation) => isolation,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    let (prefs, config) = match &isolation {
+        Some(isolation) => (isolation.preferences(), Ok(isolation.configuration())),
+        None => {
+            let prefs = GuiPrefs::load();
+            let config = configuration(&prefs, state_dir);
+            (prefs, config)
+        }
+    };
     let output = config
         .as_ref()
         .map(|c| c.output_dir.clone())
@@ -166,12 +180,12 @@ fn main() {
         ),
     };
     let handle = runtime.as_ref().map(|r| r.handle().clone());
-    let (updates, update_owner) = match &handle {
-        Some(handle) => {
+    let (updates, update_owner) = match (&handle, isolation.is_none()) {
+        (Some(handle), true) => {
             let (updates, owner) = update::UpdateState::connected(handle);
             (updates, Some(owner))
         }
-        None => (update::UpdateState::default(), None),
+        _ => (update::UpdateState::default(), None),
     };
     let (restart_tx, restart_rx) = std::sync::mpsc::channel();
     // The single-slot handoff keeps ownership in main, including native window

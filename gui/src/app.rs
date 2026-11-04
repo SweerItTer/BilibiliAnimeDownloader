@@ -331,11 +331,14 @@ impl App {
     fn reset_appearance(&mut self) {
         let output = self.prefs.output.clone();
         let default_download_rate_mib = self.prefs.default_download_rate_mib;
+        let storage_path = self.prefs.storage_path.clone();
         self.prefs = GuiPrefs {
             output,
             default_download_rate_mib,
+            storage_path,
             ..GuiPrefs::default()
         };
+        self.prefs.enforce_isolation();
         self.reduced = self.prefs.reduced_motion;
         self.scale_draft = self.prefs.ui_scale;
         self.touch_prefs();
@@ -2640,6 +2643,26 @@ mod layout_tests {
         app.reset_appearance();
         assert_eq!(app.prefs.default_download_rate_mib, 10.0);
         assert_eq!(app.prefs.theme, GuiPrefs::default().theme);
+    }
+
+    #[test]
+    fn resetting_appearance_preserves_the_isolated_preference_store() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("preferences.json");
+        let mut app = test_app();
+        app.prefs = GuiPrefs::load_isolated(file.clone(), root.path().join("output"));
+        app.prefs.appearance = AppearanceMode::Light;
+        app.reset_appearance();
+        assert_eq!(app.prefs.storage_path.as_ref(), Some(&file));
+        assert!(!app.prefs.remember_login);
+        assert!(!app.prefs.update.check_updates);
+        assert!(!app.prefs.update.auto_update);
+        app.prefs.save();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(saved["appearance"], "system");
+        assert_eq!(saved["remember_login"], false);
+        assert_eq!(saved["update"]["check_updates"], false);
     }
 
     #[test]

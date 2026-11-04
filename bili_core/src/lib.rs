@@ -17,6 +17,7 @@ mod state;
 pub mod update;
 pub mod verification;
 
+pub use api::OfflineApiReplay;
 pub use auth::{AuthAction, AuthSnapshot};
 pub use domain::*;
 pub use service::Core;

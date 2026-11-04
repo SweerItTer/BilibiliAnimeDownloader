@@ -153,6 +153,9 @@ pub struct GuiPrefs {
     pub update: bili_core::update::UpdateSettings,
     /// Unix seconds of the last successful or failed check. No credentials.
     pub last_check: u64,
+    /// Process-local destination for an explicitly isolated debugging session.
+    #[serde(skip)]
+    pub(crate) storage_path: Option<PathBuf>,
 }
 
 impl Default for GuiPrefs {
@@ -176,6 +179,7 @@ impl Default for GuiPrefs {
             default_download_rate_mib: 0.0,
             update: bili_core::update::UpdateSettings::default(),
             last_check: 0,
+            storage_path: None,
         }
     }
 }
@@ -220,15 +224,34 @@ impl GuiPrefs {
     }
 
     pub fn load() -> Self {
-        Self::file()
-            .and_then(|path| std::fs::read(path).ok())
+        Self::load_file(Self::file())
+    }
+
+    fn load_file(path: Option<PathBuf>) -> Self {
+        path.and_then(|path| std::fs::read(path).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .map(GuiPrefs::sanitized)
             .unwrap_or_default()
     }
 
+    pub fn load_isolated(path: PathBuf, output: PathBuf) -> Self {
+        let mut prefs = Self::load_file(Some(path.clone()));
+        prefs.storage_path = Some(path);
+        prefs.output = Some(output);
+        prefs.enforce_isolation();
+        prefs
+    }
+
+    pub(crate) fn enforce_isolation(&mut self) {
+        if self.storage_path.is_some() {
+            self.remember_login = false;
+            self.update.check_updates = false;
+            self.update.auto_update = false;
+        }
+    }
+
     pub fn save(&self) {
-        let Some(path) = Self::file() else {
+        let Some(path) = self.storage_path.clone().or_else(Self::file) else {
             return;
         };
         let Some(parent) = path.parent() else {
@@ -237,7 +260,9 @@ impl GuiPrefs {
         if std::fs::create_dir_all(parent).is_err() {
             return;
         }
-        let Ok(bytes) = serde_json::to_vec_pretty(self) else {
+        let mut persisted = self.clone();
+        persisted.enforce_isolation();
+        let Ok(bytes) = serde_json::to_vec_pretty(&persisted) else {
             return;
         };
         let pending = path.with_extension("json.tmp");
@@ -274,6 +299,52 @@ impl GuiPrefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn isolated_preferences_stay_in_their_file_and_never_restore_an_account() {
+        let root = tempfile::tempdir().unwrap();
+        let isolated_file = root.path().join("isolated/preferences.json");
+        let other_file = root.path().join("other-preferences.json");
+        let output = root.path().join("isolated/output");
+        std::fs::write(&other_file, b"unchanged").unwrap();
+        std::fs::create_dir(isolated_file.parent().unwrap()).unwrap();
+        let seeded = GuiPrefs {
+            theme: "tv-blue".into(),
+            appearance: AppearanceMode::Dark,
+            remember_login: true,
+            output: Some(root.path().join("other-output")),
+            update: bili_core::update::UpdateSettings {
+                auto_update: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        std::fs::write(&isolated_file, serde_json::to_vec(&seeded).unwrap()).unwrap();
+        let mut prefs = GuiPrefs::load_isolated(isolated_file.clone(), output.clone());
+        assert_eq!(prefs.theme, "tv-blue");
+        assert_eq!(prefs.appearance, AppearanceMode::Dark);
+        assert!(!prefs.remember_login);
+        assert!(!prefs.update.check_updates);
+        assert!(!prefs.update.auto_update);
+        assert_eq!(prefs.output, Some(output.clone()));
+        prefs.appearance = AppearanceMode::Light;
+        prefs.remember_login = true;
+        prefs.update.check_updates = true;
+        prefs.update.auto_update = true;
+        prefs.save();
+        let bytes = std::fs::read(&isolated_file).unwrap();
+        let serialized: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(serialized.get("storage_path").is_none());
+        assert_eq!(serialized["remember_login"], false);
+        assert_eq!(serialized["update"]["check_updates"], false);
+        assert_eq!(serialized["update"]["auto_update"], false);
+        let restored = GuiPrefs::load_isolated(isolated_file, output.clone());
+        assert_eq!(restored.appearance, AppearanceMode::Light);
+        assert_eq!(restored.theme, "tv-blue");
+        assert_eq!(restored.output, Some(output));
+        assert!(!restored.remember_login);
+        assert_eq!(std::fs::read(other_file).unwrap(), b"unchanged");
+    }
+
     #[test]
     fn appearance_and_brightness_persist_without_changing_the_accent_or_image_opacity() {
         let older: GuiPrefs = serde_json::from_str(r#"{"theme":"tv-blue","opacity":83}"#).unwrap();
