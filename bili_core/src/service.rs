@@ -116,6 +116,7 @@ impl Core {
             client.clone(),
             credentials.clone(),
             connections.clone(),
+            config.retry.clone(),
         ));
         let auth = Arc::new(Mutex::new(AuthManager::new(
             client.clone(),

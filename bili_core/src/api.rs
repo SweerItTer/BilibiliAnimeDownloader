@@ -23,6 +23,8 @@ const MAX_JSON: usize = 8 * 1024 * 1024;
 const MAX_COVER: usize = 8 * 1024 * 1024;
 const WBI_KEY_TTL: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
+const MAX_API_ATTEMPTS: u32 = 3;
+const MAX_API_BACKOFF: Duration = Duration::from_secs(2);
 
 pub(crate) struct ResolvedLocator {
     pub url: Url,
@@ -60,6 +62,7 @@ pub(crate) struct Api {
     client: reqwest::Client,
     credentials: Arc<RwLock<CredentialJar>>,
     connections: Arc<Semaphore>,
+    retry: RetryPolicy,
     wbi_key: Arc<Mutex<Option<(Instant, String)>>>,
     pgc_conditions: Arc<Mutex<std::collections::HashMap<PgcSection, BrowseConditions>>>,
 }
@@ -70,6 +73,7 @@ impl Api {
             client: self.client.clone(),
             credentials,
             connections: self.connections.clone(),
+            retry: self.retry.clone(),
             wbi_key: self.wbi_key.clone(),
             pgc_conditions: self.pgc_conditions.clone(),
         }
@@ -78,11 +82,13 @@ impl Api {
         client: reqwest::Client,
         credentials: Arc<RwLock<CredentialJar>>,
         connections: Arc<Semaphore>,
+        retry: RetryPolicy,
     ) -> Self {
         Self {
             client,
             credentials,
             connections,
+            retry,
             wbi_key: Arc::new(Mutex::new(None)),
             pgc_conditions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
@@ -622,6 +628,7 @@ impl Api {
             url,
             referer,
             &self.connections,
+            &self.retry,
         )
         .await
     }
@@ -811,14 +818,11 @@ async fn get_json_with<T: DeserializeOwned>(
     url: Url,
     referer: &str,
     connections: &Semaphore,
+    retry: &RetryPolicy,
 ) -> Result<T> {
     if url.scheme() != "https" || !is_api_host(url.host_str().unwrap_or_default()) {
         return Err(invalid("API host is not allowed"));
     }
-    let _permit = connections
-        .acquire()
-        .await
-        .map_err(|_| CoreError::new(ErrorCode::Shutdown, "core connection pool closed"))?;
     let cookie = {
         let credentials = jar.read().map_err(|_| {
             CoreError::new(ErrorCode::CredentialStore, "credential lock unavailable")
@@ -832,6 +836,57 @@ async fn get_json_with<T: DeserializeOwned>(
     if let Some(cookie) = cookie {
         req = req.header(header::COOKIE, cookie);
     }
+    get_json_request(req, connections, retry).await
+}
+
+// Only the trusted-host adapter above constructs production requests. Keeping
+// the request executor private also permits real loopback transport tests.
+async fn get_json_request<T: DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    connections: &Semaphore,
+    retry: &RetryPolicy,
+) -> Result<T> {
+    let attempts = retry.attempts.clamp(1, MAX_API_ATTEMPTS);
+    for attempt in 1..=attempts {
+        let result = {
+            let _permit = connections
+                .acquire()
+                .await
+                .map_err(|_| CoreError::new(ErrorCode::Shutdown, "core connection pool closed"))?;
+            let request = request
+                .try_clone()
+                .ok_or_else(|| invalid("clone API GET request"))?;
+            read_json_response(request).await
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(mut error) => {
+                if !error.retryable {
+                    return Err(error);
+                }
+                if attempt == attempts {
+                    if attempt > 1 {
+                        error.code = ErrorCode::RetryExhausted;
+                    }
+                    return Err(error);
+                }
+                // No permit or response survives backoff. Dropping this future
+                // cancels the entire operation; retries own no spawned work.
+                tokio::time::sleep(api_retry_delay(retry, attempt)).await;
+            }
+        }
+    }
+    unreachable!("API attempts are nonzero")
+}
+
+fn api_retry_delay(retry: &RetryPolicy, completed_attempts: u32) -> Duration {
+    retry
+        .base_delay
+        .saturating_mul(1 << completed_attempts.saturating_sub(1).min(2))
+        .min(MAX_API_BACKOFF)
+}
+
+async fn read_json_response<T: DeserializeOwned>(req: reqwest::RequestBuilder) -> Result<T> {
     let mut response = req.send().await.map_err(|error| request_failure(&error))?;
     let status = response.status().as_u16();
     if !response.status().is_success() {
@@ -850,7 +905,7 @@ async fn get_json_with<T: DeserializeOwned>(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| with_http_status(transport("read Bilibili API response"), status))?
+        .map_err(|error| body_failure(&error, status))?
     {
         if bytes.len().saturating_add(chunk.len()) > MAX_JSON {
             return Err(with_http_status(
@@ -2357,10 +2412,54 @@ fn request_failure(error: &reqwest::Error) -> CoreError {
     } else {
         "request Bilibili API"
     };
-    transport(operation)
+    let mut failure = transport(operation);
+    failure.retryable = transient_network_failure(error);
+    failure
+}
+fn body_failure(error: &reqwest::Error, status: u16) -> CoreError {
+    let operation = if error.is_timeout() {
+        "read Bilibili API response timed out"
+    } else {
+        "read Bilibili API response"
+    };
+    let mut failure = with_http_status(transport(operation), status);
+    failure.retryable = transient_network_failure(error);
+    failure
+}
+fn transient_network_failure(error: &reqwest::Error) -> bool {
+    use std::error::Error;
+
+    if error.is_timeout() || error.is_connect() || error.is_body() {
+        return true;
+    }
+    // Response::chunk wraps transport-body errors as Decode. Inspect typed
+    // causes, never their text; JSON deserialization below is not retried.
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_timeout() || error.is_connect() || error.is_body())
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::TimedOut
+                )
+            })
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 fn http_response_failure(status: u16) -> CoreError {
-    with_http_status(transport("request Bilibili API"), status)
+    let mut failure = with_http_status(transport("request Bilibili API"), status);
+    failure.retryable = matches!(status, 408 | 500 | 502 | 503 | 504);
+    failure
 }
 fn with_http_status(mut error: CoreError, status: u16) -> CoreError {
     error.http_status = Some(status);
