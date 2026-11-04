@@ -1663,77 +1663,7 @@ impl Worker {
             self.update(Update::Resources(resources.clone())).await?;
             self.record.resources = resources;
             self.phase(JobPhase::Downloading).await?;
-            let mut paths = Vec::new();
-            let mut completed_bytes = 0u64;
-            for (index, locator) in locators.iter().enumerate() {
-                let path = self
-                    .journal
-                    .owned_file(self.id(), &self.record.resources[index].name)?;
-                let mut checkpoint = crate::download::load_checkpoint(&path)?;
-                let mut attempt = 0;
-                loop {
-                    let fresh;
-                    let current = if attempt == 0 {
-                        locator
-                    } else {
-                        fresh = self.api.locators(&plan).await?;
-                        fresh
-                            .get(index)
-                            .filter(|l| l.identity == locator.identity)
-                            .ok_or_else(|| {
-                                CoreError::new(
-                                    ErrorCode::RepresentationChanged,
-                                    "renewed locator identity changed",
-                                )
-                            })?
-                    };
-                    let permit = tokio::select! {
-                        _=self.cancel.cancelled()=>return Err(CoreError::new(ErrorCode::Cancelled,"download cancelled")),
-                        permit=self.connections.acquire()=>match permit {
-                            Ok(permit)=>permit,
-                            Err(_)=>return Err(CoreError::new(ErrorCode::Shutdown,"connection limiter closed")),
-                        }
-                    };
-                    let sender = self.commands.clone();
-                    let id = self.id();
-                    let base = completed_bytes;
-                    let result = crate::download::transfer(
-                        &self.client,
-                        current,
-                        &path,
-                        &mut checkpoint,
-                        crate::download::TransferOptions {
-                            cancel: &self.cancel,
-                            rate_limit: self.config.rate_limit,
-                            budget: self.budget.as_deref(),
-                        },
-                        &self.config.retry,
-                        move |bytes| {
-                            let _ =
-                                sender.try_send(Command::Progress(id, base.saturating_add(bytes)));
-                        },
-                    )
-                    .await;
-                    drop(permit);
-                    match result {
-                        Ok(()) => break,
-                        Err(error)
-                            if error.code == ErrorCode::Transport
-                                && error.retryable
-                                && attempt + 1 < self.config.retry.attempts =>
-                        {
-                            attempt += 1;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                completed_bytes = completed_bytes.saturating_add(checkpoint.durable_bytes);
-                paths.push(path);
-                self.commands
-                    .send(Command::Progress(self.id(), completed_bytes))
-                    .await
-                    .map_err(|_| CoreError::new(ErrorCode::Shutdown, "job reducer unavailable"))?;
-            }
+            let paths = self.transfer_resources(&plan, &locators).await?;
             if plan.merge == MergePolicy::Manual {
                 let components = self.sidecars(&plan).await;
                 self.update(Update::Components(components.clone())).await?;
@@ -1832,6 +1762,111 @@ impl Worker {
         state::clean_staging(&self.record, false)?;
         Ok(())
     }
+    async fn transfer_resources(
+        &self,
+        plan: &StreamPlan,
+        locators: &[crate::api::ResolvedLocator],
+    ) -> Result<Vec<std::path::PathBuf>> {
+        let paths = self
+            .record
+            .resources
+            .iter()
+            .map(|resource| self.journal.owned_file(self.id(), &resource.name))
+            .collect::<Result<Vec<_>>>()?;
+        let mut checkpoints = paths
+            .iter()
+            .map(|path| crate::download::load_checkpoint(path))
+            .collect::<Result<Vec<_>>>()?;
+        let mut resources = Vec::with_capacity(paths.len());
+        for ((path, checkpoint), locator) in paths.iter().zip(&mut checkpoints).zip(locators) {
+            resources.push(
+                crate::download::prepare_resource(locator, path, checkpoint, &self.cancel).await?,
+            );
+        }
+        // Later resources can already have retained bytes when an earlier one
+        // is revisited. Count only reconciled contributions, including those
+        // later resources, rather than rebuilding a completed prefix from zero.
+        let mut contributions: Vec<u64> = resources
+            .iter()
+            .map(crate::download::PreparedResource::retained_bytes)
+            .collect();
+        self.report_progress(contributions.iter().copied().fold(0, u64::saturating_add))
+            .await?;
+        for (index, (locator, resource)) in locators.iter().zip(&mut resources).enumerate() {
+            let base = contributions
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, bytes)| *bytes)
+                .fold(0, u64::saturating_add);
+            let mut attempt = 0;
+            loop {
+                let fresh;
+                let current = if attempt == 0 {
+                    locator
+                } else {
+                    fresh = self.api.locators(plan).await?;
+                    fresh
+                        .get(index)
+                        .filter(|l| l.identity == locator.identity)
+                        .ok_or_else(|| {
+                            CoreError::new(
+                                ErrorCode::RepresentationChanged,
+                                "renewed locator identity changed",
+                            )
+                        })?
+                };
+                let permit = tokio::select! {
+                    _=self.cancel.cancelled()=>return Err(CoreError::new(ErrorCode::Cancelled,"download cancelled")),
+                    permit=self.connections.acquire()=>match permit {
+                        Ok(permit)=>permit,
+                        Err(_)=>return Err(CoreError::new(ErrorCode::Shutdown,"connection limiter closed")),
+                    }
+                };
+                let sender = self.commands.clone();
+                let id = self.id();
+                let result = resource
+                    .transfer(
+                        &self.client,
+                        current,
+                        crate::download::TransferOptions {
+                            cancel: &self.cancel,
+                            rate_limit: self.config.rate_limit,
+                            budget: self.budget.as_deref(),
+                        },
+                        &self.config.retry,
+                        move |bytes| {
+                            let _ =
+                                sender.try_send(Command::Progress(id, base.saturating_add(bytes)));
+                        },
+                    )
+                    .await;
+                drop(permit);
+                contributions[index] = resource.retained_bytes();
+                self.report_progress(base.saturating_add(contributions[index]))
+                    .await?;
+                match result {
+                    Ok(()) => break,
+                    Err(error)
+                        if error.code == ErrorCode::Transport
+                            && error.retryable
+                            && attempt + 1 < self.config.retry.attempts =>
+                    {
+                        attempt += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        drop(resources);
+        Ok(paths)
+    }
+    async fn report_progress(&self, bytes: u64) -> Result<()> {
+        self.commands
+            .send(Command::Progress(self.id(), bytes))
+            .await
+            .map_err(|_| CoreError::new(ErrorCode::Shutdown, "job reducer unavailable"))
+    }
     async fn sidecars(&self, plan: &StreamPlan) -> Vec<ComponentResult> {
         if matches!(plan.sidecars.subtitles, SubtitleSelection::None) && !plan.sidecars.danmaku {
             return Vec::new();
@@ -1864,6 +1899,10 @@ impl Worker {
 }
 
 #[cfg(test)]
+#[path = "service/transfer_progress.rs"]
+mod transfer_progress;
+
+#[cfg(test)]
 type NativeGate = (oneshot::Sender<()>, Arc<std::sync::Barrier>);
 #[cfg(test)]
 static NATIVE_GATES: std::sync::LazyLock<
@@ -1882,7 +1921,7 @@ fn run_native_gate(inputs: &[std::path::PathBuf]) {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    fn offline_plan(destination: std::path::PathBuf) -> StreamPlan {
+    pub(super) fn offline_plan(destination: std::path::PathBuf) -> StreamPlan {
         let part = PartRef {
             content: ContentRef::Video(Aid::new(7).unwrap()),
             aid: Aid::new(7).unwrap(),
