@@ -1,52 +1,88 @@
 //! Shared visual tokens and native painter widgets; no remote assets.
 use egui::{pos2, vec2, Align2, Color32, FontId, Frame, Id, Rect, Response, Sense, Stroke, Ui};
-use std::sync::RwLock;
+use std::cell::Cell;
 use std::time::Duration;
 
-pub const OUTER_RADIUS: f32 = 24.0;
+pub const OUTER_RADIUS: f32 = 10.0;
 pub const INSET: f32 = 8.0;
 pub const MOTION: f32 = 0.18;
 pub const ON_PRIMARY: Color32 = Color32::WHITE;
 pub const ERROR: Color32 = Color32::from_rgb(174, 62, 85);
-pub const GREEN: Color32 = Color32::from_rgb(50, 132, 112);
+pub const GREEN: Color32 = Color32::from_rgb(33, 111, 80);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
+    pub dark_mode: bool,
     pub background: Color32,
     pub card: Color32,
     pub ink: Color32,
     pub muted: Color32,
     pub primary: Color32,
     pub primary_hover: Color32,
+    pub on_primary: Color32,
     pub soft: Color32,
     pub soft_hover: Color32,
     pub border: Color32,
     pub rose: Color32,
+    pub error: Color32,
+    pub success: Color32,
 }
 
-pub const DEFAULT_PALETTE: Palette = Palette {
-    background: Color32::from_rgb(245, 245, 250),
-    card: Color32::WHITE,
-    ink: Color32::from_rgb(36, 36, 56),
-    muted: Color32::from_rgb(112, 112, 132),
-    primary: Color32::from_rgb(115, 87, 217),
-    primary_hover: Color32::from_rgb(97, 68, 195),
-    soft: Color32::from_rgb(239, 235, 252),
-    soft_hover: Color32::from_rgb(226, 218, 248),
-    border: Color32::from_rgb(229, 228, 238),
-    rose: Color32::from_rgb(249, 232, 239),
-};
-
-static PALETTE: RwLock<Palette> = RwLock::new(DEFAULT_PALETTE);
-
-pub fn set_palette(palette: Palette) {
-    if let Ok(mut current) = PALETTE.write() {
-        *current = palette;
+pub const fn light_palette(primary: Color32, primary_hover: Color32) -> Palette {
+    Palette {
+        dark_mode: false,
+        background: Color32::from_rgb(240, 242, 245),
+        card: Color32::from_rgb(250, 251, 252),
+        ink: Color32::from_rgb(32, 37, 45),
+        muted: Color32::from_rgb(89, 99, 113),
+        primary,
+        primary_hover,
+        on_primary: ON_PRIMARY,
+        soft: Color32::from_rgb(232, 234, 240),
+        soft_hover: Color32::from_rgb(221, 225, 233),
+        border: Color32::from_rgb(164, 173, 186),
+        rose: Color32::from_rgb(248, 232, 236),
+        error: ERROR,
+        success: GREEN,
     }
 }
 
+pub const fn dark_palette(primary: Color32, primary_hover: Color32) -> Palette {
+    Palette {
+        dark_mode: true,
+        background: Color32::from_rgb(22, 25, 31),
+        card: Color32::from_rgb(31, 35, 43),
+        ink: Color32::from_rgb(228, 232, 239),
+        muted: Color32::from_rgb(162, 173, 190),
+        primary,
+        primary_hover,
+        on_primary: Color32::from_rgb(18, 22, 28),
+        soft: Color32::from_rgb(43, 48, 59),
+        soft_hover: Color32::from_rgb(54, 60, 72),
+        border: Color32::from_rgb(94, 105, 124),
+        rose: Color32::from_rgb(62, 36, 44),
+        error: Color32::from_rgb(244, 143, 157),
+        success: Color32::from_rgb(137, 207, 166),
+    }
+}
+
+pub const DEFAULT_PALETTE: Palette = light_palette(
+    Color32::from_rgb(99, 81, 171),
+    Color32::from_rgb(80, 65, 147),
+);
+
+thread_local! {
+    // A native app paints on its UI thread. Independent headless contexts on
+    // other threads must not replace one another's current presentation tokens.
+    static PALETTE: Cell<Palette> = const { Cell::new(DEFAULT_PALETTE) };
+}
+
+pub fn set_palette(palette: Palette) {
+    PALETTE.set(palette);
+}
+
 pub fn palette() -> Palette {
-    PALETTE.read().map(|p| *p).unwrap_or(DEFAULT_PALETTE)
+    PALETTE.get()
 }
 
 pub fn background() -> Color32 {
@@ -73,19 +109,15 @@ pub fn border() -> Color32 {
 pub fn rose() -> Color32 {
     palette().rose
 }
+pub fn error_color() -> Color32 {
+    palette().error
+}
+pub fn success_color() -> Color32 {
+    palette().success
+}
 
 pub fn inner_radius(outer: f32, inset: f32) -> f32 {
     (outer - inset).max(0.0)
-}
-
-/// Blend `fill` toward transparent by `keep` (1.0 keeps the color opaque).
-pub fn alpha(fill: Color32, keep: f32) -> Color32 {
-    Color32::from_rgba_unmultiplied(
-        fill.r(),
-        fill.g(),
-        fill.b(),
-        (keep.clamp(0.0, 1.0) * 255.0).round() as u8,
-    )
 }
 
 pub fn install(ctx: &egui::Context, fonts: Option<egui::FontDefinitions>) {
@@ -98,7 +130,11 @@ pub fn install(ctx: &egui::Context, fonts: Option<egui::FontDefinitions>) {
 pub fn apply_style(ctx: &egui::Context, compact: bool) {
     let p = palette();
     let mut style = (*ctx.style()).clone();
-    style.visuals = egui::Visuals::light();
+    style.visuals = if p.dark_mode {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
     style.visuals.panel_fill = p.background;
     style.visuals.window_fill = p.card;
     style.visuals.window_rounding = egui::Rounding::same(OUTER_RADIUS);
@@ -109,18 +145,33 @@ pub fn apply_style(ctx: &egui::Context, compact: bool) {
     style.visuals.selection.bg_fill = p.soft;
     style.visuals.selection.stroke = Stroke::new(1.0_f32, p.primary);
     style.visuals.hyperlink_color = p.primary;
-    style.visuals.widgets.inactive.rounding = egui::Rounding::same(12.0);
+    style.visuals.error_fg_color = p.error;
+    style.visuals.warn_fg_color = if p.dark_mode {
+        Color32::from_rgb(233, 187, 112)
+    } else {
+        Color32::from_rgb(139, 88, 19)
+    };
+    style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
+    style.visuals.widgets.noninteractive.bg_fill = p.card;
+    style.visuals.widgets.noninteractive.weak_bg_fill = p.card;
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border);
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.ink);
+    style.visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
     style.visuals.widgets.inactive.bg_fill = p.background;
+    style.visuals.widgets.inactive.weak_bg_fill = p.background;
     style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.border);
     style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, p.ink);
-    style.visuals.widgets.hovered.rounding = egui::Rounding::same(12.0);
+    style.visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
     style.visuals.widgets.hovered.bg_fill = p.soft;
+    style.visuals.widgets.hovered.weak_bg_fill = p.soft;
     style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.primary);
     style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, p.primary);
-    style.visuals.widgets.active.rounding = egui::Rounding::same(12.0);
+    style.visuals.widgets.active.rounding = egui::Rounding::same(6.0);
     style.visuals.widgets.active.bg_fill = p.soft;
+    style.visuals.widgets.active.weak_bg_fill = p.soft;
     style.visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, p.primary);
     style.visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, p.primary);
+    style.visuals.widgets.open = style.visuals.widgets.active;
     style.spacing.item_spacing = if compact {
         vec2(8.0, 6.0)
     } else {
@@ -248,25 +299,6 @@ pub fn section(ui: &mut Ui, title: &str, description: &str) {
 
 pub fn hint_indented(ui: &mut Ui, id: &str, text: impl Into<String>) {
     ui.indent(id, |ui| hint(ui, text));
-}
-
-/// Hollow in-app brand mark. The filled raster icon is reserved for the OS shell.
-pub fn brand_mark(painter: &egui::Painter, rect: Rect, accent: Color32) {
-    let rounding = rect.width() * 0.32;
-    painter.rect_filled(rect, rounding, alpha(accent, 0.08));
-    painter.rect_stroke(rect, rounding, Stroke::new(1.8_f32, accent));
-    icon(
-        painter,
-        rect.shrink(rect.width() * 0.27),
-        Icon::Download,
-        accent,
-    );
-    let dot = rect.width() * 0.075;
-    painter.circle_filled(
-        pos2(rect.right() - dot * 1.4, rect.top() + dot * 1.4),
-        dot,
-        Color32::from_rgb(255, 126, 168),
-    );
 }
 
 #[derive(Clone, Copy)]
@@ -447,10 +479,10 @@ pub fn button_width(
     );
     let p = palette();
     let (base, hover, foreground) = match kind {
-        ButtonKind::Primary => (p.primary, p.primary_hover, ON_PRIMARY),
+        ButtonKind::Primary => (p.primary, p.primary_hover, p.on_primary),
         ButtonKind::Soft => (p.soft, p.soft_hover, p.primary),
         ButtonKind::Quiet => (p.card, p.soft, p.muted),
-        ButtonKind::Danger => (p.rose, mix(p.rose, ERROR, 0.12), ERROR),
+        ButtonKind::Danger => (p.rose, mix(p.rose, p.error, 0.12), p.error),
     };
     let pressed = response.is_pointer_button_down_on();
     let fill = if !ui.is_enabled() {
@@ -461,12 +493,14 @@ pub fn button_width(
     let foreground = if ui.is_enabled() {
         foreground
     } else {
-        p.muted.gamma_multiply(0.55)
+        // Disabled egui UIs already tint painter colors toward the card.
+        // Keep the input opaque: fading alpha again washes out light-mode text.
+        p.ink
     };
     let painted = if pressed { rect.shrink(1.0) } else { rect };
     ui.painter().rect(
         painted,
-        12.0,
+        6.0,
         fill,
         if response.has_focus() {
             Stroke::new(2.0_f32, p.primary)
@@ -553,16 +587,63 @@ pub fn progress(ui: &mut Ui, id: Id, value: Option<f32>, active: bool, reduced: 
 mod tests {
     use super::*;
     #[test]
-    fn nested_corners_share_the_same_center() {
-        assert_eq!(inner_radius(OUTER_RADIUS, INSET), 16.0);
-        assert_eq!(inner_radius(6.0, 8.0), 0.0);
+    fn independent_ui_threads_keep_their_own_palette() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = [false, true]
+            .into_iter()
+            .map(|dark| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let expected = crate::prefs::THEMES[2].palette_for(dark);
+                    set_palette(expected);
+                    barrier.wait();
+                    assert!(palette() == expected);
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 
     #[test]
-    fn translucent_overlay_keeps_requested_alpha() {
-        let color = alpha(Color32::from_rgb(10, 20, 30), 0.5);
-        assert_eq!(color.a(), 128);
-        assert_eq!(alpha(ON_PRIMARY, 2.0).a(), 255);
+    fn primary_button_paints_the_mode_specific_foreground() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            let expected = crate::prefs::THEMES[1].palette_for(dark);
+            set_palette(expected);
+            apply_style(&ctx, false);
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 200.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    button(ui, "Start", Icon::Download, ButtonKind::Primary, true);
+                });
+            });
+            fn color(shape: &egui::Shape) -> Option<Color32> {
+                match shape {
+                    egui::Shape::Text(text) if text.galley.job.text == "Start" => {
+                        Some(text.fallback_color)
+                    }
+                    egui::Shape::Vec(children) => children.iter().find_map(color),
+                    _ => None,
+                }
+            }
+            let actual = output
+                .shapes
+                .iter()
+                .find_map(|shape| color(&shape.shape))
+                .unwrap();
+            assert_eq!(actual, expected.on_primary);
+        }
+    }
+
+    #[test]
+    fn nested_corners_share_the_same_center() {
+        assert_eq!(inner_radius(OUTER_RADIUS, INSET), 2.0);
+        assert_eq!(inner_radius(6.0, 8.0), 0.0);
     }
 
     fn input_frame(

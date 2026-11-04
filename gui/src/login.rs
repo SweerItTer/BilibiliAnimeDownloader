@@ -242,7 +242,7 @@ impl LoginState {
                                     }
                                 });
                             }
-                            if let Some(error) = &self.error { ui.colored_label(theme::ERROR, error); }
+                            if let Some(error) = &self.error { ui.colored_label(theme::error_color(), error); }
                             ui.add_space(8.0);
                             ui.label(RichText::new("仅本次登录不写盘；保持登录写入系统凭据库，可随时退出。").size(12.0).color(theme::muted_color()));
                             ui.label(RichText::new("点击获取后才会连接登录服务；登录成功前仍以访客身份使用。").size(12.0).color(theme::muted_color()));

@@ -7,8 +7,6 @@ const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PIXELS: u64 = 40_000_000;
 const BASE_WIDTH: u32 = 1600;
 const BLUR_WIDTH: u32 = 720;
-// Image opacity fades into a neutral surface, independently of the UI palette.
-const IMAGE_BASE: Color32 = Color32::WHITE;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CropEvent {
@@ -246,16 +244,33 @@ impl Background {
         let painter = ctx
             .layer_painter(egui::LayerId::background())
             .with_clip_rect(clip.intersect(ctx.screen_rect()));
-        painter.rect_filled(clip, 0.0, IMAGE_BASE);
+        let base = if ctx.style().visuals.dark_mode {
+            24
+        } else {
+            238
+        };
+        painter.rect_filled(clip, 0.0, Color32::from_gray(base));
         let rect = cover_rect(clip, self.tex_size);
         painter.image(
             texture.id(),
             rect,
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            // egui_glow multiplies texture/tint and blends in gamma space.
-            // from_white_alpha premultiplies in linear space and brightens
-            // partially opaque images instead of applying uniform opacity.
-            Color32::WHITE.gamma_multiply(visibility),
+            // The pinned glow shader multiplies gamma-channel texture/tint.
+            // Brightness changes RGB only; opacity also controls source-over alpha.
+            {
+                let brightness = if prefs.background_brightness.is_finite() {
+                    prefs.background_brightness.clamp(20.0, 100.0) / 100.0
+                } else {
+                    1.0
+                };
+                let color = (255.0 * visibility * brightness).round() as u8;
+                Color32::from_rgba_premultiplied(
+                    color,
+                    color,
+                    color,
+                    (255.0 * visibility).round() as u8,
+                )
+            },
         );
     }
 
@@ -555,54 +570,65 @@ mod tests {
     }
 
     #[test]
-    fn original_colors_and_partial_opacity_are_independent_of_theme() {
+    fn opacity_brightness_and_source_colors_are_independent_of_accent() {
         let (_dir, ctx, mut background, mut prefs, image) = loaded_background();
         let texture = background.texture.as_ref().unwrap().id();
         let clip = Rect::from_min_size(pos2(10.0, 20.0), vec2(192.0, 64.0));
-        for theme in crate::prefs::THEMES {
-            prefs.theme = theme.id.to_owned();
-            for opacity in [0.0, 50.0, 100.0] {
-                prefs.opacity = opacity;
-                let output = ctx.run(input(), |ctx| {
-                    background.sync(ctx, &prefs);
-                    background.paint(ctx, clip, &prefs);
-                    ctx.layer_painter(egui::LayerId::background()).rect_filled(
-                        clip,
-                        0.0,
-                        background.surface_fill(true, &prefs, theme.palette.background),
-                    );
-                });
-                assert_eq!(background.texture.as_ref().unwrap().id(), texture);
-                assert!(!output
-                    .textures_delta
-                    .set
-                    .iter()
-                    .any(|(id, _)| *id == texture));
-                for (band, original) in SOURCE_COLORS.into_iter().enumerate() {
-                    let expected = if opacity == 0.0 {
-                        theme.palette.background.to_array()
-                    } else if opacity == 100.0 {
-                        original
-                    } else {
-                        // 50% rounds to alpha128; blend over a fixed white base.
-                        original.map(|v| ((u32::from(v) * 128 + 255 * 127 + 127) / 255) as u8)
-                    };
-                    assert_eq!(
-                        sample(
-                            &output,
-                            texture,
-                            &image,
-                            pos2(42.0 + band as f32 * 64.0, 52.0)
-                        ),
-                        expected,
-                        "theme={} opacity={opacity} band={band}",
-                        theme.id,
-                    );
+        for dark in [false, true] {
+            prefs.appearance = if dark {
+                crate::prefs::AppearanceMode::Dark
+            } else {
+                crate::prefs::AppearanceMode::Light
+            };
+            for theme in crate::prefs::THEMES {
+                prefs.theme = theme.id.to_owned();
+                for opacity in [0.0, 50.0, 100.0] {
+                    for brightness in [20.0, 50.0, 100.0] {
+                        prefs.opacity = opacity;
+                        prefs.background_brightness = brightness;
+                        let output = ctx.run(input(), |ctx| {
+                            prefs.apply(ctx);
+                            background.sync(ctx, &prefs);
+                            background.paint(ctx, clip, &prefs);
+                            ctx.layer_painter(egui::LayerId::background()).rect_filled(
+                                clip,
+                                0.0,
+                                background.surface_fill(
+                                    true,
+                                    &prefs,
+                                    prefs.palette_for(dark).background,
+                                ),
+                            );
+                        });
+                        assert_eq!(background.texture.as_ref().unwrap().id(), texture);
+                        assert!(!output
+                            .textures_delta
+                            .set
+                            .iter()
+                            .any(|(id, _)| *id == texture));
+                        for (band, original) in SOURCE_COLORS.into_iter().enumerate() {
+                            let expected = if opacity == 0.0 {
+                                prefs.palette_for(dark).background.to_array()
+                            } else {
+                                let alpha = (255.0 * opacity / 100.0).round();
+                                let tint = (255.0 * opacity / 100.0 * brightness / 100.0).round();
+                                let base = if dark { 24.0 } else { 238.0 };
+                                let mut rgb = original.map(|v| {
+                                    (f32::from(v) * tint / 255.0 + base * (1.0 - alpha / 255.0))
+                                        .round() as u8
+                                });
+                                rgb[3] = 255;
+                                rgb
+                            };
+                            assert_eq!(sample(&output, texture, &image, pos2(42.0 + band as f32 * 64.0, 52.0)), expected,
+                                "dark={dark} accent={} opacity={opacity} brightness={brightness} band={band}", theme.id);
+                        }
+                        assert_eq!(
+                            sample(&output, texture, &image, pos2(8.0, 52.0)),
+                            CLEAR.to_array()
+                        );
+                    }
                 }
-                assert_eq!(
-                    sample(&output, texture, &image, pos2(8.0, 52.0)),
-                    CLEAR.to_array()
-                );
             }
         }
     }

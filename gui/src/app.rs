@@ -7,7 +7,7 @@ use crate::{
     download_config::ConfigState,
     download_panel::QueueState,
     login::{LoginAction, LoginState},
-    prefs::{BackgroundScope, GuiPrefs, StartPage, UpdateChannel, THEMES},
+    prefs::{AppearanceMode, BackgroundScope, GuiPrefs, StartPage, UpdateChannel, THEMES},
     search::SearchState,
     theme::{self, ButtonKind, Icon},
     update::{self, Status as UpdateStatus, UpdateState},
@@ -177,7 +177,7 @@ pub struct App {
     prefs: GuiPrefs,
     background: Background,
     prefs_dirty: bool,
-    appearance: (usize, f32, bool),
+    appearance: Option<(usize, f32, bool, AppearanceMode, bool)>,
     scale_draft: f32,
     confirming_close: bool,
     updates: UpdateState,
@@ -205,7 +205,6 @@ impl App {
             StartPage::Queue => Page::Queue,
         };
         let reduced = prefs.reduced_motion;
-        let appearance = (prefs.theme_index(), prefs.ui_scale, prefs.compact);
         let scale_draft = prefs.ui_scale;
         Self {
             bridge,
@@ -253,7 +252,7 @@ impl App {
             prefs,
             background: Background::default(),
             prefs_dirty: false,
-            appearance,
+            appearance: None,
             scale_draft,
             confirming_close: false,
             updates: UpdateState::default(),
@@ -326,10 +325,12 @@ impl App {
             self.prefs.theme_index(),
             self.prefs.ui_scale,
             self.prefs.compact,
+            self.prefs.appearance,
+            self.prefs.resolved_dark(ctx),
         );
-        if current != self.appearance {
+        if Some(current) != self.appearance {
             self.prefs.apply(ctx);
-            self.appearance = current;
+            self.appearance = Some(current);
         }
         let animation = if self.reduced { 0.0 } else { theme::MOTION };
         if (ctx.style().animation_time - animation).abs() > f32::EPSILON {
@@ -918,7 +919,7 @@ impl App {
         egui::TopBottomPanel::top("browse-header")
             .frame(
                 egui::Frame::none()
-                    .fill(self.surface(self.background.visible_for(&self.prefs, true)))
+                    .fill(theme::card())
                     .inner_margin(egui::vec2(18.0, 10.0)),
             )
             .show(ctx, |ui| {
@@ -1245,7 +1246,10 @@ impl App {
         }
         if let Some(error) = self.init_error.clone() {
             theme::inset(theme::rose()).show(ui, |ui| {
-                ui.colored_label(theme::ERROR, "下载核心暂不可用，仍可浏览界面和调整设置。");
+                ui.colored_label(
+                    theme::error_color(),
+                    "下载核心暂不可用，仍可浏览界面和调整设置。",
+                );
                 ui.label(error);
                 ui.add_enabled_ui(
                     self.bridge.is_some() && !self.initializing && !self.closing,
@@ -1480,7 +1484,20 @@ impl App {
         theme::card_frame().show(ui, |ui| {
             theme::inset(theme::card()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                theme::section(ui, "主题", "内置 5 套配色，切换后立即生效并记住选择。");
+                ui.label(RichText::new("外观模式").strong());
+                ui.horizontal_wrapped(|ui| {
+                    for (mode, label) in [
+                        (AppearanceMode::System, "跟随系统"),
+                        (AppearanceMode::Light, "浅色"),
+                        (AppearanceMode::Dark, "深色"),
+                    ] {
+                        if ui.selectable_value(&mut self.prefs.appearance, mode, label).changed() {
+                            self.touch_prefs();
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+                ui.label(RichText::new("主题色").strong());
                 ui.horizontal_wrapped(|ui| {
                     for (index, preset) in THEMES.iter().enumerate() {
                         let selected = self.prefs.theme_index() == index;
@@ -1560,7 +1577,7 @@ impl App {
                     });
                 });
                 if let Some(error) = self.background.error() {
-                    ui.colored_label(theme::ERROR, error);
+                    ui.colored_label(theme::error_color(), error);
                 }
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
@@ -1599,6 +1616,16 @@ impl App {
                     self.touch_prefs();
                 }
                 ui.add_space(4.0);
+                let mut brightness = self.prefs.background_brightness;
+                if ui.add(
+                    egui::Slider::new(&mut brightness, 20.0..=100.0)
+                        .text("背景亮度")
+                        .suffix("%"),
+                ).changed() {
+                    self.prefs.background_brightness = brightness;
+                    self.touch_prefs();
+                }
+                ui.add_space(4.0);
                 let mut blur = self.prefs.blur;
                 let blur_response = ui.add(
                     egui::Slider::new(&mut blur, 0.0..=100.0)
@@ -1627,7 +1654,7 @@ impl App {
                 let valid = !self.output_input.trim().is_empty() && path.is_absolute();
                 if !valid {
                     ui.colored_label(
-                        theme::ERROR,
+                        theme::error_color(),
                         "请输入绝对路径，例如 C:\\Users\\你的用户名\\Downloads 或 /home/user/Downloads。",
                     );
                 }
@@ -1873,14 +1900,14 @@ impl App {
                         UpdateStatus::Ready { version } => {
                             ui.label(
                                 RichText::new(format!("v{version} 已安装，重启后生效"))
-                                    .color(theme::GREEN),
+                                    .color(theme::success_color()),
                             );
                         }
                         UpdateStatus::Error(message) => {
-                            ui.colored_label(theme::ERROR, message);
+                            ui.colored_label(theme::error_color(), message);
                         }
                         UpdateStatus::UpToDate => {
-                            ui.label(RichText::new("已是最新版本").color(theme::GREEN));
+                            ui.label(RichText::new("已是最新版本").color(theme::success_color()));
                         }
                         UpdateStatus::NoCompatibleRelease => {
                             theme::muted(ui, "更高版本暂无适用于当前平台的 GUI 包");
@@ -2151,18 +2178,23 @@ impl App {
                             }
                         }
                         Page::Queue => {
-                            let action = self.queue.show(
-                                ui,
-                                crate::download_panel::QueueView {
-                                    snapshot: &self.snapshot,
-                                    pending: &self.controls,
-                                    available: self.ready && !self.closing && !self.stopped,
-                                    operations_available: available,
-                                    reduced: self.reduced,
-                                },
-                                &mut self.covers,
-                                self.bridge.as_ref(),
-                            );
+                            let action = theme::inset(theme::card())
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    self.queue.show(
+                                        ui,
+                                        crate::download_panel::QueueView {
+                                            snapshot: &self.snapshot,
+                                            pending: &self.controls,
+                                            available: self.ready && !self.closing && !self.stopped,
+                                            operations_available: available,
+                                            reduced: self.reduced,
+                                        },
+                                        &mut self.covers,
+                                        self.bridge.as_ref(),
+                                    )
+                                })
+                                .inner;
                             if let Some(action) = action {
                                 match action {
                                     crate::download_panel::QueueAction::Control(id, action) => {
@@ -2378,7 +2410,7 @@ impl eframe::App for App {
             egui::Rect::from_min_max(egui::pos2(screen.left(), screen.top() + 92.0), screen.max)
         };
         self.background.paint(ctx, clip, &self.prefs);
-        let bar_fill = self.surface(self.prefs.background_scope == BackgroundScope::Full);
+        let bar_fill = theme::card();
         if let Some(action) = window::title_bar(ctx, bar_fill, maximized) {
             match action {
                 WindowAction::Minimize => {
@@ -2468,7 +2500,7 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     theme::inset(theme::card()).show(ui, |ui| {
                         if let Some(error) = &self.close_error {
-                            ui.colored_label(theme::ERROR, error);
+                            ui.colored_label(theme::error_color(), error);
                             theme::muted(
                                 ui,
                                 "后台已停止，但未能确认所有状态已保存。请保留状态目录以便恢复。",
@@ -3244,6 +3276,31 @@ mod layout_tests {
                 .any(|(text, _, _)| text.contains("过期的布局测试横幅")),
             "expired toast is still painted"
         );
+    }
+
+    #[test]
+    fn appearance_sync_tracks_system_changes_and_manual_override() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        for (mode, system, expected_dark) in [
+            (AppearanceMode::System, egui::Theme::Light, false),
+            (AppearanceMode::System, egui::Theme::Dark, true),
+            (AppearanceMode::Light, egui::Theme::Dark, false),
+            (AppearanceMode::Dark, egui::Theme::Light, true),
+        ] {
+            app.prefs.appearance = mode;
+            let _ = ctx.run(
+                egui::RawInput {
+                    system_theme: Some(system),
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.sync_appearance(ctx);
+                    assert_eq!(ctx.style().visuals.dark_mode, expected_dark);
+                    assert_eq!(theme::palette().dark_mode, expected_dark);
+                },
+            );
+        }
     }
 
     #[test]
