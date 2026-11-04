@@ -1,7 +1,9 @@
 //! Bounded native-shell adapter. Core owns all network and durable job behavior.
 //! The host retains this worker and joins it before dropping its Tokio runtime.
 use bili_core::{auth::QrStatus, *};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet, future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration,
+};
 use tokio::{
     runtime::Handle,
     sync::{mpsc, watch},
@@ -126,14 +128,31 @@ pub enum Event {
         url: String,
         image: Option<egui::ColorImage>,
     },
+    /// Read-only decoration was preempted, rather than failing to load.
+    CoverDeferred {
+        url: String,
+    },
     Stopped(Result<ShutdownReport>),
 }
 
 pub struct Bridge {
     commands: mpsc::Sender<Command>,
+    covers: mpsc::Sender<String>,
     pub events: mpsc::Receiver<Event>,
     pub snapshots: watch::Receiver<Arc<QueueSnapshot>>,
     shutdown: watch::Sender<bool>,
+}
+
+const COVER_CONCURRENCY: usize = 2;
+const COVER_QUEUE: usize = 16;
+
+struct SessionIo {
+    commands: mpsc::Receiver<Command>,
+    covers: mpsc::Receiver<String>,
+    events: mpsc::Sender<Event>,
+    snapshots: watch::Sender<Arc<QueueSnapshot>>,
+    stop: watch::Receiver<bool>,
+    ctx: egui::Context,
 }
 
 pub struct Owner {
@@ -152,45 +171,55 @@ impl Owner {
 }
 
 impl Bridge {
-    #[cfg(test)]
-    pub fn test_channel() -> (Self, mpsc::Sender<Event>, mpsc::Receiver<Command>) {
+    fn channel_pair(ctx: egui::Context) -> (Self, SessionIo) {
         let (commands, receiver) = mpsc::channel(16);
+        let (covers, cover_requests) = mpsc::channel(COVER_QUEUE);
         let (events_tx, events) = mpsc::channel(32);
-        let (_, snapshots) = watch::channel(Arc::new(QueueSnapshot::default()));
-        let (shutdown, _) = watch::channel(false);
+        let (snapshots_tx, snapshots) = watch::channel(Arc::new(QueueSnapshot::default()));
+        let (shutdown, stop) = watch::channel(false);
         (
             Self {
                 commands,
+                covers,
                 events,
                 snapshots,
                 shutdown,
             },
-            events_tx,
-            receiver,
+            SessionIo {
+                commands: receiver,
+                covers: cover_requests,
+                events: events_tx,
+                snapshots: snapshots_tx,
+                stop,
+                ctx,
+            },
         )
+    }
+    #[cfg(test)]
+    pub fn test_channel() -> (Self, mpsc::Sender<Event>, mpsc::Receiver<Command>) {
+        let (bridge, io) = Self::channel_pair(egui::Context::default());
+        (bridge, io.events, io.commands)
     }
     pub fn start(
         config: Result<CoreConfig>,
         runtime: &Handle,
         ctx: egui::Context,
     ) -> (Self, Owner) {
-        let (commands, receiver) = mpsc::channel(16);
-        let (events_tx, events) = mpsc::channel(32);
-        let (snapshots_tx, snapshots) = watch::channel(Arc::new(QueueSnapshot::default()));
-        let (shutdown, stop) = watch::channel(false);
-        let worker = runtime.spawn(serve(config, receiver, events_tx, snapshots_tx, stop, ctx));
-        (
-            Self {
-                commands,
-                events,
-                snapshots,
-                shutdown: shutdown.clone(),
-            },
-            Owner { worker, shutdown },
-        )
+        let (bridge, io) = Self::channel_pair(ctx);
+        let shutdown = bridge.shutdown.clone();
+        let worker = runtime.spawn(serve(config, io));
+        (bridge, Owner { worker, shutdown })
     }
 
     pub fn send(&self, command: Command) -> std::result::Result<(), &'static str> {
+        if let Command::Cover(url) = command {
+            // Decoration cannot fill the command lane or reserve unbounded
+            // connection waiters. Rejected covers may be requested next frame.
+            return self.covers.try_send(url).map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => "封面队列已满，稍后重试。",
+                mpsc::error::TrySendError::Closed(_) => "后台已停止，请关闭并重新打开应用。",
+            });
+        }
         self.commands
             .try_send(command)
             .map_err(|error| match error {
@@ -229,32 +258,30 @@ async fn initialize(config: Result<CoreConfig>) -> Result<Core> {
         .map_err(|_| CoreError::new(ErrorCode::Corruption, "initialize GUI core worker"))?
 }
 
-async fn serve(
-    config: Result<CoreConfig>,
-    mut commands: mpsc::Receiver<Command>,
-    events: mpsc::Sender<Event>,
-    snapshots: watch::Sender<Arc<QueueSnapshot>>,
-    mut stop: watch::Receiver<bool>,
-    ctx: egui::Context,
-) {
+async fn serve(config: Result<CoreConfig>, mut io: SessionIo) {
     // Initialization and retry never perform authentication or discovery calls.
     let core = loop {
-        if *stop.borrow() {
-            emit(&events, &ctx, Event::Stopped(Ok(ShutdownReport::default()))).await;
+        if *io.stop.borrow() {
+            emit(
+                &io.events,
+                &io.ctx,
+                Event::Stopped(Ok(ShutdownReport::default())),
+            )
+            .await;
             return;
         }
         match initialize(config.clone()).await {
             Ok(core) => break core,
-            Err(error) => emit(&events, &ctx, Event::InitFailed(error)).await,
+            Err(error) => emit(&io.events, &io.ctx, Event::InitFailed(error)).await,
         }
         loop {
             tokio::select! {
                 biased;
-                _ = wait_cancel(&mut stop) => {
-                    emit(&events, &ctx, Event::Stopped(Ok(ShutdownReport::default()))).await;
+                _ = wait_cancel(&mut io.stop) => {
+                    emit(&io.events, &io.ctx, Event::Stopped(Ok(ShutdownReport::default()))).await;
                     return;
                 }
-                command = commands.recv() => match command {
+                command = io.commands.recv() => match command {
                     Some(Command::RetryInit) => break,
                     None => return,
                     _ => {}
@@ -262,29 +289,98 @@ async fn serve(
             }
         }
     };
-    let mut jobs = core.jobs();
-    snapshots.send_replace(jobs.borrow_and_update().clone());
-    emit(&events, &ctx, Event::Ready).await;
+    let jobs = core.jobs();
+    let events = io.events.clone();
+    let ctx = io.ctx.clone();
+    let snapshots = io.snapshots.clone();
+    let worker_error = serve_session(core.clone(), io, jobs.clone()).await;
+    let report = core.shutdown(StopMode::Pause).await;
+    let report = report.and_then(|report| worker_error.map_or(Ok(report), Err));
+    snapshots.send_replace(jobs.borrow().clone());
+    emit(&events, &ctx, Event::Stopped(report)).await;
+}
+
+type SessionFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// The private adapter keeps the real bridge scheduler testable without a core
+/// instance, credentials, filesystem state or network service.
+trait Session: Clone + Send + 'static {
+    fn run(
+        self,
+        operation: Operation,
+        cancel: watch::Receiver<bool>,
+        events: mpsc::Sender<Event>,
+        ctx: egui::Context,
+    ) -> SessionFuture<Result<Outcome>>;
+    fn control(self, id: JobId, action: JobAction) -> SessionFuture<(JobId, Result<()>)>;
+    fn cover(self, url: String) -> SessionFuture<(String, Option<egui::ColorImage>)>;
+}
+
+impl Session for Core {
+    fn run(
+        self,
+        operation: Operation,
+        cancel: watch::Receiver<bool>,
+        events: mpsc::Sender<Event>,
+        ctx: egui::Context,
+    ) -> SessionFuture<Result<Outcome>> {
+        Box::pin(execute(self, operation, cancel, events, ctx))
+    }
+    fn control(self, id: JobId, action: JobAction) -> SessionFuture<(JobId, Result<()>)> {
+        Box::pin(async move { (id, Core::control(&self, id, action).await) })
+    }
+    fn cover(self, url: String) -> SessionFuture<(String, Option<egui::ColorImage>)> {
+        Box::pin(async move {
+            let image = Core::cover(&self, CoverRequest { url: url.clone() })
+                .await
+                .ok()
+                .and_then(decode_cover);
+            (url, image)
+        })
+    }
+}
+
+async fn session_emit(io: &mut SessionIo, event: Event) -> bool {
+    tokio::select! {
+        biased;
+        _ = wait_cancel(&mut io.stop) => false,
+        result = io.events.send(event) => {
+            if result.is_ok() { io.ctx.request_repaint(); }
+            result.is_ok()
+        }
+    }
+}
+
+async fn serve_session<S: Session>(
+    session: S,
+    mut io: SessionIo,
+    mut jobs: watch::Receiver<Arc<QueueSnapshot>>,
+) -> Option<CoreError> {
+    io.snapshots.send_replace(jobs.borrow_and_update().clone());
+    if !session_emit(&mut io, Event::Ready).await {
+        return None;
+    }
     let mut foreground = JoinSet::new();
     let mut controls = JoinSet::new();
     let mut covers = JoinSet::new();
+    let mut active_covers = HashSet::new();
     let mut cancellation: Option<watch::Sender<bool>> = None;
     let mut worker_error = None;
-    loop {
+    'session: loop {
         tokio::select! {
             biased;
-            _ = wait_cancel(&mut stop) => break,
+            _ = wait_cancel(&mut io.stop) => break,
             result = foreground.join_next(), if !foreground.is_empty() => {
                 cancellation = None;
                 let result = match result {
                     Some(Ok(result)) => result,
                     _ => Err(CoreError::new(ErrorCode::Corruption, "GUI operation worker failed")),
                 };
-                emit(&events, &ctx, Event::Finished(result)).await;
+                if !session_emit(&mut io, Event::Finished(result)).await { break; }
             }
             result = controls.join_next(), if !controls.is_empty() => {
                 if let Some(Ok((id, result))) = result {
-                    emit(&events, &ctx, Event::Controlled(id, result)).await;
+                    if !session_emit(&mut io, Event::Controlled(id, result)).await { break; }
                 } else {
                     // Control tasks contain only a core call; a panic is fatal to
                     // this shell session rather than leaving buttons pending forever.
@@ -292,72 +388,84 @@ async fn serve(
                     break;
                 }
             }
-            result = covers.join_next(), if !covers.is_empty() => {
-                if let Some(Ok((url, image))) = result {
-                    emit(&events, &ctx, Event::Cover { url, image }).await;
-                }
-            }
-            command = commands.recv() => match command {
+            command = io.commands.recv() => match command {
                 Some(Command::Run(operation)) if foreground.is_empty() => {
+                    // Release both running requests and semaphore waiters before
+                    // foreground discovery, and discard the preceding page's
+                    // queued decoration without poisoning its cache entries.
+                    covers.abort_all();
+                    while covers.join_next().await.is_some() {}
+                    let mut deferred: Vec<_> = active_covers.drain().collect();
+                    while let Ok(url) = io.covers.try_recv() { deferred.push(url); }
                     let (tx, rx) = watch::channel(false);
                     cancellation = Some(tx);
-                    foreground.spawn(execute(core.clone(), operation, rx, events.clone(), ctx.clone()));
+                    foreground.spawn(session.clone().run(operation, rx, io.events.clone(), io.ctx.clone()));
+                    for url in deferred {
+                        if !session_emit(&mut io, Event::CoverDeferred { url }).await { break 'session; }
+                    }
                 }
                 Some(Command::Run(_)) => {
-                    emit(&events, &ctx, Event::Finished(Err(CoreError::new(ErrorCode::Busy, "GUI operation already running")))).await;
+                    if !session_emit(&mut io, Event::Finished(Err(CoreError::new(ErrorCode::Busy, "GUI operation already running")))).await { break; }
                 }
                 Some(Command::Cancel) => {
                     if let Some(cancel) = &cancellation { cancel.send_replace(true); }
                 }
                 Some(Command::Control(id, action)) => {
                     if controls.len() < 16 {
-                        let core = core.clone();
-                        controls.spawn(async move { (id, core.control(id, action).await) });
+                        controls.spawn(session.clone().control(id, action));
                     } else {
-                        emit(&events, &ctx, Event::Controlled(id, Err(CoreError::new(ErrorCode::Busy, "too many GUI controls")))).await;
+                        if !session_emit(&mut io, Event::Controlled(id, Err(CoreError::new(ErrorCode::Busy, "too many GUI controls")))).await { break; }
                     }
                 }
                 Some(Command::Cover(url)) => {
-                    // Covers are read-only decoration; keep them out of the
-                    // single-slot foreground lane so browsing never blocks.
-                    let core = core.clone();
-                    covers.spawn(async move {
-                        let image = core
-                            .cover(CoverRequest { url: url.clone() })
-                            .await
-                            .ok()
-                            .and_then(decode_cover);
-                        (url, image)
-                    });
+                    // Bridge::send routes covers into the bounded decoration lane.
+                    if !session_emit(&mut io, Event::CoverDeferred { url }).await { break; }
                 }
                 Some(Command::RetryInit) => {}
                 None => break,
             },
+            result = covers.join_next(), if !covers.is_empty() => {
+                if let Some(Ok((url, image))) = result {
+                    active_covers.remove(&url);
+                    if !session_emit(&mut io, Event::Cover { url, image }).await { break; }
+                } else {
+                    // A decoration panic must not leak pending cache entries or
+                    // grow the active-name set across later pages.
+                    covers.abort_all();
+                    while covers.join_next().await.is_some() {}
+                    for url in active_covers.drain() {
+                        if !session_emit(&mut io, Event::CoverDeferred { url }).await { break 'session; }
+                    }
+                }
+            }
+            Some(url) = io.covers.recv(), if foreground.is_empty() && covers.len() < COVER_CONCURRENCY => {
+                if active_covers.insert(url.clone()) {
+                    covers.spawn(session.clone().cover(url));
+                }
+            }
             changed = jobs.changed() => {
                 if changed.is_err() {
                     worker_error = Some(CoreError::new(ErrorCode::Shutdown, "core snapshot stream closed"));
                     break;
                 }
-                snapshots.send_replace(jobs.borrow_and_update().clone());
-                ctx.request_repaint();
+                io.snapshots.send_replace(jobs.borrow_and_update().clone());
+                io.ctx.request_repaint();
             }
         }
     }
-    commands.close();
+    io.commands.close();
+    io.covers.close();
     if let Some(cancel) = cancellation {
         cancel.send_replace(true);
     }
+    // Release read-only HTTP resources before waiting for durable acknowledgements.
+    covers.abort_all();
+    while covers.join_next().await.is_some() {}
     // Do not abort state-changing futures: wait for enqueue/control acks, then
     // let core pause, checkpoint and join its owned transfer/remux workers.
     while foreground.join_next().await.is_some() {}
     while controls.join_next().await.is_some() {}
-    // Cover fetches are read-only; dropping them cannot lose durable state.
-    covers.abort_all();
-    while covers.join_next().await.is_some() {}
-    let report = core.shutdown(StopMode::Pause).await;
-    let report = report.and_then(|report| worker_error.map_or(Ok(report), Err));
-    snapshots.send_replace(jobs.borrow().clone());
-    emit(&events, &ctx, Event::Stopped(report)).await;
+    worker_error
 }
 
 async fn execute(
@@ -436,10 +544,11 @@ async fn execute(
                 .map_err(|_| CoreError::new(ErrorCode::Filesystem, "open output location"))?
                 .map(|_| Outcome::Revealed)
         }
-        Operation::BrowseConditions(section) => core
-            .browse_conditions(section)
-            .await
-            .map(Outcome::BrowseConditions),
+        Operation::BrowseConditions(section) => {
+            cancellable(&mut cancel, core.browse_conditions(section))
+                .await
+                .map(Outcome::BrowseConditions)
+        }
         Operation::Browse(query) => tokio::select! {
             biased;
             _ = wait_cancel(&mut cancel) => Err(cancelled()),
@@ -534,6 +643,17 @@ async fn execute(
                 .map_err(|_| CoreError::new(ErrorCode::Filesystem, "check GUI output directory"))?
                 .map(Outcome::Output)
         }
+    }
+}
+
+async fn cancellable<T>(
+    cancel: &mut watch::Receiver<bool>,
+    request: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = wait_cancel(cancel) => Err(cancelled()),
+        result = request => result,
     }
 }
 
@@ -751,12 +871,319 @@ pub fn error_message(error: &CoreError) -> String {
 }
 
 pub fn error_code(error: &CoreError) -> String {
-    format!("错误码 {:?}", error.code)
+    let mut code = format!("错误码 {:?}", error.code);
+    if let Some(status) = error
+        .http_status
+        .filter(|status| (100..=599).contains(status))
+    {
+        code.push_str(&format!(" · HTTP {status}"));
+    }
+    code
+}
+
+/// Only exact core-owned labels are mapped; never echo operation text, URLs,
+/// remote bodies, cookies, or an inferred number of retry attempts.
+pub fn error_hint(error: &CoreError) -> Option<String> {
+    if !matches!(error.code, ErrorCode::Transport | ErrorCode::RetryExhausted) {
+        return None;
+    }
+    let stage = match error.operation.as_str() {
+        "request Bilibili API timed out" => Some("请求超时"),
+        "connect to Bilibili API" => Some("连接失败"),
+        "request Bilibili API" => Some("请求未成功"),
+        "read Bilibili API response" => Some("读取响应失败"),
+        "read Bilibili API response timed out" => Some("读取响应超时"),
+        _ => None,
+    };
+    let mut details = Vec::new();
+    if let Some(stage) = stage {
+        details.push(stage.to_owned());
+    }
+    if let Some(status) = error
+        .http_status
+        .filter(|status| (100..=599).contains(status))
+    {
+        details.push(format!("HTTP {status}"));
+    }
+    if error.code == ErrorCode::RetryExhausted {
+        details.push("自动重试已结束，可手动重试。".into());
+    }
+    (!details.is_empty()).then(|| details.join(" · "))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
+
+    #[derive(Clone)]
+    struct FixtureSession {
+        started: mpsc::Sender<&'static str>,
+        release: Arc<Semaphore>,
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        admitted: Arc<AtomicBool>,
+        controlled: Arc<AtomicBool>,
+    }
+    struct ActiveCover(Arc<AtomicUsize>);
+    impl Drop for ActiveCover {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    impl Session for FixtureSession {
+        fn run(
+            self,
+            operation: Operation,
+            mut cancel: watch::Receiver<bool>,
+            _: mpsc::Sender<Event>,
+            _: egui::Context,
+        ) -> SessionFuture<Result<Outcome>> {
+            Box::pin(async move {
+                self.started.send("foreground").await.unwrap();
+                if matches!(operation, Operation::Enqueue { .. }) {
+                    // Admission deliberately ignores cancellation once sent;
+                    // the real scheduler must join its acknowledgement.
+                    self.release.acquire().await.unwrap().forget();
+                    self.admitted.store(true, Ordering::SeqCst);
+                    return Ok(Outcome::Enqueued {
+                        receipts: vec![],
+                        cancelled: false,
+                        error: None,
+                    });
+                }
+                cancellable(&mut cancel, async move {
+                    self.release.acquire().await.unwrap().forget();
+                    match operation {
+                        Operation::BrowseConditions(section) => {
+                            Ok(Outcome::BrowseConditions(BrowseConditions {
+                                section,
+                                genres: vec![],
+                            }))
+                        }
+                        _ => Ok(Outcome::Search(CandidatePage { pages: vec![] })),
+                    }
+                })
+                .await
+            })
+        }
+        fn control(self, id: JobId, _: JobAction) -> SessionFuture<(JobId, Result<()>)> {
+            Box::pin(async move {
+                self.started.send("control").await.unwrap();
+                self.release.acquire().await.unwrap().forget();
+                self.controlled.store(true, Ordering::SeqCst);
+                (id, Ok(()))
+            })
+        }
+        fn cover(self, url: String) -> SessionFuture<(String, Option<egui::ColorImage>)> {
+            Box::pin(async move {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                let _owned = ActiveCover(self.active.clone());
+                self.started.send("cover").await.unwrap();
+                std::future::pending::<()>().await;
+                (url, None)
+            })
+        }
+    }
+    fn fixture() -> (FixtureSession, mpsc::Receiver<&'static str>) {
+        let (started, receiver) = mpsc::channel(32);
+        (
+            FixtureSession {
+                started,
+                release: Arc::new(Semaphore::new(0)),
+                active: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
+                admitted: Arc::new(AtomicBool::new(false)),
+                controlled: Arc::new(AtomicBool::new(false)),
+            },
+            receiver,
+        )
+    }
+    async fn next_event(bridge: &mut Bridge) -> Event {
+        tokio::time::timeout(Duration::from_secs(2), bridge.events.recv())
+            .await
+            .expect("bridge event deadline")
+            .expect("bridge event channel")
+    }
+    async fn started(receiver: &mut mpsc::Receiver<&'static str>) -> &'static str {
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("operation start deadline")
+            .unwrap()
+    }
+    fn query() -> SearchQuery {
+        SearchQuery {
+            keyword: "offline".into(),
+            category: SearchCategory::Video,
+            page: 1,
+            sort: SearchSort::Relevance,
+            filter: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_reports_only_the_actual_terminal_result_of_a_delayed_operation() {
+        let (session, mut requests) = fixture();
+        let (mut bridge, io) = Bridge::channel_pair(egui::Context::default());
+        let (_jobs, jobs) = watch::channel(Arc::new(QueueSnapshot::default()));
+        let worker = tokio::spawn(serve_session(session.clone(), io, jobs));
+        assert!(matches!(next_event(&mut bridge).await, Event::Ready));
+        bridge
+            .send(Command::Run(Operation::Search(query())))
+            .unwrap();
+        assert_eq!(started(&mut requests).await, "foreground");
+        assert!(
+            matches!(
+                bridge.events.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "waiting is not a failed terminal result"
+        );
+        session.release.add_permits(1);
+        assert!(matches!(
+            next_event(&mut bridge).await,
+            Event::Finished(Ok(Outcome::Search(_)))
+        ));
+        bridge.shutdown();
+        assert!(tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn cover_flood_is_bounded_and_preempted_before_foreground_work() {
+        let (session, mut requests) = fixture();
+        let (mut bridge, io) = Bridge::channel_pair(egui::Context::default());
+        let (_jobs, jobs) = watch::channel(Arc::new(QueueSnapshot::default()));
+        let worker = tokio::spawn(serve_session(session.clone(), io, jobs));
+        assert!(matches!(next_event(&mut bridge).await, Event::Ready));
+        for i in 0..COVER_CONCURRENCY {
+            bridge.send(Command::Cover(format!("active:{i}"))).unwrap();
+        }
+        for _ in 0..COVER_CONCURRENCY {
+            assert_eq!(started(&mut requests).await, "cover");
+        }
+        let accepted = (0..100)
+            .filter(|i| bridge.send(Command::Cover(format!("queued:{i}"))).is_ok())
+            .count();
+        assert_eq!(accepted, COVER_QUEUE);
+        bridge
+            .send(Command::Run(Operation::Search(query())))
+            .expect("covers cannot fill foreground command queue");
+        assert_eq!(started(&mut requests).await, "foreground");
+        assert_eq!(
+            session.active.load(Ordering::SeqCst),
+            0,
+            "cover HTTP futures must be dropped before discovery starts"
+        );
+        assert_eq!(session.peak.load(Ordering::SeqCst), COVER_CONCURRENCY);
+        let mut deferred = HashSet::new();
+        for _ in 0..COVER_QUEUE + COVER_CONCURRENCY {
+            let Event::CoverDeferred { url } = next_event(&mut bridge).await else {
+                panic!("preemption must release pending cache entries without a failure");
+            };
+            deferred.insert(url);
+        }
+        assert_eq!(deferred.len(), COVER_QUEUE + COVER_CONCURRENCY);
+        session.release.add_permits(1);
+        assert!(matches!(
+            next_event(&mut bridge).await,
+            Event::Finished(Ok(Outcome::Search(_)))
+        ));
+        bridge.send(Command::Cover("active:0".into())).unwrap();
+        assert_eq!(
+            started(&mut requests).await,
+            "cover",
+            "preempted URL remains requestable"
+        );
+        bridge.shutdown();
+        assert!(tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            session.active.load(Ordering::SeqCst),
+            0,
+            "close joins aborted cover work"
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_conditions_can_be_cancelled_while_its_request_is_pending() {
+        let (session, mut requests) = fixture();
+        let (mut bridge, io) = Bridge::channel_pair(egui::Context::default());
+        let (_jobs, jobs) = watch::channel(Arc::new(QueueSnapshot::default()));
+        let worker = tokio::spawn(serve_session(session, io, jobs));
+        assert!(matches!(next_event(&mut bridge).await, Event::Ready));
+        bridge
+            .send(Command::Run(Operation::BrowseConditions(PgcSection::Anime)))
+            .unwrap();
+        assert_eq!(started(&mut requests).await, "foreground");
+        bridge.send(Command::Cancel).unwrap();
+        assert!(
+            matches!(next_event(&mut bridge).await, Event::Finished(Err(error)) if error.code == ErrorCode::Cancelled)
+        );
+        bridge.shutdown();
+        assert!(tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn close_joins_admission_and_control_acknowledgements_without_aborting_them() {
+        let (session, mut requests) = fixture();
+        let (mut bridge, io) = Bridge::channel_pair(egui::Context::default());
+        let (_jobs, jobs) = watch::channel(Arc::new(QueueSnapshot::default()));
+        let worker = tokio::spawn(serve_session(session.clone(), io, jobs));
+        assert!(matches!(next_event(&mut bridge).await, Event::Ready));
+        bridge
+            .send(Command::Run(Operation::Enqueue {
+                selections: vec![],
+                output_dir: PathBuf::from("synthetic"),
+            }))
+            .unwrap();
+        bridge
+            .send(Command::Control(JobId::new(), JobAction::Pause))
+            .unwrap();
+        let mut seen = [started(&mut requests).await, started(&mut requests).await];
+        seen.sort_unstable();
+        assert_eq!(seen, ["control", "foreground"]);
+        bridge.shutdown();
+        tokio::task::yield_now().await;
+        assert!(!worker.is_finished());
+        session.release.add_permits(2);
+        assert!(tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert!(session.admitted.load(Ordering::SeqCst));
+        assert!(session.controlled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn close_interrupts_event_backpressure_without_requiring_the_paint_loop() {
+        let (session, _) = fixture();
+        let (bridge, io) = Bridge::channel_pair(egui::Context::default());
+        for _ in 0..32 {
+            assert!(io.events.try_send(Event::Ready).is_ok());
+        }
+        let (_jobs, jobs) = watch::channel(Arc::new(QueueSnapshot::default()));
+        let worker = tokio::spawn(serve_session(session, io, jobs));
+        bridge.shutdown();
+        assert!(tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+    }
     #[test]
     fn adding_an_account_requires_the_new_qr_commit_not_an_existing_logged_in_session() {
         let mut snapshot = AuthSnapshot {
@@ -865,5 +1292,34 @@ mod tests {
         let mut error = CoreError::new(ErrorCode::Transport, "request");
         error.operation = "secret-cookie-and-url".into();
         assert!(!error_message(&error).contains("secret-cookie"));
+        assert!(error_hint(&error).is_none());
+        error.http_status = Some(503);
+        assert_eq!(error_hint(&error).as_deref(), Some("HTTP 503"));
+        assert!(!error_code(&error).contains("secret-cookie"));
+    }
+
+    #[test]
+    fn transport_diagnostics_show_only_allowlisted_stage_and_actual_numeric_status() {
+        let mut error =
+            CoreError::new(ErrorCode::Transport, "read Bilibili API response timed out");
+        error.http_status = Some(502);
+        assert_eq!(
+            error_hint(&error).as_deref(),
+            Some("读取响应超时 · HTTP 502")
+        );
+        assert_eq!(error_code(&error), "错误码 Transport · HTTP 502");
+        error.code = ErrorCode::RetryExhausted;
+        assert_eq!(
+            error_hint(&error).as_deref(),
+            Some("读取响应超时 · HTTP 502 · 自动重试已结束，可手动重试。")
+        );
+        error.http_status = Some(999);
+        assert!(!error_code(&error).contains("999"));
+        assert!(!error_hint(&error).unwrap().contains("999"));
+        error.code = ErrorCode::VerificationRequired;
+        assert!(
+            error_hint(&error).is_none(),
+            "access challenges never get a transport diagnosis"
+        );
     }
 }

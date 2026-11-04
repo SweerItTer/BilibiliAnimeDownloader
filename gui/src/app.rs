@@ -26,6 +26,20 @@ const TOAST_WIDTH: f32 = 380.0;
 const TOAST_ERROR_TTL: Duration = Duration::from_secs(12);
 const TOAST_NOTICE_TTL: Duration = Duration::from_secs(8);
 
+type DetailDraftKey = (ContentRef, Vec<bili_core::PartRef>);
+
+// Whole-content and explicit-part responses may share a ContentRef. Restore
+// only a draft for the incoming original parts, preserving their order.
+fn detail_draft_key(item: &bili_core::MediaItem) -> DetailDraftKey {
+    (
+        item.reference.clone(),
+        item.parts
+            .iter()
+            .map(|part| part.reference.clone())
+            .collect(),
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Page {
     Discover,
@@ -139,7 +153,7 @@ pub struct App {
     page: Page,
     search: SearchState,
     detail: Option<DetailState>,
-    detail_drafts: HashMap<ContentRef, DetailState>,
+    detail_drafts: HashMap<DetailDraftKey, DetailState>,
     config_drafts: HashMap<String, ConfigState>,
     navigation: u64,
     operation_navigation: Option<u64>,
@@ -158,6 +172,8 @@ pub struct App {
     auth: Option<AuthSnapshot>,
     snapshot: Arc<QueueSnapshot>,
     busy: Option<Busy>,
+    busy_started: Option<Instant>,
+    busy_description: Option<String>,
     cancelling: bool,
     controls: HashSet<JobId>,
     notice: Option<Notice>,
@@ -233,6 +249,8 @@ impl App {
             auth: None,
             snapshot: Arc::new(QueueSnapshot::default()),
             busy: None,
+            busy_started: None,
+            busy_description: None,
             cancelling: false,
             controls: HashSet::new(),
             notice: None,
@@ -293,7 +311,10 @@ impl App {
         if self
             .error_at
             .is_some_and(|shown| shown.elapsed() >= TOAST_ERROR_TTL)
-            && self.error.as_ref().is_none_or(|e| e.verification.is_none())
+            && self
+                .error
+                .as_ref()
+                .is_none_or(|e| e.verification.is_none() && e.retry.is_none())
         {
             self.error = None;
             self.error_at = None;
@@ -379,10 +400,7 @@ impl App {
             self.switching_account = matches!(operation, Operation::SelectProfile(_));
         }
         let kind = match &operation {
-            Operation::Search(_) => {
-                self.search.start_wait();
-                Busy::Search
-            }
+            Operation::Search(_) => Busy::Search,
             Operation::Resolve(_) => Busy::Resolve,
             Operation::Enqueue { .. } => Busy::Enqueue,
             Operation::Prepare { .. } => Busy::Resolve,
@@ -428,10 +446,23 @@ impl App {
         if let Operation::ValidateOutput(path) = &operation {
             self.retry_output = Some(path.clone());
         }
+        let description = match &operation {
+            Operation::Search(query) => format!("正在搜索第 {} 页", query.page),
+            Operation::Browse(query) => format!("正在加载第 {} 页", query.page),
+            Operation::BrowseConditions(_) => "正在加载分类条件".into(),
+            Operation::Resolve(_) => "正在加载内容详情".into(),
+            Operation::Prepare { .. } => "正在获取可用画质".into(),
+            _ => kind.label().trim_end_matches('…').to_owned(),
+        };
         if let Some(bridge) = &self.bridge {
             match bridge.send(Command::Run(operation)) {
                 Ok(()) => {
                     self.busy = Some(kind);
+                    self.busy_started = Some(Instant::now());
+                    self.busy_description = Some(description);
+                    if kind == Busy::Search {
+                        self.search.start_wait();
+                    }
                     self.cancelling = false;
                     self.error = None;
                     self.notice = None;
@@ -554,6 +585,7 @@ impl App {
                 Event::Cover { url, image } => {
                     self.covers.insert(ctx, url, image);
                 }
+                Event::CoverDeferred { url } => self.covers.defer(&url),
                 Event::Controlled(id, result) => {
                     self.controls.remove(&id);
                     if let Err(error) = result {
@@ -597,6 +629,8 @@ impl App {
                         self.search.mark_stale();
                     }
                     self.busy = None;
+                    self.busy_started = None;
+                    self.busy_description = None;
                     self.cancelling = false;
                     if was_login {
                         self.login.clear_challenge();
@@ -612,15 +646,11 @@ impl App {
                             {
                                 detail.category = category;
                             }
+                            let key = detail_draft_key(&detail.item);
                             if requested_navigation == Some(self.navigation) {
-                                self.detail = self
-                                    .detail_drafts
-                                    .remove(&detail.item.reference)
-                                    .or(Some(detail));
+                                self.detail = self.detail_drafts.remove(&key).or(Some(detail));
                             } else {
-                                self.detail_drafts
-                                    .entry(detail.item.reference.clone())
-                                    .or_insert(detail);
+                                self.detail_drafts.entry(key).or_insert(detail);
                             }
                         }
                         Ok(Outcome::Enqueued {
@@ -810,13 +840,16 @@ impl App {
                                 let mut banner = Banner::from(message);
                                 banner.verification = error.verification.clone();
                                 banner.code = Some(backend::error_code(&error));
-                                banner.hint = if retry_query.as_ref().is_some_and(|query| {
+                                banner.hint = backend::error_hint(&error);
+                                if retry_query.as_ref().is_some_and(|query| {
                                     query.category == bili_core::SearchCategory::All
                                 }) {
-                                    Some("「全部」会同时查询视频、番剧与影视，任一分区失败时整次搜索会失败；可切换到「视频」后重试。".into())
-                                } else {
-                                    None
-                                };
+                                    let hint = banner.hint.get_or_insert_default();
+                                    if !hint.is_empty() {
+                                        hint.push('\n');
+                                    }
+                                    hint.push_str("「全部」会同时查询视频、番剧与影视，任一分区失败时整次搜索会失败；可切换到「视频」后重试。");
+                                }
                                 banner.retry = if was_search {
                                     retry_discovery.or_else(|| retry_query.map(Retry::Search))
                                 } else if was_resolve {
@@ -839,6 +872,8 @@ impl App {
                     self.stopped = true;
                     self.ready = false;
                     self.busy = None;
+                    self.busy_started = None;
+                    self.busy_description = None;
                     self.controls.clear();
                     self.login.clear_challenge();
                     match result {
@@ -905,7 +940,7 @@ impl App {
     fn home(&mut self) {
         if let Some(detail) = self.detail.take() {
             self.detail_drafts
-                .insert(detail.item.reference.clone(), detail);
+                .insert(detail_draft_key(&detail.item), detail);
         }
         self.navigate(Page::Discover);
     }
@@ -1017,7 +1052,9 @@ impl App {
                             self.account_menu = false;
                         }
                         if self.auth.as_ref().is_some_and(|a| a.logged_in)
-                            && ui.button("退出登录").clicked()
+                            && ui
+                                .add_enabled(self.available(), egui::Button::new("退出登录"))
+                                .clicked()
                         {
                             self.send(Operation::Logout);
                             self.account_menu = false;
@@ -1225,7 +1262,11 @@ impl App {
             {
                 self.login.begin_add();
             }
-            if self.auth_target.is_none() && ui.button("使用访客").clicked() {
+            if self.auth_target.is_none()
+                && ui
+                    .add_enabled(self.available(), egui::Button::new("使用访客"))
+                    .clicked()
+            {
                 action = Some(Operation::Anonymous);
             }
         });
@@ -1278,14 +1319,11 @@ impl App {
     }
 
     fn busy_label(&self, busy: Busy) -> String {
-        if busy == Busy::Search {
-            self.search.waited().map_or_else(
-                || busy.label().to_owned(),
-                |waited| format!("正在搜索，已等待 {} 秒…", waited.as_secs()),
-            )
-        } else {
-            busy.label().to_owned()
-        }
+        let description = self.busy_description.as_deref().unwrap_or(busy.label());
+        self.busy_started.map_or_else(
+            || description.to_owned(),
+            |started| format!("{description}，已等待 {} 秒…", started.elapsed().as_secs()),
+        )
     }
 
     fn busy_toast(&mut self, ui: &mut Ui, busy: Busy) {
@@ -2128,6 +2166,19 @@ impl App {
                     ui.disable();
                 }
                 self.banners(ui);
+                if self.page == Page::Discover {
+                    if let Some(busy @ (Busy::Search | Busy::Resolve)) = self.busy {
+                        let label = if self.cancelling {
+                            "正在取消，请稍候…".to_owned()
+                        } else {
+                            self.busy_label(busy)
+                        };
+                        theme::inset(theme::soft()).show(ui, |ui| {
+                            theme::loading(ui, self.reduced, &label);
+                        });
+                        ui.add_space(8.0);
+                    }
+                }
                 if self.page == Page::Settings && !self.background.crop_open {
                     self.settings_nav(ui);
                 }
@@ -2333,7 +2384,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.collect(ctx);
         self.sync_appearance(ctx);
-        if self.busy == Some(Busy::Search) {
+        if self.busy.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
         if self.updates.status().is_checking() {
@@ -2557,6 +2608,28 @@ mod layout_tests {
         app.ready = true;
         app.initializing = false;
         app
+    }
+
+    #[test]
+    fn discovery_wait_is_visible_in_content_until_a_terminal_result() {
+        let size = Vec2::new(1180.0, 800.0);
+        let mut ctx = egui::Context::default();
+        let mut app = test_app();
+        app.busy = Some(Busy::Search);
+        app.busy_started = Some(Instant::now() - Duration::from_secs(5));
+        app.busy_description = Some("正在加载第 2 页".into());
+        app.search.start_wait();
+        frame(&mut ctx, &mut app, size, Vec::new());
+        let output = frame(&mut ctx, &mut app, size, Vec::new());
+        let labels = texts(&output);
+        assert!(labels.iter().any(
+            |(text, rect, _)| text.contains("正在加载第 2 页，已等待 5 秒")
+                && rect.left() < size.x / 2.0
+        ));
+        assert!(app.search.pending());
+        assert!(app.error.is_none());
+        assert!(!app.available());
+        assert!(!labels.iter().any(|(text, _, _)| text.contains("没有找到")));
     }
 
     #[test]
@@ -3080,7 +3153,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn busy_status_floats_top_right_instead_of_inline() {
+    fn busy_status_keeps_a_floating_cancel_action_alongside_inline_waiting() {
         let size = Vec2::new(1180.0, 800.0);
         let screen = Rect::from_min_size(Pos2::ZERO, size);
         let mut ctx = egui::Context::default();
@@ -3093,7 +3166,7 @@ mod layout_tests {
         assert_visible(&output, "正在解析内容与分集…", screen);
         let status = texts(&output)
             .into_iter()
-            .find(|(text, _, _)| text == "正在解析内容与分集…")
+            .find(|(text, rect, _)| text == "正在解析内容与分集…" && rect.left() > size.x * 0.6)
             .map(|(_, rect, _)| rect)
             .unwrap();
         assert!(
@@ -3279,6 +3352,20 @@ mod layout_tests {
     }
 
     #[test]
+    fn retryable_error_remains_visible_after_the_notice_timeout() {
+        let mut app = test_app();
+        let mut banner: Banner = "搜索没有完成".into();
+        banner.retry = Some(Retry::Login);
+        app.raise(banner);
+        app.error_at = Some(Instant::now() - Duration::from_secs(30));
+        app.inform("旧通知");
+        app.notice_at = Some(Instant::now() - Duration::from_secs(30));
+        app.expire_toasts();
+        assert!(app.error.as_ref().unwrap().retry.is_some());
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
     fn appearance_sync_tracks_system_changes_and_manual_override() {
         let mut app = test_app();
         let ctx = egui::Context::default();
@@ -3303,6 +3390,187 @@ mod layout_tests {
         }
     }
 
+    fn multipart_detail_item() -> MediaItem {
+        let mut item = media_item();
+        item.title = "Multipart detail state".into();
+        item.parts[0].title = "First original part".into();
+        let mut second = item.parts[0].clone();
+        second.reference.cid = Cid::new(137_649_200).unwrap();
+        second.ordinal = 2;
+        second.title = "Second original part".into();
+        item.parts.push(second);
+        item
+    }
+
+    fn explicit_detail_part(item: &MediaItem, index: usize) -> MediaItem {
+        let mut explicit = item.clone();
+        explicit.parts = vec![item.parts[index].clone()];
+        explicit
+    }
+
+    fn receive_detail(
+        app: &mut App,
+        events: &tokio::sync::mpsc::Sender<Event>,
+        commands: &mut tokio::sync::mpsc::Receiver<Command>,
+        ctx: &egui::Context,
+        input: &str,
+        item: MediaItem,
+    ) {
+        app.send(Operation::Resolve(input.into()));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::Run(Operation::Resolve(_))
+        ));
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Detail(item))))
+            .is_ok());
+        app.collect(ctx);
+    }
+
+    #[test]
+    fn whole_and_explicit_part_details_keep_independent_drafts() {
+        let mut app = test_app();
+        let (bridge, events, mut commands) = Bridge::test_channel();
+        app.bridge = Some(bridge);
+        let ctx = egui::Context::default();
+        let whole = multipart_detail_item();
+        let second = explicit_detail_part(&whole, 1);
+        let whole_key = detail_draft_key(&whole);
+        let second_key = detail_draft_key(&second);
+
+        receive_detail(
+            &mut app,
+            &events,
+            &mut commands,
+            &ctx,
+            "av80433022",
+            whole.clone(),
+        );
+        app.detail.as_mut().unwrap().item.description = Some("whole draft marker".into());
+        app.home();
+        receive_detail(
+            &mut app,
+            &events,
+            &mut commands,
+            &ctx,
+            "https://www.bilibili.com/video/av80433022?p=2",
+            second.clone(),
+        );
+        let active = app.detail.as_ref().unwrap();
+        assert_eq!(active.item.parts.len(), 1);
+        assert_eq!(active.item.parts[0].ordinal, 2);
+        assert_eq!(active.item.parts[0].reference, second.parts[0].reference);
+        assert_eq!(
+            app.detail_drafts[&whole_key].item.description.as_deref(),
+            Some("whole draft marker")
+        );
+
+        app.detail.as_mut().unwrap().item.description = Some("second part draft marker".into());
+        app.home();
+        receive_detail(&mut app, &events, &mut commands, &ctx, "av80433022", whole);
+        let active = app.detail.as_ref().unwrap();
+        assert_eq!(active.item.parts.len(), 2);
+        assert_eq!(
+            active.item.description.as_deref(),
+            Some("whole draft marker")
+        );
+        assert_eq!(
+            app.detail_drafts[&second_key].item.description.as_deref(),
+            Some("second part draft marker")
+        );
+    }
+
+    #[test]
+    fn explicit_part_details_do_not_restore_another_original_part_draft() {
+        let mut app = test_app();
+        let (bridge, events, mut commands) = Bridge::test_channel();
+        app.bridge = Some(bridge);
+        let ctx = egui::Context::default();
+        let whole = multipart_detail_item();
+        let first = explicit_detail_part(&whole, 0);
+        let second = explicit_detail_part(&whole, 1);
+        let first_key = detail_draft_key(&first);
+        let second_key = detail_draft_key(&second);
+
+        receive_detail(
+            &mut app,
+            &events,
+            &mut commands,
+            &ctx,
+            "https://www.bilibili.com/video/av80433022?p=1",
+            first.clone(),
+        );
+        app.detail.as_mut().unwrap().item.description = Some("first part draft marker".into());
+        app.home();
+        receive_detail(
+            &mut app,
+            &events,
+            &mut commands,
+            &ctx,
+            "https://www.bilibili.com/video/av80433022?p=2",
+            second.clone(),
+        );
+        let active = app.detail.as_ref().unwrap();
+        assert_eq!(active.item.parts.len(), 1);
+        assert_eq!(active.item.parts[0].ordinal, 2);
+        assert_eq!(active.item.parts[0].reference, second.parts[0].reference);
+        assert_eq!(
+            app.detail_drafts[&first_key].item.description.as_deref(),
+            Some("first part draft marker")
+        );
+        app.home();
+        receive_detail(
+            &mut app,
+            &events,
+            &mut commands,
+            &ctx,
+            "https://www.bilibili.com/video/av80433022?p=1",
+            first,
+        );
+        let active = app.detail.as_ref().unwrap();
+        assert_eq!(active.item.parts[0].ordinal, 1);
+        assert_eq!(
+            active.item.description.as_deref(),
+            Some("first part draft marker")
+        );
+        assert_eq!(app.detail_drafts[&second_key].item.parts[0].ordinal, 2);
+    }
+
+    #[test]
+    fn late_explicit_part_detail_preserves_the_cached_whole_draft() {
+        let mut app = test_app();
+        let (bridge, events, mut commands) = Bridge::test_channel();
+        app.bridge = Some(bridge);
+        let ctx = egui::Context::default();
+        let whole = multipart_detail_item();
+        let second = explicit_detail_part(&whole, 1);
+        let whole_key = detail_draft_key(&whole);
+        let second_key = detail_draft_key(&second);
+        receive_detail(&mut app, &events, &mut commands, &ctx, "av80433022", whole);
+        app.detail.as_mut().unwrap().item.description = Some("whole draft marker".into());
+        app.home();
+
+        app.send(Operation::Resolve(
+            "https://www.bilibili.com/video/av80433022?p=2".into(),
+        ));
+        assert!(commands.try_recv().is_ok());
+        app.home();
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Detail(second.clone()))))
+            .is_ok());
+        app.collect(&ctx);
+        assert!(app.detail.is_none());
+        assert_eq!(
+            app.detail_drafts[&whole_key].item.description.as_deref(),
+            Some("whole draft marker")
+        );
+        assert_eq!(app.detail_drafts[&second_key].item.parts.len(), 1);
+        assert_eq!(
+            app.detail_drafts[&second_key].item.parts[0].reference,
+            second.parts[0].reference
+        );
+    }
+
     #[test]
     fn explicit_home_invalidates_pending_detail_and_preparation_navigation() {
         let mut app = test_app();
@@ -3310,7 +3578,7 @@ mod layout_tests {
         app.bridge = Some(bridge);
         let ctx = egui::Context::default();
         let item = media_item();
-        let reference = item.reference.clone();
+        let draft_key = detail_draft_key(&item);
         app.send(Operation::Resolve("av80433022".into()));
         assert!(commands.try_recv().is_ok());
         app.home();
@@ -3320,7 +3588,7 @@ mod layout_tests {
         app.collect(&ctx);
         assert_eq!(app.page, Page::Discover);
         assert!(app.detail.is_none());
-        assert!(app.detail_drafts.contains_key(&reference));
+        assert!(app.detail_drafts.contains_key(&draft_key));
         let selected = item.parts.iter().map(|p| p.reference.clone()).collect();
         let prepared = crate::backend::PreparedItem {
             item,

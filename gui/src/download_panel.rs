@@ -295,91 +295,95 @@ impl QueueState {
                     });
                     continue;
                 }
-                ui.group(|ui| {
-                    ui.horizontal_top(|ui| {
-                        let size = egui::vec2(112.0, 63.0);
-                        if !covers.show(ui, bridge, project.cover.as_deref(), size, 4.0) {
-                            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 4.0, theme::soft());
-                        }
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&project.title).strong());
-                            theme::muted(ui, format!("{} 项", project.jobs.len()));
-                            if project.jobs.iter().all(|j| j.created_at.is_none()) {
-                                theme::muted(ui, "旧记录：添加时间未知");
+                egui::Frame::group(ui.style())
+                    .fill(theme::card())
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            let size = egui::vec2(112.0, 63.0);
+                            if !covers.show(ui, bridge, project.cover.as_deref(), size, 4.0) {
+                                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 4.0, theme::soft());
                             }
-                            if project
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&project.title).strong());
+                                theme::muted(ui, format!("{} 项", project.jobs.len()));
+                                if project.jobs.iter().all(|j| j.created_at.is_none()) {
+                                    theme::muted(ui, "旧记录：添加时间未知");
+                                }
+                                if project.jobs.iter().any(|j| {
+                                    matches!(j.phase, JobPhase::Paused | JobPhase::Cancelled)
+                                }) {
+                                    theme::muted(ui, "含已暂停任务");
+                                }
+                            });
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("进入项目").clicked() {
+                                self.project = Some(project.key.clone());
+                            }
+                            let directories: Vec<PathBuf> = project
                                 .jobs
                                 .iter()
-                                .any(|j| matches!(j.phase, JobPhase::Paused | JobPhase::Cancelled))
+                                .filter_map(|j| {
+                                    j.output
+                                        .as_ref()
+                                        .or_else(|| j.plan.as_ref().map(|p| &p.destination))
+                                })
+                                .filter_map(|p| p.parent().map(ToOwned::to_owned))
+                                .collect::<std::collections::BTreeSet<_>>()
+                                .into_iter()
+                                .collect();
+                            if directories.len() == 1 {
+                                if ui
+                                    .add_enabled(
+                                        operations_available,
+                                        egui::Button::new("打开文件夹"),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(QueueAction::Operation(Operation::Reveal {
+                                        path: directories[0].clone(),
+                                        select: false,
+                                    }));
+                                }
+                            } else if !directories.is_empty() {
+                                ui.menu_button("打开文件夹", |ui| {
+                                    for path in &directories {
+                                        if ui
+                                            .add_enabled(
+                                                operations_available,
+                                                egui::Button::new(path.display().to_string()),
+                                            )
+                                            .clicked()
+                                        {
+                                            action =
+                                                Some(QueueAction::Operation(Operation::Reveal {
+                                                    path: path.clone(),
+                                                    select: false,
+                                                }));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            }
+                            if ui
+                                .add_enabled(available, egui::Button::new("删除项目"))
+                                .clicked()
                             {
-                                theme::muted(ui, "含已暂停任务");
+                                self.delete = Some(DeleteIntent {
+                                    ids: snapshot
+                                        .jobs
+                                        .iter()
+                                        .filter(|j| project_key(j) == project.key)
+                                        .map(|j| j.id)
+                                        .collect(),
+                                    title: project.title.clone(),
+                                    project: Some(project.key.clone()),
+                                });
+                                self.delete_files = false;
                             }
                         });
                     });
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("进入项目").clicked() {
-                            self.project = Some(project.key.clone());
-                        }
-                        let directories: Vec<PathBuf> = project
-                            .jobs
-                            .iter()
-                            .filter_map(|j| {
-                                j.output
-                                    .as_ref()
-                                    .or_else(|| j.plan.as_ref().map(|p| &p.destination))
-                            })
-                            .filter_map(|p| p.parent().map(ToOwned::to_owned))
-                            .collect::<std::collections::BTreeSet<_>>()
-                            .into_iter()
-                            .collect();
-                        if directories.len() == 1 {
-                            if ui
-                                .add_enabled(operations_available, egui::Button::new("打开文件夹"))
-                                .clicked()
-                            {
-                                action = Some(QueueAction::Operation(Operation::Reveal {
-                                    path: directories[0].clone(),
-                                    select: false,
-                                }));
-                            }
-                        } else if !directories.is_empty() {
-                            ui.menu_button("打开文件夹", |ui| {
-                                for path in &directories {
-                                    if ui
-                                        .add_enabled(
-                                            operations_available,
-                                            egui::Button::new(path.display().to_string()),
-                                        )
-                                        .clicked()
-                                    {
-                                        action = Some(QueueAction::Operation(Operation::Reveal {
-                                            path: path.clone(),
-                                            select: false,
-                                        }));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                        }
-                        if ui
-                            .add_enabled(available, egui::Button::new("删除项目"))
-                            .clicked()
-                        {
-                            self.delete = Some(DeleteIntent {
-                                ids: snapshot
-                                    .jobs
-                                    .iter()
-                                    .filter(|j| project_key(j) == project.key)
-                                    .map(|j| j.id)
-                                    .collect(),
-                                title: project.title.clone(),
-                                project: Some(project.key.clone()),
-                            });
-                            self.delete_files = false;
-                        }
-                    });
-                });
                 ui.add_space(8.0);
             }
         }
@@ -397,150 +401,166 @@ impl QueueState {
         reduced: bool,
     ) -> Option<QueueAction> {
         let mut action = None;
-        ui.group(|ui| {
-            ui.label(RichText::new(job_title(job)).strong());
-            theme::muted(ui, phase_name(job.phase));
-            if let Some(plan) = &job.plan {
-                theme::muted(
-                    ui,
-                    format!(
-                        "{} × {} · {} · MP4",
-                        plan.video
-                            .width
-                            .map_or_else(|| "?".into(), |n| n.to_string()),
-                        plan.video
-                            .height
-                            .map_or_else(|| "?".into(), |n| n.to_string()),
-                        plan.video.codec
-                    ),
-                );
-            }
-            if job.phase != JobPhase::Completed {
-                theme::progress(
-                    ui,
-                    ui.id().with((job.id, "progress")),
-                    fraction(job.downloaded, job.total),
-                    job.phase.is_active(),
-                    reduced,
-                );
-                theme::muted(ui, format!("已下载 {}", bytes(job.downloaded)));
-            }
-            let error = job
-                .error
-                .as_ref()
-                .or_else(|| job.components.iter().find_map(|c| c.error.as_ref()));
-            if let Some(error) = error {
-                ui.colored_label(theme::ERROR, backend::error_message(error));
-                ui.collapsing("错误信息", |ui| {
-                    ui.label(backend::error_code(error));
-                    ui.label(&error.operation);
-                    if let Some(code) = error.native_code {
-                        ui.label(format!("原生错误码 {code}"));
-                    }
-                });
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.add_enabled_ui(available, |ui| {
-                    if job.phase.is_active() {
-                        if ui.button("暂停").clicked() {
-                            action = Some(QueueAction::Control(job.id, JobAction::Pause));
-                        }
-                    } else if matches!(job.phase, JobPhase::Paused | JobPhase::Cancelled) {
-                        if ui.button("继续下载").clicked() {
-                            action = Some(QueueAction::Control(job.id, JobAction::Resume));
-                        }
-                    } else if status(job) == Filter::Failed {
-                        match error.map(|e| e.code) {
-                            Some(ErrorCode::LoginRequired | ErrorCode::EntitlementRequired) => {
-                                if ui.button("选择账号").clicked() {
-                                    action = Some(QueueAction::Account(job.id));
-                                }
-                            }
-                            Some(ErrorCode::VerificationRequired) => {
-                                if let Some(request) = error.and_then(|e| e.verification.clone()) {
-                                    if ui.button("安全验证").clicked() {
-                                        action = Some(QueueAction::Operation(
-                                            Operation::BeginVerification {
-                                                request,
-                                                profile: job
-                                                    .plan
-                                                    .as_ref()
-                                                    .and_then(|p| p.context.as_ref())
-                                                    .and_then(|c| c.profile_id.clone()),
-                                            },
-                                        ));
-                                    }
-                                }
-                                if ui.button("重试").clicked() {
-                                    action = Some(QueueAction::Control(job.id, JobAction::Retry));
-                                }
-                            }
-                            Some(
-                                ErrorCode::Unavailable
-                                | ErrorCode::RegionRestricted
-                                | ErrorCode::RepresentationChanged,
-                            ) => {}
-                            _ => {
-                                if ui
-                                    .button(if job.phase == JobPhase::Completed {
-                                        "重试附件"
-                                    } else {
-                                        "重试"
-                                    })
-                                    .clicked()
-                                {
-                                    action = Some(QueueAction::Control(job.id, JobAction::Retry));
-                                }
-                            }
-                        }
-                    }
-                    if let Some(path) = &job.output {
-                        if ui
-                            .add_enabled(
-                                operations_available,
-                                egui::Button::new("打开文件所在位置"),
-                            )
-                            .clicked()
-                        {
-                            action = Some(QueueAction::Operation(Operation::Reveal {
-                                path: path.clone(),
-                                select: true,
-                            }));
-                        }
-                        if ui
-                            .add_enabled(operations_available, egui::Button::new("媒体信息"))
-                            .clicked()
-                        {
-                            action = Some(QueueAction::Operation(Operation::OutputInfo(job.id)));
-                        }
-                    }
-                    if ui.button("删除").clicked() {
-                        self.delete = Some(DeleteIntent {
-                            ids: vec![job.id],
-                            title: job_title(job),
-                            project: None,
-                        });
-                        self.delete_files = false;
-                    }
-                });
-            });
-            for component in &job.components {
-                if component.error.is_some() {
-                    ui.colored_label(theme::ERROR, format!("{} 下载失败", component.name));
-                } else if let Some(path) = &component.path {
+        egui::Frame::group(ui.style())
+            .fill(theme::card())
+            .show(ui, |ui| {
+                ui.label(RichText::new(job_title(job)).strong());
+                theme::muted(ui, phase_name(job.phase));
+                if let Some(plan) = &job.plan {
                     theme::muted(
                         ui,
                         format!(
-                            "{} · {}",
-                            component.name,
-                            path.extension()
-                                .and_then(|p| p.to_str())
-                                .unwrap_or("格式未知")
+                            "视频尺寸：{} × {} · {} · MP4",
+                            plan.video
+                                .width
+                                .map_or_else(|| "?".into(), |n| n.to_string()),
+                            plan.video
+                                .height
+                                .map_or_else(|| "?".into(), |n| n.to_string()),
+                            plan.video.codec
                         ),
                     );
                 }
-            }
-        });
+                if job.phase != JobPhase::Completed {
+                    theme::progress(
+                        ui,
+                        ui.id().with((job.id, "progress")),
+                        fraction(job.downloaded, job.total),
+                        job.phase.is_active(),
+                        reduced,
+                    );
+                    theme::muted(ui, format!("已下载 {}", bytes(job.downloaded)));
+                }
+                let error = job
+                    .error
+                    .as_ref()
+                    .or_else(|| job.components.iter().find_map(|c| c.error.as_ref()));
+                if let Some(error) = error {
+                    ui.colored_label(theme::error_color(), backend::error_message(error));
+                    ui.collapsing("错误信息", |ui| {
+                        ui.label(backend::error_code(error));
+                        ui.label(&error.operation);
+                        if let Some(code) = error.native_code {
+                            ui.label(format!("原生错误码 {code}"));
+                        }
+                    });
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_enabled_ui(available, |ui| {
+                        if job.phase.is_active() {
+                            if ui.button("暂停").clicked() {
+                                action = Some(QueueAction::Control(job.id, JobAction::Pause));
+                            }
+                        } else if matches!(job.phase, JobPhase::Paused | JobPhase::Cancelled) {
+                            if ui.button("继续下载").clicked() {
+                                action = Some(QueueAction::Control(job.id, JobAction::Resume));
+                            }
+                        } else if status(job) == Filter::Failed {
+                            match error.map(|e| e.code) {
+                                Some(ErrorCode::LoginRequired | ErrorCode::EntitlementRequired) => {
+                                    if ui.button("选择账号").clicked() {
+                                        action = Some(QueueAction::Account(job.id));
+                                    }
+                                }
+                                Some(ErrorCode::VerificationRequired) => {
+                                    if let Some(request) =
+                                        error.and_then(|e| e.verification.clone())
+                                    {
+                                        if ui
+                                            .add_enabled(
+                                                operations_available,
+                                                egui::Button::new("安全验证"),
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some(QueueAction::Operation(
+                                                Operation::BeginVerification {
+                                                    request,
+                                                    profile: job
+                                                        .plan
+                                                        .as_ref()
+                                                        .and_then(|p| p.context.as_ref())
+                                                        .and_then(|c| c.profile_id.clone()),
+                                                },
+                                            ));
+                                        }
+                                    }
+                                    if ui.button("重试").clicked() {
+                                        action =
+                                            Some(QueueAction::Control(job.id, JobAction::Retry));
+                                    }
+                                }
+                                Some(
+                                    ErrorCode::Unavailable
+                                    | ErrorCode::RegionRestricted
+                                    | ErrorCode::RepresentationChanged,
+                                ) => {}
+                                _ => {
+                                    if ui
+                                        .button(if job.phase == JobPhase::Completed {
+                                            "重试附件"
+                                        } else {
+                                            "重试"
+                                        })
+                                        .clicked()
+                                    {
+                                        action =
+                                            Some(QueueAction::Control(job.id, JobAction::Retry));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(path) = &job.output {
+                            if ui
+                                .add_enabled(
+                                    operations_available,
+                                    egui::Button::new("打开文件所在位置"),
+                                )
+                                .clicked()
+                            {
+                                action = Some(QueueAction::Operation(Operation::Reveal {
+                                    path: path.clone(),
+                                    select: true,
+                                }));
+                            }
+                            if ui
+                                .add_enabled(operations_available, egui::Button::new("媒体信息"))
+                                .clicked()
+                            {
+                                action =
+                                    Some(QueueAction::Operation(Operation::OutputInfo(job.id)));
+                            }
+                        }
+                        if ui.button("删除").clicked() {
+                            self.delete = Some(DeleteIntent {
+                                ids: vec![job.id],
+                                title: job_title(job),
+                                project: None,
+                            });
+                            self.delete_files = false;
+                        }
+                    });
+                });
+                for component in &job.components {
+                    if component.error.is_some() {
+                        ui.colored_label(
+                            theme::error_color(),
+                            format!("{} 下载失败", component.name),
+                        );
+                    } else if let Some(path) = &component.path {
+                        theme::muted(
+                            ui,
+                            format!(
+                                "{} · {}",
+                                component.name,
+                                path.extension()
+                                    .and_then(|p| p.to_str())
+                                    .unwrap_or("格式未知")
+                            ),
+                        );
+                    }
+                }
+            });
         ui.add_space(7.0);
         action
     }
@@ -569,7 +589,7 @@ impl QueueState {
                         for stream in &media.streams {
                             ui.label(format!("{} · {}", stream.media_type, stream.codec));
                             if let (Some(w), Some(h)) = (stream.width, stream.height) {
-                                ui.label(format!("分辨率：{w} × {h}"));
+                                ui.label(format!("实际尺寸：{w} × {h}"));
                             }
                             if let (Some(n), Some(d)) =
                                 (stream.frame_rate_num, stream.frame_rate_den)
@@ -633,7 +653,7 @@ impl QueueState {
                         "同时将任务拥有的文件移至回收站",
                     );
                     if active {
-                        ui.colored_label(theme::ERROR, "请先暂停此范围内的下载，再删除。");
+                        ui.colored_label(theme::error_color(), "请先暂停此范围内的下载，再删除。");
                     }
                     ui.horizontal(|ui| {
                         confirmed = ui

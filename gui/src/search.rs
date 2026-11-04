@@ -9,7 +9,9 @@ use bili_core::{
     SearchCategory, SearchFilter, SearchQuery, SearchSort,
 };
 use egui::Ui;
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputKind {
@@ -167,8 +169,8 @@ impl SearchState {
     pub fn start_wait(&mut self) {
         self.started = Some(Instant::now());
     }
-    pub fn waited(&self) -> Option<Duration> {
-        self.started.map(|s| s.elapsed())
+    pub fn pending(&self) -> bool {
+        self.started.is_some()
     }
     pub fn mark_stale(&mut self) {
         self.stale = self.results.is_some();
@@ -176,6 +178,26 @@ impl SearchState {
     pub fn choose_category(&mut self, category: SearchCategory) -> Option<Operation> {
         self.home_requested = true;
         if category == self.category {
+            // A failed first conditions request has no committed category
+            // context. An explicit click can retry it, while a loaded active
+            // tab and an operation still pending do not refresh implicitly.
+            let loaded = self
+                .conditions
+                .as_ref()
+                .is_some_and(|c| c.section.category() == category)
+                || self
+                    .results
+                    .as_ref()
+                    .is_some_and(|r| r.pages.iter().any(|p| p.category == category));
+            if category != SearchCategory::Video && !loaded && !self.pending() {
+                return Some(Operation::BrowseConditions(
+                    if category == SearchCategory::Bangumi {
+                        PgcSection::Anime
+                    } else {
+                        PgcSection::Film
+                    },
+                ));
+            }
             return None;
         }
         self.category = category;
@@ -414,11 +436,14 @@ impl SearchState {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .button(if self.bulk {
-                            "退出多选"
-                        } else {
-                            "批量下载"
-                        })
+                        .add_enabled(
+                            available,
+                            egui::Button::new(if self.bulk {
+                                "退出多选"
+                            } else {
+                                "批量下载"
+                            }),
+                        )
                         .clicked()
                     {
                         self.bulk = !self.bulk;
@@ -454,7 +479,7 @@ impl SearchState {
         ui.add_space(12.0);
         if self.stale {
             readable_frame().show(ui, |ui| {
-                ui.colored_label(theme::ERROR, "本次搜索未更新，以下保留上次结果。");
+                ui.colored_label(theme::error_color(), "本次搜索未更新，以下保留上次结果。");
             });
         }
         let items: Vec<Candidate> = self
@@ -467,11 +492,11 @@ impl SearchState {
                     .collect()
             })
             .unwrap_or_default();
-        if self.results.is_none() {
+        if self.results.is_none() && !self.pending() {
             readable_frame().show(ui, |ui| {
                 theme::muted(ui, "搜索关键词，或粘贴视频、番剧与影视链接。");
             });
-        } else if items.is_empty() {
+        } else if self.results.is_some() && items.is_empty() && !self.pending() {
             readable_frame().show(ui, |ui| {
                 theme::muted(ui, "没有找到相关内容。");
             });
@@ -534,8 +559,13 @@ impl SearchState {
                             }
                             if self.bulk {
                                 let mut check = selected;
-                                let changed = ui.checkbox(&mut check, "选择此内容").changed();
-                                if response.clicked() || title.clicked() || changed {
+                                let changed = ui
+                                    .add_enabled(
+                                        available,
+                                        egui::Checkbox::new(&mut check, "选择此内容"),
+                                    )
+                                    .changed();
+                                if available && (response.clicked() || title.clicked() || changed) {
                                     if selected {
                                         self.selected.retain(|c| c.reference != item.reference);
                                     } else {
@@ -585,11 +615,19 @@ impl SearchState {
                     }
                     let mut navigate = None;
                     if let Some(draft) = &mut self.page_edit {
-                        let response = ui.add_sized(
-                            [48.0, 30.0],
-                            theme::singleline_input(ui, draft, "", 30.0).id_salt("page-number"),
-                        );
-                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let id = ui.make_persistent_id("page-number");
+                        let response = ui
+                            .add_enabled_ui(available, |ui| {
+                                ui.add_sized(
+                                    [48.0, 30.0],
+                                    theme::singleline_input(ui, draft, "", 30.0).id(id),
+                                )
+                            })
+                            .inner;
+                        if available
+                            && response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        {
                             navigate = Some(draft.clone());
                         }
                         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -621,6 +659,7 @@ impl SearchState {
                         match draft.parse::<u32>() {
                             Ok(n) if n > 0 && n <= total_pages.unwrap_or(1000) => {
                                 self.page_error = None;
+                                self.page_edit = None;
                                 action = self.page(n);
                             }
                             _ => {
@@ -632,7 +671,7 @@ impl SearchState {
                         }
                     }
                     if let Some(error) = &self.page_error {
-                        ui.colored_label(theme::ERROR, error);
+                        ui.colored_label(theme::error_color(), error);
                     }
                 });
             });
@@ -688,6 +727,16 @@ mod tests {
         covers: &mut CoverCache,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, Option<Operation>) {
+        render_available(ctx, state, covers, events, true)
+    }
+
+    fn render_available(
+        ctx: &egui::Context,
+        state: &mut SearchState,
+        covers: &mut CoverCache,
+        events: Vec<egui::Event>,
+        available: bool,
+    ) -> (egui::FullOutput, Option<Operation>) {
         let mut action = None;
         let output = ctx.run(
             egui::RawInput {
@@ -707,13 +756,189 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none())
                     .show(ctx, |ui| {
-                        state.header(ui, true);
+                        state.header(ui, available);
                         ui.add_space(6.0);
-                        action = state.show(ui, true, true, covers, None);
+                        action = state.show(ui, available, true, covers, None);
                     });
             },
         );
         (output, action)
+    }
+
+    fn click_label(
+        ctx: &egui::Context,
+        state: &mut SearchState,
+        covers: &mut CoverCache,
+        label: &str,
+        occurrence: usize,
+        available: bool,
+    ) -> Option<Operation> {
+        let (output, _) = render_available(ctx, state, covers, vec![], available);
+        let pos = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+            .nth(occurrence)
+            .unwrap_or_else(|| panic!("missing label {label} occurrence {occurrence}"));
+        render_available(
+            ctx,
+            state,
+            covers,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            available,
+        );
+        render_available(
+            ctx,
+            state,
+            covers,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            available,
+        )
+        .1
+    }
+
+    fn page_results(page: u32, items: Vec<Candidate>) -> CandidatePage {
+        CandidatePage {
+            pages: vec![bili_core::CategoryPage {
+                category: SearchCategory::Video,
+                page,
+                total: Some(60),
+                has_more: page < 3,
+                page_size: Some(20),
+                total_pages: Some(3),
+                items,
+            }],
+        }
+    }
+
+    fn page_state(items: Vec<Candidate>) -> SearchState {
+        let mut state = SearchState {
+            input: "fixture".into(),
+            ..Default::default()
+        };
+        state.submit_search();
+        state.accept_results(page_results(1, items));
+        state
+    }
+
+    fn replace_and_enter(text: &str) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            },
+            egui::Event::Text(text.into()),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn pending_page_editor_cannot_replace_the_inflight_query() {
+        let ctx = egui::Context::default();
+        theme::apply_style(&ctx, false);
+        let mut covers = CoverCache::default();
+        let mut state = page_state(vec![]);
+        click_label(&ctx, &mut state, &mut covers, "1", 0, true);
+        click_label(&ctx, &mut state, &mut covers, "1", 0, true);
+        assert!(state.page_edit.is_some());
+        let Some(Operation::Search(query)) = state.page(2) else {
+            panic!("missing page request")
+        };
+        assert_eq!(query.page, 2);
+        state.start_wait();
+
+        let (_, action) =
+            render_available(&ctx, &mut state, &mut covers, replace_and_enter("3"), false);
+        assert!(action.is_none());
+        assert_eq!(state.page_edit.as_deref(), Some("1"));
+        assert_eq!(state.requested_query().unwrap().page, 2);
+        state.accept_results(page_results(2, vec![]));
+        assert_eq!(state.submitted.as_ref().unwrap().page, 2);
+        assert_eq!(state.results.as_ref().unwrap().pages[0].page, 2);
+    }
+
+    #[test]
+    fn submitting_inline_page_closes_the_editor_before_waiting() {
+        let ctx = egui::Context::default();
+        theme::apply_style(&ctx, false);
+        let mut covers = CoverCache::default();
+        let mut state = page_state(vec![]);
+        click_label(&ctx, &mut state, &mut covers, "1", 0, true);
+        click_label(&ctx, &mut state, &mut covers, "1", 0, true);
+        let (_, action) =
+            render_available(&ctx, &mut state, &mut covers, replace_and_enter("2"), true);
+        assert!(matches!(action, Some(Operation::Search(query)) if query.page == 2));
+        assert!(state.page_edit.is_none());
+        assert_eq!(state.requested_query().unwrap().page, 2);
+    }
+
+    #[test]
+    fn pending_preparation_keeps_its_bulk_selection_and_mode() {
+        let ctx = egui::Context::default();
+        theme::apply_style(&ctx, false);
+        let mut covers = CoverCache::default();
+        let candidate = |id, title: &str| Candidate {
+            reference: ContentRef::Video(bili_core::Aid::new(id).unwrap()),
+            category: SearchCategory::Video,
+            title: title.into(),
+            cover: None,
+            duration_ms: None,
+            author: None,
+            published_at: None,
+            plays: None,
+            danmaku: None,
+        };
+        let first = candidate(41, "First");
+        let second = candidate(42, "Second");
+        let mut state = page_state(vec![first.clone(), second]);
+        state.bulk = true;
+        state.selected.push(first.clone());
+        let action = click_label(&ctx, &mut state, &mut covers, "配置下载 · 1", 0, true);
+        assert!(matches!(action,
+            Some(Operation::Prepare { inputs, .. })
+                if inputs.len() == 1 && inputs[0].input == "av41"));
+        state.start_wait();
+
+        for (label, occurrence) in [
+            ("退出多选", 0),
+            ("Second", 0),
+            ("选择此内容", 1),
+            ("配置下载 · 1", 0),
+        ] {
+            assert!(
+                click_label(&ctx, &mut state, &mut covers, label, occurrence, false,).is_none()
+            );
+            assert!(state.bulk);
+            assert_eq!(state.selected.len(), 1);
+            assert_eq!(state.selected[0].reference, first.reference);
+        }
     }
 
     #[test]
@@ -873,5 +1098,76 @@ mod tests {
         assert_eq!(state.category, SearchCategory::Video);
         assert!(state.results.is_some());
         assert!(state.stale);
+    }
+
+    #[test]
+    fn failed_initial_conditions_can_retry_from_the_tab_but_loaded_or_pending_tabs_do_not_refresh()
+    {
+        let mut state = SearchState::default();
+        assert!(matches!(
+            state.choose_category(SearchCategory::Bangumi),
+            Some(Operation::BrowseConditions(PgcSection::Anime))
+        ));
+        state.start_wait();
+        assert!(state.choose_category(SearchCategory::Bangumi).is_none());
+        state.discard_request();
+        state.mark_stale();
+        assert!(matches!(
+            state.choose_category(SearchCategory::Bangumi),
+            Some(Operation::BrowseConditions(PgcSection::Anime))
+        ));
+        state.accept_conditions(BrowseConditions {
+            section: PgcSection::Anime,
+            genres: vec![],
+        });
+        state.accept_results(CandidatePage { pages: vec![] });
+        assert!(
+            state.choose_category(SearchCategory::Bangumi).is_none(),
+            "successful active categories never refresh on an ordinary click"
+        );
+    }
+
+    #[test]
+    fn pending_discovery_does_not_claim_an_empty_or_terminal_result() {
+        fn has_text(output: &egui::FullOutput, needle: &str) -> bool {
+            fn contains(shape: &egui::Shape, needle: &str) -> bool {
+                match shape {
+                    egui::Shape::Text(text) => text.galley.job.text == needle,
+                    egui::Shape::Vec(shapes) => shapes.iter().any(|shape| contains(shape, needle)),
+                    _ => false,
+                }
+            }
+            output
+                .shapes
+                .iter()
+                .any(|shape| contains(&shape.shape, needle))
+        }
+        let ctx = egui::Context::default();
+        let mut state = SearchState::default();
+        let mut covers = CoverCache::default();
+        state.start_wait();
+        state.started = Instant::now().checked_sub(Duration::from_secs(4));
+        let (output, _) = render(&ctx, &mut state, &mut covers, vec![]);
+        assert!(!has_text(
+            &output,
+            "搜索关键词，或粘贴视频、番剧与影视链接。"
+        ));
+        assert!(!has_text(&output, "没有找到相关内容。"));
+        state.accept_results(CandidatePage { pages: vec![] });
+        let (output, _) = render(&ctx, &mut state, &mut covers, vec![]);
+        assert!(!state.pending());
+        assert!(has_text(&output, "没有找到相关内容。"));
+        state.start_wait();
+        let (output, _) = render(&ctx, &mut state, &mut covers, vec![]);
+        assert!(
+            !has_text(&output, "没有找到相关内容。"),
+            "an old empty result is not the new pending request's outcome"
+        );
+        state.discard_request();
+        assert!(!state.pending());
+        assert!(
+            state.results.is_some(),
+            "cancellation retains the committed result"
+        );
     }
 }

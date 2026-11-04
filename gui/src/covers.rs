@@ -24,6 +24,11 @@ pub struct CoverCache {
 }
 
 impl CoverCache {
+    /// A preempted decoration is eligible for another request on demand.
+    pub fn defer(&mut self, url: &str) {
+        self.requested.remove(url);
+    }
+
     pub fn ensure(&mut self, bridge: Option<&Bridge>, url: &str) {
         if url.is_empty()
             || self.textures.contains_key(url)
@@ -87,6 +92,27 @@ impl CoverCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preempted_covers_are_not_terminal_failures_or_evicted_textures() {
+        let ctx = egui::Context::default();
+        let mut cache = CoverCache::default();
+        cache.requested.insert("pending".into());
+        cache.defer("pending");
+        assert!(!cache.requested.contains("pending"));
+        assert!(!cache.failed.contains("pending"));
+        cache.insert(
+            &ctx,
+            "cached".into(),
+            Some(egui::ColorImage::new([1, 1], egui::Color32::WHITE)),
+        );
+        let texture = cache.texture("cached");
+        cache.defer("cached");
+        assert_eq!(cache.texture("cached"), texture);
+        cache.insert(&ctx, "failed".into(), None);
+        cache.defer("failed");
+        assert!(cache.failed.contains("failed"));
+    }
 
     #[test]
     fn decoded_cover_is_cached_and_failures_are_terminal() {

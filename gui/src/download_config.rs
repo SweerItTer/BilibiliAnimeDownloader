@@ -176,6 +176,20 @@ impl ConfigState {
     }
     pub fn exclude_admitted(&mut self, parts: Vec<PartRef>) {
         for row in &mut self.rows {
+            if row.fulfilled && row.selected.is_empty() {
+                // Only a freshly prepared intent can re-admit a removed job.
+                // Preserve manual deselections and unfinished partial drafts.
+                row.selected = row
+                    .prepared
+                    .selected
+                    .iter()
+                    .filter(|p| self.admitted.contains(p) && !parts.contains(p))
+                    .cloned()
+                    .collect();
+                if !row.selected.is_empty() {
+                    row.fulfilled = false;
+                }
+            }
             let had_admitted = row.selected.iter().any(|p| parts.contains(p));
             row.selected.retain(|p| !parts.contains(p));
             if had_admitted && row.selected.is_empty() {
@@ -264,6 +278,31 @@ impl ConfigState {
         }
         choices.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
         choices
+    }
+    fn selected_dimensions(&self, row: &Row) -> Option<(u32, u32)> {
+        let quality = self.quality_for(row)?;
+        let mut dimensions = None;
+        for reference in &row.selected {
+            let part = row
+                .prepared
+                .item
+                .parts
+                .iter()
+                .find(|p| &p.reference == reference)?;
+            let catalog = Self::catalog(row, reference).ok()?;
+            let mut selection = self.selection(row, part);
+            selection.quality = Some(quality);
+            let (video, _) = catalog.select(&selection).ok()?;
+            let pair = (
+                video.width.filter(|n| *n > 0)?,
+                video.height.filter(|n| *n > 0)?,
+            );
+            if dimensions.is_some_and(|previous| previous != pair) {
+                return None;
+            }
+            dimensions = Some(pair);
+        }
+        dimensions
     }
     fn preferred_quality(&self, row: &Row) -> Option<u32> {
         let choices = self.usable_qualities(row);
@@ -455,7 +494,7 @@ impl ConfigState {
                             ui.label(result);
                         }
                         if let Some(error) = &self.error {
-                            ui.colored_label(theme::ERROR, error);
+                            ui.colored_label(theme::error_color(), error);
                         }
                         if let Some(request) = self.verification.clone() {
                             if ui
@@ -469,7 +508,7 @@ impl ConfigState {
                             }
                         }
                         if let Some(error) = self.account_error(auth) {
-                            ui.colored_label(theme::ERROR, error);
+                            ui.colored_label(theme::error_color(), error);
                         }
                         ui.add_enabled_ui(available, |ui| {
                             ui.label("保存目录");
@@ -538,7 +577,7 @@ impl ConfigState {
                         let profile_stale = profile != self.catalog_profile;
                         if profile_stale {
                             ui.colored_label(
-                                theme::ERROR,
+                                theme::error_color(),
                                 "账号已变化，请在高级设置中重新检查画质。",
                             );
                         }
@@ -547,6 +586,7 @@ impl ConfigState {
                             let error = self.row_error(&self.rows[index]);
                             let choices = self.usable_qualities(&self.rows[index]);
                             let selected_quality = self.quality_for(&self.rows[index]);
+                            let dimensions = self.selected_dimensions(&self.rows[index]);
                             let selected_text = selected_quality.map_or_else(
                                 || "没有可用画质".into(),
                                 |quality| quality_label(quality, &self.rows),
@@ -555,12 +595,13 @@ impl ConfigState {
                             let frame = egui::Frame::group(ui.style()).stroke(egui::Stroke::new(
                                 1.0_f32,
                                 if error.is_some() {
-                                    theme::ERROR
+                                    theme::error_color()
                                 } else {
                                     theme::border()
                                 },
                             ));
                             frame.show(ui, |ui| {
+                                ui.set_width(ui.available_width());
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label(RichText::new(&row.prepared.item.title).strong());
                                     ui.add_enabled_ui(available, |ui| {
@@ -569,7 +610,7 @@ impl ConfigState {
                                 });
                                 ui.add_enabled_ui(available && !row.skip, |ui| {
                                     ui.horizontal_wrapped(|ui| {
-                                        ui.label("画质");
+                                        ui.label("源画质");
                                         egui::ComboBox::from_id_salt(("row-quality", index))
                                             .selected_text(selected_text)
                                             .show_ui(ui, |ui| {
@@ -585,6 +626,12 @@ impl ConfigState {
                                                     }
                                                 }
                                             });
+                                        if let Some((width, height)) = dimensions {
+                                            theme::muted(
+                                                ui,
+                                                format!("视频尺寸：{width} × {height}"),
+                                            );
+                                        }
                                     });
                                     ui.horizontal(|ui| {
                                         if ui.small_button("全选").clicked() {
@@ -609,31 +656,31 @@ impl ConfigState {
                                             ),
                                         );
                                     });
-                                    for part in &row.prepared.item.parts {
-                                        let mut selected = row.selected.contains(&part.reference);
-                                        if ui
-                                            .add_enabled_ui(
-                                                !self.admitted.contains(&part.reference),
-                                                |ui| {
-                                                    ui.checkbox(
+                                    ui.horizontal_wrapped(|ui| {
+                                        for part in &row.prepared.item.parts {
+                                            let mut selected =
+                                                row.selected.contains(&part.reference);
+                                            if ui
+                                                .add_enabled(
+                                                    !self.admitted.contains(&part.reference),
+                                                    egui::Checkbox::new(
                                                         &mut selected,
                                                         format!("{}  {}", part.ordinal, part.title),
-                                                    )
-                                                },
-                                            )
-                                            .inner
-                                            .changed()
-                                        {
-                                            if selected {
-                                                row.selected.push(part.reference.clone());
-                                            } else {
-                                                row.selected.retain(|p| p != &part.reference);
+                                                    ),
+                                                )
+                                                .changed()
+                                            {
+                                                if selected {
+                                                    row.selected.push(part.reference.clone());
+                                                } else {
+                                                    row.selected.retain(|p| p != &part.reference);
+                                                }
                                             }
                                         }
-                                    }
+                                    });
                                 });
                                 if let Some(error) = error {
-                                    ui.colored_label(theme::ERROR, error);
+                                    ui.colored_label(theme::error_color(), error);
                                 }
                             });
                             ui.add_space(6.0);
@@ -1102,6 +1149,70 @@ mod tests {
         assert!(config.can_submit(None));
     }
     #[test]
+    fn widescreen_source_tier_and_pixel_dimensions_are_displayed_independently() {
+        let root = std::env::temp_dir().join("bili-widescreen-config");
+        let mut item = prepared(1, &[80, 64]);
+        item.catalogs[0].1.as_mut().unwrap().representations[0].height = Some(804);
+        let mut config = ConfigState::default();
+        config.accept(vec![item], None, &root, 0.0, false);
+        assert_eq!(config.quality_for(&config.rows[0]), Some(80));
+        assert_eq!(
+            config.selected_dimensions(&config.rows[0]),
+            Some((1920, 804))
+        );
+        assert!(config.can_submit(None));
+        assert_eq!(config.requests(None)[0].selection.quality, Some(80));
+        let ctx = egui::Context::default();
+        theme::apply_style(&ctx, false);
+        let size = egui::vec2(1180.0, 800.0);
+        let _ = frame(&ctx, &mut config, size, vec![]);
+        let output = frame(&ctx, &mut config, size, vec![]);
+        let labels = texts(&output);
+        assert!(labels.iter().any(|(text, _)| text == "源画质"));
+        assert!(labels.iter().any(|(text, _)| text == "1080P"));
+        assert!(labels
+            .iter()
+            .any(|(text, _)| text == "视频尺寸：1920 × 804"));
+    }
+
+    #[test]
+    fn a_removed_acknowledged_part_can_be_deliberately_prepared_again() {
+        let root = std::env::temp_dir().join("bili-readmit-tests");
+        let mut config = ConfigState::default();
+        let items = vec![prepared(1, &[64]), prepared(2, &[64])];
+        config.accept(items.clone(), None, &root, 0.0, false);
+        let request = config.requests(None).remove(0);
+        let part = request.selection.part.clone();
+        config.acknowledge(
+            vec![receipt(&request, root.join("original.mp4"))],
+            false,
+            None,
+        );
+        let original = serde_json::to_value(&config.receipts[0].plan).unwrap();
+        config.rows[1].selected.clear();
+        config.rate_mib = 10.0;
+        config.directory = root.join("chosen").display().to_string();
+        config.accept(items.clone(), None, &root, 0.0, false);
+        config.exclude_admitted(vec![part.clone()]);
+        assert!(config.rows[0].selected.is_empty());
+        assert!(config.rows[0].fulfilled);
+        config.accept(items, None, &root, 0.0, false);
+        config.exclude_admitted(vec![]);
+        assert_eq!(config.rows[0].selected, vec![part]);
+        assert!(!config.rows[0].fulfilled);
+        assert!(
+            config.rows[1].selected.is_empty(),
+            "manual deselection survives"
+        );
+        assert_eq!(config.rate_mib, 10.0);
+        assert_eq!(config.directory, root.join("chosen").display().to_string());
+        assert_eq!(
+            serde_json::to_value(&config.receipts[0].plan).unwrap(),
+            original
+        );
+    }
+
+    #[test]
     fn acknowledged_receipts_remain_immutable_and_manual_empty_selection_is_not_fulfilled() {
         let root = std::env::temp_dir().join("bili-receipt-tests");
         let mut config = ConfigState::default();
@@ -1418,6 +1529,178 @@ mod tests {
                 pressed: false,
                 modifiers: Default::default(),
             }],
+        );
+    }
+    #[test]
+    fn episode_choices_wrap_across_the_row_and_keep_original_part_selection() {
+        fn visible_text(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
+            fn find(shape: &egui::Shape, clip: egui::Rect, label: &str) -> Option<egui::Rect> {
+                match shape {
+                    egui::Shape::Text(text) if text.galley.job.text == label => {
+                        let rect = text.galley.rect.translate(text.pos.to_vec2());
+                        clip.contains_rect(rect.shrink(0.5)).then_some(rect)
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        shapes.iter().find_map(|shape| find(shape, clip, label))
+                    }
+                    _ => None,
+                }
+            }
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| find(&shape.shape, shape.clip_rect, label))
+        }
+        fn scroll_to(
+            ctx: &egui::Context,
+            config: &mut ConfigState,
+            size: egui::Vec2,
+            label: &str,
+            delta: f32,
+        ) -> egui::FullOutput {
+            let at = dialog_bounds(egui::Rect::from_min_size(egui::Pos2::ZERO, size)).center();
+            let mut output = frame(ctx, config, size, vec![]);
+            for direction in [delta, -delta] {
+                for _ in 0..12 {
+                    if visible_text(&output, label).is_some() {
+                        return output;
+                    }
+                    let _ = frame(
+                        ctx,
+                        config,
+                        size,
+                        vec![
+                            egui::Event::PointerMoved(at),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, direction),
+                                modifiers: Default::default(),
+                            },
+                        ],
+                    );
+                    // Let egui consume the wheel's animated offset before observing
+                    // and clicking the newly visible widget in the next frame.
+                    for _ in 0..24 {
+                        output = frame(ctx, config, size, vec![]);
+                    }
+                }
+            }
+            panic!(
+                "could not scroll to visible {label} at {size:?}; final text rectangles: {:?}",
+                texts(&output)
+                    .into_iter()
+                    .filter(|(text, _)| text == label || text == "高级设置")
+                    .collect::<Vec<_>>()
+            );
+        }
+        let root = std::env::temp_dir().join("bili-config-episode-layout");
+        let mut item = prepared(1, &[80]);
+        let template = item.item.parts[0].clone();
+        let template_catalog = item.catalogs[0].1.as_ref().unwrap().clone();
+        item.item.parts = (1..=24)
+            .map(|ordinal| {
+                let mut part = template.clone();
+                part.ordinal = ordinal;
+                part.title = format!("Episode {ordinal}");
+                part.reference.cid = Cid::new(1_000 + u64::from(ordinal)).unwrap();
+                part
+            })
+            .collect();
+        item.selected = item
+            .item
+            .parts
+            .iter()
+            .map(|part| part.reference.clone())
+            .collect();
+        item.catalogs = item
+            .selected
+            .iter()
+            .map(|part| {
+                let mut catalog = template_catalog.clone();
+                catalog.part = part.clone();
+                for representation in &mut catalog.representations {
+                    representation.part = part.clone();
+                }
+                (part.clone(), Ok(catalog))
+            })
+            .collect();
+        let original = item.selected.clone();
+        let mut first_row_counts = Vec::new();
+        for size in [egui::vec2(1180.0, 800.0), egui::vec2(760.0, 800.0)] {
+            let ctx = egui::Context::default();
+            crate::prefs::GuiPrefs::default().apply(&ctx);
+            let mut config = ConfigState::default();
+            config.accept(vec![item.clone()], None, &root, 0.0, false);
+            let _ = frame(&ctx, &mut config, size, vec![]);
+            let output = frame(&ctx, &mut config, size, vec![]);
+            let episodes: Vec<_> = (1..=24)
+                .filter_map(|ordinal| {
+                    visible_text(&output, &format!("{ordinal}  Episode {ordinal}"))
+                })
+                .collect();
+            assert!(
+                episodes.len() >= 6,
+                "the viewport must show multiple episode rows at {size:?}"
+            );
+            let columns = episodes
+                .iter()
+                .filter(|rect| (rect.top() - episodes[0].top()).abs() < 1.0)
+                .count();
+            assert!(
+                columns >= 3,
+                "episode choices still form a narrow list at {size:?}"
+            );
+            first_row_counts.push(columns);
+            assert!(
+                episodes
+                    .iter()
+                    .any(|rect| rect.right() > size.x * 0.5 + 100.0),
+                "episode choices do not use the right side of the row"
+            );
+            assert!(
+                episodes
+                    .iter()
+                    .all(|rect| rect.left() >= 0.0 && rect.right() <= size.x),
+                "episode labels overflow the dialog viewport"
+            );
+            let bounds = dialog_bounds(egui::Rect::from_min_size(egui::Pos2::ZERO, size));
+            let output = scroll_to(&ctx, &mut config, size, "高级设置", -180.0);
+            let advanced = visible_text(&output, "高级设置").unwrap();
+            let footer = visible_text(&output, "开始下载 · 24 项").unwrap();
+            assert!(
+                bounds.contains_rect(advanced),
+                "advanced options fell below the viewport after24episodes"
+            );
+            assert!(
+                advanced.bottom() < footer.top() - 4.0,
+                "advanced options are hidden behind the fixed footer"
+            );
+            let _ = scroll_to(&ctx, &mut config, size, "24  Episode 24", 180.0);
+            click(&ctx, &mut config, size, "24  Episode 24");
+            assert_eq!(config.rows[0].selected, original[..23]);
+            let _ = scroll_to(&ctx, &mut config, size, "24  Episode 24", 180.0);
+            click(&ctx, &mut config, size, "24  Episode 24");
+            assert_eq!(config.rows[0].selected, original);
+            config.admitted.push(original[0].clone());
+            config.rows[0].selected.retain(|part| part != &original[0]);
+            let _ = scroll_to(&ctx, &mut config, size, "1  Episode 1", 180.0);
+            click(&ctx, &mut config, size, "1  Episode 1");
+            assert!(
+                !config.rows[0].selected.contains(&original[0]),
+                "an admitted part became selectable"
+            );
+            assert_eq!(
+                config
+                    .requests(None)
+                    .iter()
+                    .map(|request| request.selection.part.clone())
+                    .collect::<Vec<_>>(),
+                original[1..]
+            );
+        }
+        assert!(
+            first_row_counts[0] > first_row_counts[1],
+            "episode columns did not adapt to the available width"
         );
     }
     #[test]
