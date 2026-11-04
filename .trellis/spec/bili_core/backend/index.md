@@ -15,6 +15,7 @@
 | [Browse/download UX contracts](./browse-download-ux.md) | Profile isolation, source filters, immutable batches, aggregate throttling, archive operations and transient verification |
 | [Quality guidelines](./quality-guidelines.md) | Behavioral tests, source-built shared FFmpeg, stream preservation and no competing implementations |
 | [Logging guidelines](./logging-guidelines.md) | Credential-free diagnostics, bounded events and truthful progress |
+| [Offline API replay](./offline-api-replay.md) | Explicit bounded response data, unchanged Core parsing/planning and isolated production-window checks |
 | [Update protocol](./update-protocol.md) | Shared static HTTPS discovery, release descriptor, identity checks, install layout and verification limits; shells must not reimplement either |
 
 ## Read before changing code

@@ -12,6 +12,8 @@ Every upstream HTTP/JSON/native/filesystem failure is translated at the core bou
 
 Do not propagate reqwest Display/Debug, remote messages, Cookie, signed media URLs, QR login/poll tokens or raw headers into errors/events/journals. Native diagnostics may describe library versions/configuration/capabilities, never private media locators. Job failures aggregate in snapshots and overall shell status; joined task failures are not discarded.
 HTTP failures retain only the numeric response status in `http_status`, including non-2xx responses and response-body failures. API request-send failures use fixed operation labels for timeout, connect, or generic request failure; never include reqwest error text, remote messages, headers or URLs in the label.
+
+Discovery API GET execution uses the configured `RetryPolicy`, capped at three attempts and two seconds per backoff. Retry typed transient connect/timeout/body transport failures and HTTP 408/500/502/503/504 only. JSON/schema/API semantic errors, access/verification responses and other HTTP rejections do not retry. Release the shared connection permit before backoff; dropping the request future cancels body waits and all later attempts. Preserve the last safe operation/status; use `RetryExhausted` only when more than one actual attempt was exhausted. A delayed successful response remains pending, never a synthetic failure.
 QR generation accepts callback URLs only over HTTPS on `passport.bilibili.com` or `account.bilibili.com`, with the default port, no userinfo or fragment, and bounded challenge fields. Preserve that host boundary and use safe stage labels for generation rejection versus malformed challenge; never include a raw URL, QR token or remote body.
 
 At each FFmpeg failure boundary preserve its original signed `AVERROR` number in `native_code` plus the exact trusted operation stage. This field survives snapshot/journal/JSON serialization; absent values default to `None` and are omitted. Display includes an actual native code without allocating an intermediate message. Do not mask distinct open/header/packet/trailer failures behind one generic remux label or retain native error text that might contain paths, URLs or cue contents.
@@ -19,6 +21,8 @@ At each FFmpeg failure boundary preserve its original signed `AVERROR` number in
 `VerificationRequired` is distinct from an empty successful search even when upstream code is zero. Access labels require evidence; missing advertised streams remain `Unknown` if no specific reason is established. No captcha/entitlement bypass. HTTP 403/410 is access/possibly expired locator, not proof a representation changed: bounded renewal must re-resolve the same full key and validate bytes. Only renewed metadata/key mismatch establishes `RepresentationChanged`.
 
 Pause/cancel acknowledges joined workers and durable checkpoints. Before commit the stop request is honored; once the reducer has persisted Committing, stop waits for actual promotion/manifest outcome, never labels a promoted output cancelled. Failed sidecars keep a verified video and retry independently.
+
+Before publishing resumed aggregate progress, reconcile every owned resource file with its durable checkpoint. Count all validated retained bytes, including resources later in the transfer order; each resource callback replaces only that resource's contribution. `download::PreparedResource` holds the reconciled checkpoint borrow through transfer, so the worker cannot project an unvalidated offset. Checkpoint digest/length failures or incomplete resources without a safe validator reset their actual contribution. A server full response replacing retained partial data publishes the reduced starting offset before replacement body bytes arrive. Never force progress to be monotonic to conceal these real invalidations, and never briefly drop valid later-resource bytes merely because an earlier resource is revisited. Locator renewal must still retain the same exact representation identity.
 
 ## 4. Validation / error matrix
 
@@ -32,6 +36,7 @@ Pause/cancel acknowledges joined workers and durable checkpoints. Before commit 
 | Exhausted bounded attempts | RetryExhausted |
 | Output collision / writer collision | Conflict / Busy |
 | Bad checkpoint/digest/stream verification | Corruption |
+| Retained checkpoint cannot be reconciled / server replaces partial bytes | Discard only the invalidated resource bytes and publish the real aggregate reset |
 | Unsupported mux combination / native packet failure | NativeCapability / Remux |
 | Requested stop before commit | Cancelled |
 
@@ -41,7 +46,7 @@ Good: `CoreError::new(ErrorCode::Transport,"fetch player metadata")`. Base: a ba
 
 ## 6. Tests required
 
-Synthetic credential canaries must be absent from serialized errors, snapshots, events and journal files. Discovery distinguishes challenge/empty/error; QR challenge parsing accepts the official account host while rejecting untrusted hosts and keeps error labels free of URL/token values. Quality tests cover strict selection/renewal; worker tests preserve failed inputs and surface native/sidecar errors. Check logs/evidence only after the owning consolidated run.
+Synthetic credential canaries must be absent from serialized errors, snapshots, events and journal files. Discovery distinguishes challenge/empty/error; QR challenge parsing accepts the official account host while rejecting untrusted hosts and keeps error labels free of URL/token values. Quality tests cover strict selection/renewal; worker tests preserve failed inputs and surface native/sidecar errors. Multi-resource resume regressions exercise the worker's actual loop: retained aggregate bytes, HTTP Range/If-Range continuation, final bytes/checkpoint hashes, corrupt checkpoint reset and a full-response reset after preparation. Check logs/evidence only after the owning consolidated run.
 
 ## 7. Wrong versus correct
 

@@ -5,6 +5,7 @@
 ### ✨ Features
 
 - Restructure the native GUI around browsing, content details and one shared single/bulk download dialog. Add strict per-part quality checks, batch directories and rate limits, retained admission receipts, grouped three-state history, media information, Windows file location and ownership-verified recycling.
+- Add saved Light, Dark and System GUI appearance with neutral surfaces, readable status colors and restrained corners. Keep the accent color, background brightness and image opacity independent.
 - Add shared credential profiles with explicit remembering, isolated job identities and CLI profile selection; support video channels, source pagination metadata and dynamic genre browsing. Open supported Windows verification challenges only on request and keep verification tokens out of persistent storage.
 - Add shared video search sorting to Core, CLI and GUI: relevance, views, newest, danmaku, favorites and comments. Preserve server pagination and reject unsupported category/order combinations before authentication or network requests.
 - Add the native GUI, including search, queues, session login and appearance settings. GUI updating now uses the shared static catalog, GUI identity, headless native validation and core installation transaction.
@@ -14,7 +15,14 @@
 
 ### 🐞 Fixes
 
-- Blend GUI background opacity once over a neutral base so full opacity preserves original colors and theme changes do not tint the image.
+- Keep search, browsing and detail requests visibly pending until they finish or are cancelled. Disable paging and bulk-selection controls during pending work, and retain actionable retry errors until dismissal or retry. Give foreground operations priority over bounded cover requests, retry transient API GET failures within configured limits, and retain safe failure stages and HTTP status codes.
+- Preserve the total validated bytes across video and audio when resuming a download, including retained data in later resources. Continue to reflect real resets when checkpoints are invalid or the server replaces a partial response with a full response.
+- Fill the detail page with a responsive full-width episode grid and a compact single-part download action. Wrap download-dialog episode choices across its available width. Preserve original part selection when reopening details or deliberately preparing a removed task again.
+- Keep whole-video and explicit-part detail drafts separate, so opening `?p=2` after the whole video retains the requested original part through configuration and admission.
+- Distinguish provider quality names from video pixel dimensions in download preparation and history; retain widescreen source dimensions without resizing or silently selecting a lower quality.
+- Blend GUI background opacity once over a neutral light/dark base, with a separate neutral brightness control. Full opacity and brightness preserve original colors; changing the accent does not tint the image.
+- Keep the GUI header and window controls readable over background photos, remove duplicate title-bar branding, and disable history verification actions while another request is pending.
+- Keep disabled GUI button labels readable in Light and Dark appearances by applying the native disabled tint once.
 - Bound download preparation to a floating dialog, move batch limits into collapsed advanced options, and inherit a separately saved default limit for new drafts. Show concrete obtainable quality choices instead of advertised-only or duplicate highest options.
 - Preserve portrait and landscape cover proportions in the GUI, use poster slots for Bangumi/Film, remove the redundant category caption, and center single-line input text with clearly muted placeholders.
 - Restrict the Windows recycle-bin adapter to its supported platform so Linux GUI workspace checks can compile.
@@ -29,6 +37,7 @@
 
 ### 💥 Breaking Changes
 
+- Add optional `CoreConfig.api_replay` and exported `OfflineApiReplay` for isolated response-data checks. Struct-literal and matched SDK consumers must rebuild; `CoreConfig::new` keeps replay disabled by default.
 - Extend public Rust discovery, plan, error and job structs with typed filters and optional metadata. Source consumers must supply the new fields and rebuild matched SDK binaries; older serialized state defaults missing optional fields. OS recycling is supplied through the trusted host adapter in `CoreConfig`.
 - Add `sort` to the public Rust `SearchQuery` struct. Source callers must supply `SearchSort` and rebuild matched consumers; serialized queries without the field retain the default order.
 - The stable package entry remains unchanged, but the CLI and native runtime now live under `versions/<id>/`, selected by `CURRENT`. `2.0.0-alpha.6` cannot update to this layout; manually extract the first compatible package into a new directory rather than overwriting an Alpha 6 installation. No automatic migration is provided.
@@ -60,6 +69,8 @@
 
 ### ✅ Tests
 
+- Add disposable debugging of the actual native GUI with private settings/tasks/output, memory-only accounts, required process-local proxy restrictions and no update worker. Preserve the private settings destination when resetting appearance.
+- Add bounded local API response replay for the real Core and GUI detail/selection/configuration path; reject missing responses without live fallback and remove the alternate Review GUI. Supply reproducible synthetic scenarios through `scripts/debug_gui.py`.
 - Add an offline child-process crash regression for committed job recovery, uncommitted media tails and Range continuation with ETag and SHA-256 checks. This covers process termination, not physical power-loss qualification.
 
 ## [2.0.0-alpha.6] - 2026-10-29
