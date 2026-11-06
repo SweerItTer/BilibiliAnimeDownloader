@@ -114,6 +114,7 @@ struct Reply {
     extra_length: usize,
     ready: Option<tokio::sync::oneshot::Sender<()>>,
     release: Option<tokio::sync::oneshot::Receiver<()>>,
+    headers: &'static str,
 }
 
 impl Reply {
@@ -124,6 +125,7 @@ impl Reply {
             extra_length: 0,
             ready: None,
             release: None,
+            headers: "",
         }
     }
 }
@@ -162,8 +164,8 @@ impl HttpFixture {
                 .unwrap();
                 requests.push(request.lines().next().unwrap().to_owned());
                 socket.write_all(format!(
-                    "HTTP/1.1 {} fixture\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
-                    reply.status, reply.body.len() + reply.extra_length,
+                    "HTTP/1.1 {} fixture\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n{}\r\n",
+                    reply.status, reply.body.len() + reply.extra_length, reply.headers,
                 ).as_bytes()).await.unwrap();
                 let split = if reply.release.is_some() {
                     reply.body.len() / 2
@@ -214,6 +216,70 @@ fn policy(attempts: u32) -> RetryPolicy {
 }
 
 #[tokio::test]
+async fn rate_limit_honors_retry_after_and_blocks_followup_network_requests() {
+    let mut reply = Reply::new(429, "private rejection");
+    reply.headers = "Retry-After: 120\r\n";
+    let fixture = HttpFixture::start(vec![reply]).await;
+    let endpoint = fixture.endpoint.clone();
+    let connections = Semaphore::new(1);
+    let cooldown = ApiCooldown::default();
+    let result: Result<Value> = get_json_request(
+        client().get(endpoint.clone()),
+        &connections,
+        &policy(3),
+        &cooldown,
+    )
+    .await;
+    assert_eq!(fixture.finish().await.len(), 1);
+    assert_eq!(result.unwrap_err().http_status, Some(429));
+    assert!(
+        cooldown
+            .0
+            .lock()
+            .unwrap()
+            .unwrap()
+            .saturating_duration_since(Instant::now())
+            > Duration::from_secs(100)
+    );
+    // The server is gone: this still returns 429 without attempting a connection.
+    let blocked: Result<Value> =
+        get_json_request(client().get(endpoint), &connections, &policy(3), &cooldown).await;
+    let error = blocked.unwrap_err();
+    assert_eq!(error.http_status, Some(429));
+    assert_eq!(error.operation, "wait before retrying Bilibili API");
+    assert!(!error.retryable);
+    assert_eq!(connections.available_permits(), 1);
+    *cooldown.0.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
+    cooldown.check().unwrap();
+}
+
+#[test]
+fn rate_limit_accepts_http_dates_and_defaults_without_exposing_headers() {
+    let cooldown = ApiCooldown::default();
+    let date = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(120));
+    cooldown
+        .record(Some(&header::HeaderValue::from_str(&date).unwrap()))
+        .unwrap();
+    assert!(
+        cooldown
+            .0
+            .lock()
+            .unwrap()
+            .unwrap()
+            .saturating_duration_since(Instant::now())
+            > Duration::from_secs(100)
+    );
+    let fallback = ApiCooldown::default();
+    fallback
+        .record(Some(&header::HeaderValue::from_static(
+            "synthetic-private-header",
+        )))
+        .unwrap();
+    let error = fallback.check().unwrap_err();
+    assert!(!serde_json::to_string(&error).unwrap().contains("synthetic"));
+}
+
+#[tokio::test]
 async fn transient_status_and_interrupted_body_recover_the_same_get() {
     let mut interrupted = Reply::new(200, "{\"code\":0");
     interrupted.extra_length = 100;
@@ -228,6 +294,7 @@ async fn transient_status_and_interrupted_body_recover_the_same_get() {
         client().get(fixture.endpoint.clone()),
         &connections,
         &policy(3),
+        &ApiCooldown::default(),
     )
     .await;
     let requests = fixture.finish().await;
@@ -249,6 +316,7 @@ async fn only_the_selected_transient_http_statuses_retry() {
             client().get(fixture.endpoint.clone()),
             &Semaphore::new(1),
             &policy(3),
+            &ApiCooldown::default(),
         )
         .await;
         let requests = fixture.finish().await;
@@ -275,6 +343,7 @@ async fn exhaustion_retains_last_safe_failure_and_honors_the_attempt_limit() {
             client().get(fixture.endpoint.clone()),
             &connections,
             &policy(configured),
+            &ApiCooldown::default(),
         )
         .await;
         let requests = fixture.finish().await;
@@ -315,6 +384,7 @@ async fn rejections_malformed_json_and_semantic_failures_are_not_retried() {
             client().get(fixture.endpoint.clone()),
             &Semaphore::new(1),
             &policy(3),
+            &ApiCooldown::default(),
         )
         .await;
         assert_eq!(fixture.finish().await.len(), 1);
@@ -340,6 +410,7 @@ async fn rejections_malformed_json_and_semantic_failures_are_not_retried() {
             client().get(fixture.endpoint.clone()),
             &Semaphore::new(1),
             &policy(3),
+            &ApiCooldown::default(),
         )
         .await;
         let result = response.and_then(|value| parse_search_page(SearchCategory::Video, 2, &value));
@@ -365,7 +436,13 @@ async fn a_delayed_successful_body_stays_pending_until_complete() {
     let connections = Arc::new(Semaphore::new(1));
     let owned_connections = connections.clone();
     let mut request = tokio::spawn(async move {
-        get_json_request::<Value>(client().get(endpoint), &owned_connections, &policy(3)).await
+        get_json_request::<Value>(
+            client().get(endpoint),
+            &owned_connections,
+            &policy(3),
+            &ApiCooldown::default(),
+        )
+        .await
     });
     let started = tokio::time::timeout(Duration::from_secs(3), started).await;
     let early = tokio::time::timeout(Duration::from_millis(100), &mut request).await;
@@ -403,7 +480,13 @@ async fn cancelling_a_body_read_releases_the_permit_and_has_no_later_retry() {
     let connections = Arc::new(Semaphore::new(1));
     let owned_connections = connections.clone();
     let request = tokio::spawn(async move {
-        get_json_request::<Value>(client().get(endpoint), &owned_connections, &policy(3)).await
+        get_json_request::<Value>(
+            client().get(endpoint),
+            &owned_connections,
+            &policy(3),
+            &ApiCooldown::default(),
+        )
+        .await
     });
     let started = tokio::time::timeout(Duration::from_secs(3), started).await;
     request.abort();
@@ -431,6 +514,7 @@ async fn a_body_timeout_preserves_the_response_status_and_safe_stage() {
         client.get(fixture.endpoint.clone()),
         &Semaphore::new(1),
         &policy(1),
+        &ApiCooldown::default(),
     )
     .await;
     let _ = release.send(());
@@ -456,6 +540,7 @@ async fn backoff_releases_the_shared_connection_and_cancellation_ends_the_loop()
                 attempts: 3,
                 base_delay: Duration::from_secs(60),
             },
+            &ApiCooldown::default(),
         )
         .await
     });
@@ -475,6 +560,7 @@ async fn backoff_releases_the_shared_connection_and_cancellation_ends_the_loop()
         client().get(fixture.endpoint.clone()),
         &connections,
         &policy(3),
+        &ApiCooldown::default(),
     )
     .await
     .unwrap();

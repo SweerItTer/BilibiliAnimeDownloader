@@ -233,7 +233,10 @@ async fn server_sorting_preserves_two_page_order_and_parameters() {
             let response = &actual[position].pages[0];
             let params: std::collections::HashMap<_, _> =
                 requests[position].query_pairs().into_owned().collect();
-            assert_eq!(requests[position].path(), "/x/web-interface/search/type");
+            assert_eq!(
+                requests[position].path(),
+                "/x/web-interface/wbi/search/type"
+            );
             assert_eq!(params.get("search_type").map(String::as_str), Some("video"));
             assert_eq!(params.get("keyword").map(String::as_str), Some("动画 A B"));
             assert_eq!(params.get("page"), Some(&page.to_string()));
@@ -676,4 +679,31 @@ fn typed_search_pages_video_bangumi_and_film_with_posters() {
         movies.items[0].cover.as_deref(),
         Some("https://i0.hdslb.com/bfs/bangumi/image/f8590ba633657af9c15e4754b3e60ee43f24860f.png")
     );
+}
+
+#[test]
+fn server_issued_search_device_preserves_account_and_rejects_cookie_injection() {
+    let origin = Url::parse("https://api.bilibili.com/").unwrap();
+    let mut jar = CredentialJar::import_header("SESSDATA=synthetic-account").unwrap();
+    let cookies =
+        search_device_cookies(&json!({"b_3":"server-device-3","b_4":"base64/device+4=="})).unwrap();
+    jar.import_set_cookies(&origin, &cookies).unwrap();
+    assert_eq!(
+        jar.cookie_value_for("SESSDATA", &origin).as_deref(),
+        Some("synthetic-account")
+    );
+    assert_eq!(
+        jar.cookie_value_for("buvid3", &origin).as_deref(),
+        Some("server-device-3")
+    );
+    assert_eq!(
+        jar.cookie_value_for("buvid4", &origin).as_deref(),
+        Some("base64/device+4==")
+    );
+    assert!(jar
+        .header_for(&Url::parse("https://unrelated.invalid/").unwrap())
+        .is_none());
+    for bad in ["", "device; SESSDATA=injected", "device\r\nX-Secret: leak"] {
+        assert!(search_device_cookies(&json!({"b_3":bad,"b_4":"valid"})).is_err());
+    }
 }

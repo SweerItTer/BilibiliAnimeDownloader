@@ -38,6 +38,53 @@ fn playurl(full_hd: bool) -> Value {
     }})
 }
 
+#[tokio::test]
+async fn search_initializes_device_and_uses_signed_wbi_endpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let replay = write_replay(
+        root.path(),
+        vec![
+            entry(
+                "/x/frontend/finger/spi",
+                json!({}),
+                json!({"code":0,"data":{"b_3":"synthetic-device-3","b_4":"synthetic-device-4"}}),
+            ),
+            entry(
+                "/x/web-interface/nav",
+                json!({}),
+                json!({"code":-101,"data":{"isLogin":false,"wbi_img":{
+            "img_url":"https://i0.hdslb.com/bfs/wbi/0123456789abcdef0123456789abcdef.png",
+            "sub_url":"https://i0.hdslb.com/bfs/wbi/fedcba9876543210fedcba9876543210.png"}}}),
+            ),
+            entry(
+                "/x/web-interface/wbi/search/type",
+                json!({"keyword":"test","search_type":"video","page":"1"}),
+                json!({"code":0,"data":{"numResults":1,"numPages":1,"pagesize":20,"result":[{"aid":7,"title":"Synthetic result"}]}}),
+            ),
+        ],
+    );
+    let mut config = CoreConfig::new(root.path().join("state"), root.path().join("output"));
+    config.api_replay = Some(replay);
+    let core = Core::new(config, tokio::runtime::Handle::current()).unwrap();
+    for _ in 0..2 {
+        let page = core
+            .search(SearchQuery {
+                keyword: "test".into(),
+                category: SearchCategory::Video,
+                page: 1,
+                sort: SearchSort::Relevance,
+                filter: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            page.pages[0].items[0].reference,
+            ContentRef::Video(Aid::new(7).unwrap())
+        );
+    }
+    core.shutdown(StopMode::Pause).await.unwrap();
+}
+
 fn selection(part: PartRef, quality: Option<u32>) -> DownloadSelection {
     DownloadSelection {
         part,

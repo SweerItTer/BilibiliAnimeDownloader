@@ -68,6 +68,8 @@ pub(crate) struct Api {
     retry: RetryPolicy,
     replay: Option<OfflineApiReplay>,
     wbi_key: Arc<Mutex<Option<(Instant, String)>>>,
+    search_device: Arc<Mutex<Option<[String; 2]>>>,
+    cooldown: Arc<ApiCooldown>,
     pgc_conditions: Arc<Mutex<std::collections::HashMap<PgcSection, BrowseConditions>>>,
 }
 
@@ -80,6 +82,8 @@ impl Api {
             retry: self.retry.clone(),
             replay: self.replay.clone(),
             wbi_key: self.wbi_key.clone(),
+            search_device: self.search_device.clone(),
+            cooldown: self.cooldown.clone(),
             pgc_conditions: self.pgc_conditions.clone(),
         }
     }
@@ -96,6 +100,8 @@ impl Api {
             retry,
             replay: None,
             wbi_key: Arc::new(Mutex::new(None)),
+            search_device: Arc::new(Mutex::new(None)),
+            cooldown: Arc::new(ApiCooldown::default()),
             pgc_conditions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -271,8 +277,11 @@ impl Api {
     }
 
     pub(crate) async fn search(&self, query: SearchQuery) -> Result<CandidatePage> {
+        query.validate()?;
+        let api = self.search_session().await?;
+        let api = &api;
         search_pages(query, |mut url| async move {
-            let token = self
+            let token = api
                 .credentials
                 .read()
                 .map_err(|_| {
@@ -282,9 +291,32 @@ impl Api {
             if let Some(token) = token {
                 url.query_pairs_mut().append_pair("gaia_vtoken", &token);
             }
-            self.get_json(self.sign_wbi(url, &[]).await?, REFERER).await
+            api.get_json(api.sign_wbi(url, &[]).await?, REFERER).await
         })
         .await
+    }
+
+    async fn search_session(&self) -> Result<Self> {
+        let origin = api_url("/", &[])?;
+        let mut jar = self
+            .credentials
+            .read()
+            .map_err(|_| CoreError::new(ErrorCode::CredentialStore, "credential lock unavailable"))?
+            .clone();
+        if jar.cookie_value_for("buvid3", &origin).is_none() {
+            // Obtain the same server-issued device identity used by web search.
+            // This cache is transient and never changes/persists account credentials.
+            let mut cached = self.search_device.lock().await;
+            if cached.is_none() {
+                let response: Value = self
+                    .get_json(api_url("/x/frontend/finger/spi", &[])?, REFERER)
+                    .await?;
+                let data = api_result(&response, "initialize search session")?;
+                *cached = Some(search_device_cookies(data)?);
+            }
+            jar.import_set_cookies(&origin, cached.as_ref().unwrap())?;
+        }
+        Ok(self.with_credentials(Arc::new(RwLock::new(jar))))
     }
 
     pub(crate) async fn browse_conditions(&self, section: PgcSection) -> Result<BrowseConditions> {
@@ -644,6 +676,7 @@ impl Api {
             referer,
             &self.connections,
             &self.retry,
+            &self.cooldown,
         )
         .await
     }
@@ -811,7 +844,7 @@ where
             if let Some(channel) = channel {
                 params.push(("tids", channel.to_string()));
             }
-            let value = fetch(api_url("/x/web-interface/search/type", &params)?).await?;
+            let value = fetch(api_url("/x/web-interface/wbi/search/type", &params)?).await?;
             parse_search_page(*category, page, &value)
         }
     });
@@ -827,6 +860,74 @@ where
     Ok(CandidatePage { pages })
 }
 
+fn search_device_cookies(data: &Value) -> Result<[String; 2]> {
+    let mut cookies = Vec::new();
+    for (field, name) in [("b_3", "buvid3"), ("b_4", "buvid4")] {
+        let value = data
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 256
+                    && value.bytes().all(|b| {
+                        b.is_ascii_alphanumeric()
+                            || matches!(b, b'-' | b'_' | b'.' | b'=' | b'+' | b'/')
+                    })
+            })
+            .ok_or_else(|| invalid("search device identity malformed"))?;
+        cookies.push(format!(
+            "{name}={value}; Domain=bilibili.com; Path=/; Secure"
+        ));
+    }
+    cookies
+        .try_into()
+        .map_err(|_| invalid("search device identity malformed"))
+}
+
+#[derive(Default)]
+struct ApiCooldown(std::sync::Mutex<Option<Instant>>);
+impl ApiCooldown {
+    fn check(&self) -> Result<()> {
+        let until = self
+            .0
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::Corruption, "API cooldown lock unavailable"))?;
+        if until.is_some_and(|until| Instant::now() < until) {
+            let mut error = http_response_failure(429);
+            error.operation = "wait before retrying Bilibili API".into();
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn record(&self, value: Option<&header::HeaderValue>) -> Result<()> {
+        let now = std::time::SystemTime::now();
+        let delay = value
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .map(Duration::from_secs)
+                    .or_else(|| {
+                        httpdate::parse_http_date(value)
+                            .ok()
+                            .map(|at| at.duration_since(now).unwrap_or_default())
+                    })
+            })
+            .unwrap_or(Duration::from_secs(60))
+            .max(Duration::from_secs(1));
+        let deadline = Instant::now()
+            .checked_add(delay)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400));
+        let mut until = self
+            .0
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::Corruption, "API cooldown lock unavailable"))?;
+        *until = Some(until.map_or(deadline, |previous| previous.max(deadline)));
+        Ok(())
+    }
+}
+
 async fn get_json_with<T: DeserializeOwned>(
     client: &reqwest::Client,
     jar: &Arc<RwLock<CredentialJar>>,
@@ -834,6 +935,7 @@ async fn get_json_with<T: DeserializeOwned>(
     referer: &str,
     connections: &Semaphore,
     retry: &RetryPolicy,
+    cooldown: &ApiCooldown,
 ) -> Result<T> {
     if url.scheme() != "https" || !is_api_host(url.host_str().unwrap_or_default()) {
         return Err(invalid("API host is not allowed"));
@@ -851,7 +953,7 @@ async fn get_json_with<T: DeserializeOwned>(
     if let Some(cookie) = cookie {
         req = req.header(header::COOKIE, cookie);
     }
-    get_json_request(req, connections, retry).await
+    get_json_request(req, connections, retry, cooldown).await
 }
 
 // Only the trusted-host adapter above constructs production requests. Keeping
@@ -860,6 +962,7 @@ async fn get_json_request<T: DeserializeOwned>(
     request: reqwest::RequestBuilder,
     connections: &Semaphore,
     retry: &RetryPolicy,
+    cooldown: &ApiCooldown,
 ) -> Result<T> {
     let attempts = retry.attempts.clamp(1, MAX_API_ATTEMPTS);
     for attempt in 1..=attempts {
@@ -871,7 +974,8 @@ async fn get_json_request<T: DeserializeOwned>(
             let request = request
                 .try_clone()
                 .ok_or_else(|| invalid("clone API GET request"))?;
-            read_json_response(request).await
+            cooldown.check()?;
+            read_json_response(request, cooldown).await
         };
         match result {
             Ok(value) => return Ok(value),
@@ -901,10 +1005,16 @@ fn api_retry_delay(retry: &RetryPolicy, completed_attempts: u32) -> Duration {
         .min(MAX_API_BACKOFF)
 }
 
-async fn read_json_response<T: DeserializeOwned>(req: reqwest::RequestBuilder) -> Result<T> {
+async fn read_json_response<T: DeserializeOwned>(
+    req: reqwest::RequestBuilder,
+    cooldown: &ApiCooldown,
+) -> Result<T> {
     let mut response = req.send().await.map_err(|error| request_failure(&error))?;
     let status = response.status().as_u16();
     if !response.status().is_success() {
+        if status == 429 {
+            cooldown.record(response.headers().get(header::RETRY_AFTER))?;
+        }
         return Err(http_response_failure(status));
     }
     if response

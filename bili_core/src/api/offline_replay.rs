@@ -159,7 +159,11 @@ fn request_key(url: &Url) -> Result<RequestKey> {
         if !seen.insert(name.to_string()) {
             return Err(invalid("duplicate offline API request parameter"));
         }
-        if url.path() == "/x/player/wbi/playurl" && matches!(name.as_ref(), "wts" | "w_rid") {
+        if matches!(
+            url.path(),
+            "/x/player/wbi/playurl" | "/x/web-interface/wbi/search/type"
+        ) && matches!(name.as_ref(), "wts" | "w_rid")
+        {
             continue;
         }
         query.insert(name.into_owned(), value.into_owned());
@@ -249,6 +253,46 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn signed_search_keeps_keyword_category_sort_and_page_in_the_replay_key() {
+        let replay = fixture(
+            "/x/web-interface/wbi/search/type",
+            json!({"keyword":"你好","search_type":"video","page":"1"}),
+            json!({"ok":true}),
+            0,
+        );
+        let mut url =
+            Url::parse("https://api.bilibili.com/x/web-interface/wbi/search/type").unwrap();
+        url.query_pairs_mut().extend_pairs([
+            ("keyword", "你好"),
+            ("search_type", "video"),
+            ("page", "1"),
+            ("wts", "123"),
+            ("w_rid", "local"),
+        ]);
+        assert_eq!(
+            replay.response::<Value>(&url).await.unwrap(),
+            json!({"ok":true})
+        );
+        for (field, value) in [
+            ("keyword", "其他"),
+            ("search_type", "media_ft"),
+            ("page", "2"),
+            ("order", "click"),
+        ] {
+            let mut changed = url.clone();
+            let mut pairs: Vec<(String, String)> = changed
+                .query_pairs()
+                .into_owned()
+                .filter(|(key, _)| key != field)
+                .collect();
+            pairs.push((field.into(), value.into()));
+            changed.set_query(None);
+            changed.query_pairs_mut().extend_pairs(pairs);
+            assert!(replay.response::<Value>(&changed).await.is_err());
+        }
     }
 
     #[test]
