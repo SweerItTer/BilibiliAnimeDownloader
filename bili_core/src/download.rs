@@ -237,6 +237,31 @@ pub(crate) fn load_checkpoint(path: &Path) -> Result<ResourceCheckpoint> {
     }
 }
 
+/// Reuse only complete, digest-proven inputs without reacquiring a remote URL.
+/// This read-only check never repairs or truncates retained recovery data.
+pub(crate) async fn completed_resource(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Result<Option<u64>> {
+    let checkpoint = load_checkpoint(path)?;
+    if !checkpoint.complete {
+        return Ok(None);
+    }
+    crate::state::reject_symlink(path)?;
+    let (size, digest) = digest_file(path, cancel).await?;
+    if size == 0
+        || size != checkpoint.durable_bytes
+        || checkpoint.expected_total != Some(size)
+        || checkpoint.sha256.as_deref() != Some(digest.as_str())
+    {
+        return Err(CoreError::new(
+            ErrorCode::Corruption,
+            "completed resource verification failed",
+        ));
+    }
+    Ok(Some(size))
+}
+
 async fn reconcile(
     path: &Path,
     sidecar: &Path,

@@ -787,10 +787,17 @@ impl AuthManager {
     ) -> Result<(String, ProfileSession)> {
         let account = snapshot.account.clone().ok_or_else(login_error)?;
         let id = if remembered && activate {
-            self.profiles
-                .values()
-                .find(|p| p.metadata.remembered && p.metadata.account.mid == account.mid)
+            self.selected
+                .as_ref()
+                .and_then(|id| self.profiles.get(id))
+                .filter(|p| p.metadata.account.mid == account.mid)
                 .map(|p| p.metadata.id.clone())
+                .or_else(|| {
+                    self.profiles
+                        .values()
+                        .find(|p| p.metadata.remembered && p.metadata.account.mid == account.mid)
+                        .map(|p| p.metadata.id.clone())
+                })
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
         } else {
             uuid::Uuid::new_v4().to_string()
@@ -1696,6 +1703,51 @@ mod tests {
             .iter()
             .all(|p| p.expires_at.is_none() && !p.remembered));
         assert!(manager.session(Some("missing")).is_err());
+    }
+
+    #[tokio::test]
+    async fn remembering_the_active_account_preserves_task_profile_identity_across_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = StorePolicy::Remember {
+            directory: root.path().to_owned(),
+            allow_plaintext_fallback: false,
+        };
+        let initial = CredentialJar::import_header("SESSDATA=synthetic-session-only").unwrap();
+        let (mut auth, _) = manager(policy.clone(), initial);
+        auth.install_profile(&account_snapshot(42), false).unwrap();
+        let id = auth.selected_profile_id().unwrap();
+        let captured = auth.session(Some(&id)).unwrap();
+        let next = CredentialJar::import_header("SESSDATA=synthetic-remembered-upgrade").unwrap();
+        let (remembered_id, _) = auth
+            .accept_login(&account_snapshot(42), next, true, true)
+            .await
+            .unwrap();
+        assert_eq!(remembered_id, id);
+        assert_eq!(auth.profiles.len(), 1);
+        let (mut reopened, _) = manager(policy, CredentialJar::default());
+        reopened.load_profiles().await.unwrap();
+        let origin = Url::parse("https://api.bilibili.com/").unwrap();
+        assert_eq!(reopened.stored_selected.as_deref(), Some(id.as_str()));
+        assert!(reopened.profiles[&id].metadata.remembered);
+        assert_eq!(
+            reopened
+                .session(Some(&id))
+                .unwrap()
+                .read()
+                .unwrap()
+                .cookie_value_for("SESSDATA", &origin)
+                .as_deref(),
+            Some("synthetic-remembered-upgrade")
+        );
+        assert_eq!(
+            captured
+                .read()
+                .unwrap()
+                .cookie_value_for("SESSDATA", &origin)
+                .as_deref(),
+            Some("synthetic-session-only")
+        );
+        secure_store::delete(root.path()).unwrap();
     }
 
     #[tokio::test]

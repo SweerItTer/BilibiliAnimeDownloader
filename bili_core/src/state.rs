@@ -376,7 +376,7 @@ pub(crate) fn output_info(record: &JobRecord) -> Result<OutputInfo> {
     })
 }
 
-fn removal_files(record: &JobRecord) -> Result<Vec<PathBuf>> {
+fn removal_files(record: &JobRecord, state_dir: &Path) -> Result<Vec<PathBuf>> {
     let cancel = tokio_util::sync::CancellationToken::new();
     let mut paths = Vec::new();
     let output = record
@@ -403,13 +403,14 @@ fn removal_files(record: &JobRecord) -> Result<Vec<PathBuf>> {
     for component in &record.snapshot.components {
         if let Some(path) = &component.path {
             reject_symlink(path)?;
+            let verified = verify_component(path, &cancel, state_dir)?;
             if !path.try_exists().map_err(CoreError::io)? {
                 continue;
             }
             ensure_real_dir(path.parent().ok_or_else(|| {
                 CoreError::new(ErrorCode::InvalidInput, "component parent missing")
             })?)?;
-            if !verify_component(path, &cancel)? {
+            if !verified {
                 return Err(CoreError::new(
                     ErrorCode::Conflict,
                     "refusing unowned component removal",
@@ -423,19 +424,25 @@ fn removal_files(record: &JobRecord) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-pub(crate) fn recycle_outputs(records: &[JobRecord], recycle: RecycleBin) -> Result<RemovalReport> {
-    recycle_outputs_with(records, recycle.move_files)
+pub(crate) fn recycle_outputs(
+    records: &[JobRecord],
+    recycle: RecycleBin,
+    state_dir: &Path,
+) -> Result<RemovalReport> {
+    recycle_outputs_with(records, recycle.move_files, state_dir)
 }
 fn recycle_outputs_with(
     records: &[JobRecord],
     recycle: impl FnMut(&[PathBuf]) -> Result<()>,
+    state_dir: &Path,
 ) -> Result<RemovalReport> {
-    recycle_outputs_checked(records, recycle, |path| path.try_exists())
+    recycle_outputs_checked(records, recycle, |path| path.try_exists(), state_dir)
 }
 fn recycle_outputs_checked(
     records: &[JobRecord],
     mut recycle: impl FnMut(&[PathBuf]) -> Result<()>,
     mut exists: impl FnMut(&Path) -> std::io::Result<bool>,
+    state_dir: &Path,
 ) -> Result<RemovalReport> {
     let mut report = RemovalReport::default();
     for record in records {
@@ -447,7 +454,7 @@ fn recycle_outputs_checked(
         }
     }
     for record in records {
-        let paths = match removal_files(record) {
+        let paths = match removal_files(record, state_dir) {
             Ok(paths) => paths,
             Err(error) => {
                 report.errors.push(error);
@@ -482,6 +489,10 @@ fn recycle_outputs_checked(
             }
         }
         if succeeded && all_missing {
+            if let Err(error) = remove_empty_project_directory(record) {
+                report.errors.push(error);
+                continue;
+            }
             report.removed.push(record.snapshot.id);
         } else if succeeded && present {
             report.errors.push(CoreError::new(
@@ -491,6 +502,48 @@ fn recycle_outputs_checked(
         }
     }
     Ok(report)
+}
+
+fn remove_empty_project_directory(record: &JobRecord) -> Result<()> {
+    let Some(plan) = &record.snapshot.plan else {
+        return Ok(());
+    };
+    let Some(project) = plan
+        .context
+        .as_ref()
+        .and_then(|context| context.project.as_ref())
+    else {
+        return Ok(());
+    };
+    let suffix = match project.reference {
+        ContentRef::Video(id) => format!("_av{}", id.get()),
+        ContentRef::Bangumi(id) => format!("_ss{}", id.get()),
+        ContentRef::Episode(id) => format!("_ep{}", id.get()),
+    };
+    let Some(directory) = plan.destination.parent() else {
+        return Ok(());
+    };
+    if directory.file_name()
+        != Some(std::ffi::OsStr::new(&crate::api::safe_filename(
+            &project.title,
+            &suffix,
+        )))
+    {
+        return Ok(());
+    }
+    reject_symlink(directory)?;
+    match fs::remove_dir(directory) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(CoreError::io(error)),
+    }
 }
 
 pub(crate) fn private_options() -> OpenOptions {
@@ -781,7 +834,7 @@ pub(crate) fn clean_staging(record: &JobRecord, dry_run: bool) -> Result<(Vec<Pa
     Ok((paths, bytes))
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 struct ComponentArtifact {
     schema_version: u32,
     destination: PathBuf,
@@ -792,7 +845,7 @@ struct ComponentArtifact {
     promoted: bool,
 }
 
-fn component_manifest(path: &Path) -> Result<PathBuf> {
+fn legacy_component_manifest(path: &Path) -> Result<PathBuf> {
     let name = path
         .file_name()
         .ok_or_else(|| CoreError::new(ErrorCode::InvalidInput, "component filename missing"))?;
@@ -804,7 +857,19 @@ fn component_manifest(path: &Path) -> Result<PathBuf> {
         Sha256::digest(name.as_encoded_bytes())
     )))
 }
-fn component_guard(path: &Path) -> Result<(PathBuf, File)> {
+fn component_manifest(path: &Path, state_dir: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() || !state_dir.is_absolute() {
+        return Err(CoreError::new(
+            ErrorCode::InvalidInput,
+            "component paths must be absolute",
+        ));
+    }
+    Ok(state_dir.join("components").join(format!(
+        "{:x}.json",
+        Sha256::digest(path.as_os_str().as_encoded_bytes())
+    )))
+}
+fn component_guard(path: &Path, state_dir: &Path) -> Result<(PathBuf, File)> {
     if !path.is_absolute() {
         return Err(CoreError::new(
             ErrorCode::InvalidInput,
@@ -816,16 +881,26 @@ fn component_guard(path: &Path) -> Result<(PathBuf, File)> {
         .ok_or_else(|| CoreError::new(ErrorCode::InvalidInput, "component parent missing"))?;
     output_dir(parent)?;
     reject_symlink(path)?;
-    let manifest = component_manifest(path)?;
+    let manifest = component_manifest(path, state_dir)?;
+    private_dir(
+        manifest
+            .parent()
+            .ok_or_else(|| CoreError::new(ErrorCode::InvalidInput, "component store missing"))?,
+    )?;
     let lock_path = manifest.with_extension("lock");
-    reject_symlink(&lock_path)?;
+    let lock = component_lock(&lock_path)?;
+    migrate_component_manifest(path, &manifest)?;
+    Ok((manifest, lock))
+}
+fn component_lock(lock_path: &Path) -> Result<File> {
+    reject_symlink(lock_path)?;
     let lock = private_options()
         .read(true)
         .write(true)
         .create(true)
-        .open(&lock_path)
+        .open(lock_path)
         .map_err(CoreError::io)?;
-    crate::cookie::restrict_private(&lock_path, false)?;
+    crate::cookie::restrict_private(lock_path, false)?;
     FileExt::try_lock_exclusive(&lock).map_err(|error| {
         if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
             CoreError::new(ErrorCode::Busy, "component writer is active")
@@ -833,7 +908,45 @@ fn component_guard(path: &Path) -> Result<(PathBuf, File)> {
             CoreError::io(error)
         }
     })?;
-    Ok((manifest, lock))
+    Ok(lock)
+}
+
+fn migrate_component_manifest(path: &Path, manifest: &Path) -> Result<()> {
+    let legacy = legacy_component_manifest(path)?;
+    let legacy_lock = legacy.with_extension("lock");
+    if !legacy.try_exists().map_err(CoreError::io)?
+        && !legacy_lock.try_exists().map_err(CoreError::io)?
+    {
+        return Ok(());
+    }
+    let guard = component_lock(&legacy_lock)?;
+    if let Some(artifact) = load_component(path, &legacy, None)? {
+        if let Some(current) = load_component(path, manifest, None)? {
+            if artifact != current {
+                return Err(CoreError::new(
+                    ErrorCode::Conflict,
+                    "component ownership migration differs",
+                ));
+            }
+        } else {
+            atomic_json(manifest, &artifact)?;
+        }
+        fs::remove_file(&legacy).map_err(CoreError::io)?;
+    } else if !manifest.try_exists().map_err(CoreError::io)? {
+        return Ok(());
+    }
+    if guard.metadata().map_err(CoreError::io)?.len() != 0 {
+        return Err(CoreError::new(
+            ErrorCode::Conflict,
+            "component legacy lock is not empty",
+        ));
+    }
+    drop(guard);
+    fs::remove_file(legacy_lock).map_err(CoreError::io)?;
+    sync_directory(
+        path.parent()
+            .ok_or_else(|| CoreError::new(ErrorCode::InvalidInput, "component parent missing"))?,
+    )
 }
 fn load_component(
     path: &Path,
@@ -935,6 +1048,7 @@ pub(crate) fn component_exists(
     path: &Path,
     identity: &str,
     cancel: &tokio_util::sync::CancellationToken,
+    state_dir: &Path,
 ) -> Result<bool> {
     if cancel.is_cancelled() {
         return Err(CoreError::new(
@@ -942,7 +1056,7 @@ pub(crate) fn component_exists(
             "component verification cancelled",
         ));
     }
-    let (manifest, _guard) = component_guard(path)?;
+    let (manifest, _guard) = component_guard(path, state_dir)?;
     match load_component(path, &manifest, Some(identity))? {
         Some(mut artifact) => finish_component(path, &manifest, &mut artifact, cancel),
         None if path.try_exists().map_err(CoreError::io)? => Err(CoreError::new(
@@ -957,6 +1071,7 @@ pub(crate) fn component_exists(
 pub(crate) fn verify_component(
     path: &Path,
     cancel: &tokio_util::sync::CancellationToken,
+    state_dir: &Path,
 ) -> Result<bool> {
     if cancel.is_cancelled() {
         return Err(CoreError::new(
@@ -964,7 +1079,7 @@ pub(crate) fn verify_component(
             "component verification cancelled",
         ));
     }
-    let (manifest, _guard) = component_guard(path)?;
+    let (manifest, _guard) = component_guard(path, state_dir)?;
     match load_component(path, &manifest, None)? {
         Some(mut artifact) => finish_component(path, &manifest, &mut artifact, cancel),
         None if path.try_exists().map_err(CoreError::io)? => Err(CoreError::new(
@@ -981,6 +1096,7 @@ pub(crate) fn write_component(
     bytes: &[u8],
     identity: &str,
     cancel: &tokio_util::sync::CancellationToken,
+    state_dir: &Path,
 ) -> Result<()> {
     if cancel.is_cancelled() {
         return Err(CoreError::new(
@@ -988,7 +1104,7 @@ pub(crate) fn write_component(
             "component write cancelled",
         ));
     }
-    let (manifest, _guard) = component_guard(path)?;
+    let (manifest, _guard) = component_guard(path, state_dir)?;
     if let Some(mut artifact) = load_component(path, &manifest, Some(identity))? {
         if finish_component(path, &manifest, &mut artifact, cancel)? {
             return Ok(());
@@ -1108,6 +1224,7 @@ mod tests {
             b"subtitle",
             "fixture/subtitle",
             &tokio_util::sync::CancellationToken::new(),
+            &root.path().join("state"),
         )
         .unwrap();
         record.snapshot.components.push(ComponentResult {
@@ -1120,13 +1237,18 @@ mod tests {
         fs::write(&unrelated, b"keep me").unwrap();
         let recover = root.path().join("recovery");
         fs::create_dir(&recover).unwrap();
-        let report = recycle_outputs_with(&[record.clone()], |paths| {
-            assert_eq!(paths, &[output.clone(), subtitle.clone()]);
-            for path in paths {
-                fs::rename(path, recover.join(path.file_name().unwrap())).map_err(CoreError::io)?;
-            }
-            Ok(())
-        })
+        let report = recycle_outputs_with(
+            &[record.clone()],
+            |paths| {
+                assert_eq!(paths, &[output.clone(), subtitle.clone()]);
+                for path in paths {
+                    fs::rename(path, recover.join(path.file_name().unwrap()))
+                        .map_err(CoreError::io)?;
+                }
+                Ok(())
+            },
+            &root.path().join("state"),
+        )
         .unwrap();
         assert_eq!(report.removed, vec![record.snapshot.id]);
         assert_eq!(report.recycled.len(), 2);
@@ -1141,20 +1263,26 @@ mod tests {
         let record = completed_record(root.path());
         let output = record.snapshot.output.as_ref().unwrap();
         fs::write(output, b"replacement bytes").unwrap();
-        let report = recycle_outputs_with(std::slice::from_ref(&record), |_| {
-            panic!("must not recycle changed bytes")
-        })
+        let report = recycle_outputs_with(
+            std::slice::from_ref(&record),
+            |_| panic!("must not recycle changed bytes"),
+            &root.path().join("state"),
+        )
         .unwrap();
         assert!(report.removed.is_empty());
         assert_eq!(report.errors[0].code, ErrorCode::Conflict);
         assert_eq!(fs::read(output).unwrap(), b"replacement bytes");
         let record = completed_record(root.path());
-        let report = recycle_outputs_with(std::slice::from_ref(&record), |_| {
-            Err(CoreError::new(
-                ErrorCode::Filesystem,
-                "test trash unavailable",
-            ))
-        })
+        let report = recycle_outputs_with(
+            std::slice::from_ref(&record),
+            |_| {
+                Err(CoreError::new(
+                    ErrorCode::Filesystem,
+                    "test trash unavailable",
+                ))
+            },
+            &root.path().join("state"),
+        )
         .unwrap();
         assert!(report.removed.is_empty());
         assert!(report.recycled.is_empty());
@@ -1163,7 +1291,9 @@ mod tests {
         let mut unowned = record.clone();
         unowned.completion = None;
         assert_eq!(
-            removal_files(&unowned).unwrap_err().code,
+            removal_files(&unowned, &root.path().join("state"))
+                .unwrap_err()
+                .code,
             ErrorCode::Conflict
         );
     }
@@ -1181,6 +1311,7 @@ mod tests {
                     "fixture metadata failure",
                 ))
             },
+            &root.path().join("state"),
         )
         .unwrap();
         assert!(report.removed.is_empty());
@@ -1199,6 +1330,7 @@ mod tests {
             b"subtitle",
             "fixture/partial",
             &tokio_util::sync::CancellationToken::new(),
+            &root.path().join("state"),
         )
         .unwrap();
         record.snapshot.components.push(ComponentResult {
@@ -1208,14 +1340,18 @@ mod tests {
             omissions: 0,
         });
         let recovery = root.path().join("recoverable-output.mp4");
-        let report = recycle_outputs_with(&[record], |paths| {
-            assert_eq!(paths, &[output.clone(), subtitle.clone()]);
-            fs::rename(&output, &recovery).map_err(CoreError::io)?;
-            Err(CoreError::new(
-                ErrorCode::Filesystem,
-                "fixture partial recycle",
-            ))
-        })
+        let report = recycle_outputs_with(
+            &[record],
+            |paths| {
+                assert_eq!(paths, &[output.clone(), subtitle.clone()]);
+                fs::rename(&output, &recovery).map_err(CoreError::io)?;
+                Err(CoreError::new(
+                    ErrorCode::Filesystem,
+                    "fixture partial recycle",
+                ))
+            },
+            &root.path().join("state"),
+        )
         .unwrap();
         assert!(report.removed.is_empty());
         assert_eq!(report.recycled, vec![output]);
@@ -1380,16 +1516,23 @@ mod component_tests {
     fn component_writer_contention_is_busy_and_other_file_errors_remain_filesystem() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("en.srt");
-        let (manifest, guard) = component_guard(&path).unwrap();
-        assert_eq!(component_guard(&path).unwrap_err().code, ErrorCode::Busy);
+        let (manifest, guard) = component_guard(&path, &root.path().join("state")).unwrap();
+        assert_eq!(
+            component_guard(&path, &root.path().join("state"))
+                .unwrap_err()
+                .code,
+            ErrorCode::Busy
+        );
         drop(guard);
-        let (_, replacement) = component_guard(&path).unwrap();
+        let (_, replacement) = component_guard(&path, &root.path().join("state")).unwrap();
         drop(replacement);
         let lock_path = manifest.with_extension("lock");
         fs::remove_file(&lock_path).unwrap();
         fs::create_dir(&lock_path).unwrap();
         assert_eq!(
-            component_guard(&path).unwrap_err().code,
+            component_guard(&path, &root.path().join("state"))
+                .unwrap_err()
+                .code,
             ErrorCode::Filesystem
         );
     }
@@ -1398,34 +1541,73 @@ mod component_tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("en.srt");
         let cancel = CancellationToken::new();
-        write_component(&path, b"original snapshot", "part:1/track:2/srt", &cancel).unwrap();
-        write_component(&path, b"new live snapshot", "part:1/track:2/srt", &cancel).unwrap();
+        write_component(
+            &path,
+            b"original snapshot",
+            "part:1/track:2/srt",
+            &cancel,
+            &root.path().join("state"),
+        )
+        .unwrap();
+        write_component(
+            &path,
+            b"new live snapshot",
+            "part:1/track:2/srt",
+            &cancel,
+            &root.path().join("state"),
+        )
+        .unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"original snapshot");
-        assert!(component_exists(&path, "part:1/track:2/srt", &cancel).unwrap());
-        assert!(verify_component(&path, &cancel).unwrap());
+        assert!(component_exists(
+            &path,
+            "part:1/track:2/srt",
+            &cancel,
+            &root.path().join("state")
+        )
+        .unwrap());
+        assert!(verify_component(&path, &cancel, &root.path().join("state")).unwrap());
         assert_eq!(
-            write_component(&path, b"other track", "part:1/track:3/srt", &cancel)
-                .unwrap_err()
-                .code,
+            write_component(
+                &path,
+                b"other track",
+                "part:1/track:3/srt",
+                &cancel,
+                &root.path().join("state")
+            )
+            .unwrap_err()
+            .code,
             ErrorCode::Conflict
         );
         fs::write(&path, b"modified output").unwrap();
         assert_eq!(
-            component_exists(&path, "part:1/track:2/srt", &cancel)
-                .unwrap_err()
-                .code,
+            component_exists(
+                &path,
+                "part:1/track:2/srt",
+                &cancel,
+                &root.path().join("state")
+            )
+            .unwrap_err()
+            .code,
             ErrorCode::Corruption
         );
         assert_eq!(
-            verify_component(&path, &cancel).unwrap_err().code,
+            verify_component(&path, &cancel, &root.path().join("state"))
+                .unwrap_err()
+                .code,
             ErrorCode::Corruption
         );
         let unrelated = root.path().join("unrelated.ass");
         fs::write(&unrelated, b"equal bytes").unwrap();
         assert_eq!(
-            write_component(&unrelated, b"equal bytes", "part:1/ass", &cancel)
-                .unwrap_err()
-                .code,
+            write_component(
+                &unrelated,
+                b"equal bytes",
+                "part:1/ass",
+                &cancel,
+                &root.path().join("state")
+            )
+            .unwrap_err()
+            .code,
             ErrorCode::Conflict
         );
         assert_eq!(fs::read(unrelated).unwrap(), b"equal bytes");
@@ -1439,7 +1621,8 @@ mod component_tests {
         let stage = root.path().join(&stage_name);
         fs::write(&stage, b"complete pool").unwrap();
         let (size, sha256) = file_digest_cancel(&stage, &cancel).unwrap();
-        let manifest = component_manifest(&path).unwrap();
+        let manifest = component_manifest(&path, &root.path().join("state")).unwrap();
+        private_dir(manifest.parent().unwrap()).unwrap();
         let artifact = ComponentArtifact {
             schema_version: SCHEMA,
             destination: PathBuf::from("pool.xml"),
@@ -1452,14 +1635,16 @@ mod component_tests {
         atomic_json(&manifest, &artifact).unwrap();
         fs::write(&path, b"complete pool").unwrap();
         assert_eq!(
-            component_exists(&path, "part:1/xml", &cancel)
+            component_exists(&path, "part:1/xml", &cancel, &root.path().join("state"))
                 .unwrap_err()
                 .code,
             ErrorCode::Conflict
         );
         fs::remove_file(&path).unwrap();
         fs::hard_link(&stage, &path).unwrap();
-        assert!(component_exists(&path, "part:1/xml", &cancel).unwrap());
+        assert!(
+            component_exists(&path, "part:1/xml", &cancel, &root.path().join("state")).unwrap()
+        );
         assert!(!stage.exists());
         assert!(read_json::<ComponentArtifact>(&manifest).unwrap().promoted);
     }
@@ -1470,12 +1655,55 @@ mod component_tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert_eq!(
-            write_component(&path, b"content", "part:1/srt", &cancel)
-                .unwrap_err()
-                .code,
+            write_component(
+                &path,
+                b"content",
+                "part:1/srt",
+                &cancel,
+                &root.path().join("state")
+            )
+            .unwrap_err()
+            .code,
             ErrorCode::Cancelled
         );
         assert!(!path.exists());
-        assert!(!component_manifest(&path).unwrap().exists());
+        assert!(!component_manifest(&path, &root.path().join("state"))
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn component_metadata_stays_private_and_same_names_in_different_folders_do_not_collide() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("state");
+        let cancel = CancellationToken::new();
+        for (folder, bytes) in [("one", b"first".as_slice()), ("two", b"second".as_slice())] {
+            let output = root.path().join(folder).join("subtitle.srt");
+            write_component(&output, bytes, folder, &cancel, &store).unwrap();
+            assert!(component_exists(&output, folder, &cancel, &store).unwrap());
+            assert_eq!(fs::read(&output).unwrap(), bytes);
+            assert_eq!(fs::read_dir(output.parent().unwrap()).unwrap().count(), 1);
+        }
+        assert_eq!(fs::read_dir(store.join("components")).unwrap().count(), 4);
+    }
+
+    #[test]
+    fn legacy_component_proof_moves_to_state_without_losing_ownership_or_snapshot_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("state");
+        let output = root.path().join("output").join("subtitle.srt");
+        let cancel = CancellationToken::new();
+        write_component(&output, b"preserved", "same component", &cancel, &store).unwrap();
+        let manifest = component_manifest(&output, &store).unwrap();
+        let legacy = legacy_component_manifest(&output).unwrap();
+        fs::rename(&manifest, &legacy).unwrap();
+        fs::write(legacy.with_extension("lock"), b"").unwrap();
+        assert!(component_exists(&output, "same component", &cancel, &store).unwrap());
+        assert!(manifest.exists());
+        assert!(!legacy.exists());
+        assert!(!legacy.with_extension("lock").exists());
+        write_component(&output, b"new snapshot", "same component", &cancel, &store).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"preserved");
+        assert_eq!(fs::read_dir(output.parent().unwrap()).unwrap().count(), 1);
     }
 }

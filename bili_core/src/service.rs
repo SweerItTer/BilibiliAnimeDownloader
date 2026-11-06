@@ -860,9 +860,10 @@ impl Reducer {
                             .recycle
                             .expect("recycle adapter validated before maintenance");
                         self.maintenance_ids.extend(ids.iter().copied());
+                        let state_dir = self.config.state_dir.clone();
                         self.maintenance.spawn(async move {
                             let result = tokio::task::spawn_blocking(move || {
-                                state::recycle_outputs(&records, recycle)
+                                state::recycle_outputs(&records, recycle, &state_dir)
                             })
                             .await
                             .map_err(|_| {
@@ -1550,10 +1551,16 @@ impl Worker {
             _=self.cancel.cancelled()=>return Err(CoreError::new(ErrorCode::Cancelled,"job credentials cancelled")),
             auth=self.auth.lock()=>auth,
         };
-        let credentials = auth.session(profile_id)?;
+        let credentials = auth.session(profile_id);
         drop(auth);
-        self.api = Arc::new(self.api.with_credentials(credentials.clone()));
-        self.credentials = credentials;
+        let credential_error = match credentials {
+            Ok(credentials) => {
+                self.api = Arc::new(self.api.with_credentials(credentials.clone()));
+                self.credentials = credentials;
+                None
+            }
+            Err(error) => Some(error),
+        };
         // A completed video survives a failed sidecar; retry only requested components.
         if self.record.completion.is_some() {
             self.phase(JobPhase::Verifying).await?;
@@ -1590,9 +1597,10 @@ impl Worker {
                         .collect();
                     if !paths.is_empty() {
                         let cancel = self.cancel.clone();
+                        let state_dir = self.config.state_dir.clone();
                         retry = !tokio::task::spawn_blocking(move || -> Result<bool> {
                             for path in paths {
-                                if !state::verify_component(&path, &cancel)? {
+                                if !state::verify_component(&path, &cancel, &state_dir)? {
                                     return Ok(false);
                                 }
                             }
@@ -1609,7 +1617,7 @@ impl Worker {
                 }
                 if retry {
                     if let Some(plan) = &self.record.snapshot.plan {
-                        let components = self.sidecars(plan).await;
+                        let components = self.sidecars(plan, credential_error.as_ref()).await;
                         self.update(Update::Components(components.clone())).await?;
                         if components.iter().any(|c| c.error.is_some()) {
                             return Err(CoreError::new(
@@ -1675,35 +1683,42 @@ impl Worker {
                 .as_ref()
                 .ok_or_else(|| CoreError::new(ErrorCode::Corruption, "job has no plan"))?
                 .clone();
-            let locators = self.api.locators(&plan).await?;
-            let resources: Vec<ResourceRecord> = locators
-                .iter()
-                .enumerate()
-                .map(|(i, l)| ResourceRecord {
-                    name: format!("resource-{i}.media"),
-                    identity: l.identity.clone(),
-                })
-                .collect();
-            if !self.record.resources.is_empty()
-                && (self.record.resources.len() != resources.len()
-                    || self
-                        .record
-                        .resources
-                        .iter()
-                        .zip(&resources)
-                        .any(|(old, new)| old.identity != new.identity))
-            {
-                return Err(CoreError::new(
-                    ErrorCode::RepresentationChanged,
-                    "resource identity changed",
-                ));
-            }
-            self.update(Update::Resources(resources.clone())).await?;
-            self.record.resources = resources;
-            self.phase(JobPhase::Downloading).await?;
-            let paths = self.transfer_resources(&plan, &locators).await?;
+            let paths = if let Some(paths) = self.completed_resources(&plan).await? {
+                paths
+            } else {
+                if let Some(error) = &credential_error {
+                    return Err(error.clone());
+                }
+                let locators = self.api.locators(&plan).await?;
+                let resources: Vec<ResourceRecord> = locators
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| ResourceRecord {
+                        name: format!("resource-{i}.media"),
+                        identity: l.identity.clone(),
+                    })
+                    .collect();
+                if !self.record.resources.is_empty()
+                    && (self.record.resources.len() != resources.len()
+                        || self
+                            .record
+                            .resources
+                            .iter()
+                            .zip(&resources)
+                            .any(|(old, new)| old.identity != new.identity))
+                {
+                    return Err(CoreError::new(
+                        ErrorCode::RepresentationChanged,
+                        "resource identity changed",
+                    ));
+                }
+                self.update(Update::Resources(resources.clone())).await?;
+                self.record.resources = resources;
+                self.phase(JobPhase::Downloading).await?;
+                self.transfer_resources(&plan, &locators).await?
+            };
             if plan.merge == MergePolicy::Manual {
-                let components = self.sidecars(&plan).await;
+                let components = self.sidecars(&plan, credential_error.as_ref()).await;
                 self.update(Update::Components(components.clone())).await?;
                 if components.iter().any(|c| c.error.is_some()) {
                     return Err(CoreError::new(
@@ -1756,7 +1771,7 @@ impl Worker {
             .map(|p| p.fingerprint.clone())
             .unwrap_or_else(|| format!("manual:{}", self.id()));
         let components = if let Some(plan) = &self.record.snapshot.plan {
-            self.sidecars(plan).await
+            self.sidecars(plan, credential_error.as_ref()).await
         } else {
             Vec::new()
         };
@@ -1800,6 +1815,44 @@ impl Worker {
         state::clean_staging(&self.record, false)?;
         Ok(())
     }
+    async fn completed_resources(
+        &self,
+        plan: &StreamPlan,
+    ) -> Result<Option<Vec<std::path::PathBuf>>> {
+        if self.record.resources.is_empty() {
+            return Ok(None);
+        }
+        let expected = crate::api::planned_resource_identities(plan)?;
+        // Segmented DASH can have multiple locators per representation. Its
+        // mapping is resolved by the existing exact-key locator path instead.
+        if expected.len() != self.record.resources.len() {
+            return Ok(None);
+        }
+        if expected.iter().zip(&self.record.resources).enumerate().any(
+            |(index, (identity, resource))| {
+                resource.identity != *identity || resource.name != format!("resource-{index}.media")
+            },
+        ) {
+            return Err(CoreError::new(
+                ErrorCode::RepresentationChanged,
+                "resource identity changed",
+            ));
+        }
+        let mut paths = Vec::new();
+        let mut total = 0u64;
+        for resource in &self.record.resources {
+            let path = self.journal.owned_file(self.id(), &resource.name)?;
+            let Some(bytes) = crate::download::completed_resource(&path, &self.cancel).await?
+            else {
+                return Ok(None);
+            };
+            total = total.saturating_add(bytes);
+            paths.push(path);
+        }
+        self.report_progress(total).await?;
+        Ok(Some(paths))
+    }
+
     async fn transfer_resources(
         &self,
         plan: &StreamPlan,
@@ -1905,9 +1958,21 @@ impl Worker {
             .await
             .map_err(|_| CoreError::new(ErrorCode::Shutdown, "job reducer unavailable"))
     }
-    async fn sidecars(&self, plan: &StreamPlan) -> Vec<ComponentResult> {
+    async fn sidecars(
+        &self,
+        plan: &StreamPlan,
+        credential_error: Option<&CoreError>,
+    ) -> Vec<ComponentResult> {
         if matches!(plan.sidecars.subtitles, SubtitleSelection::None) && !plan.sidecars.danmaku {
             return Vec::new();
+        }
+        if let Some(error) = credential_error {
+            return vec![ComponentResult {
+                name: "sidecars".into(),
+                path: None,
+                error: Some(error.clone()),
+                omissions: 0,
+            }];
         }
         let permit = tokio::select! {
             _=self.cancel.cancelled()=>Err(CoreError::new(ErrorCode::Cancelled,"sidecars cancelled")),
@@ -1931,6 +1996,7 @@ impl Worker {
             &self.sidecar_client,
             &self.credentials,
             &self.cancel,
+            &self.config.state_dir,
         )
         .await
     }
@@ -2079,6 +2145,134 @@ mod lifecycle_tests {
         assert!(reopened.jobs().borrow().jobs.is_empty());
         reopened.shutdown(StopMode::Pause).await.unwrap();
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_remuxes_complete_downloads_without_contacting_the_api() {
+        retry_complete_download(false).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_sidecar_account_preserves_a_successfully_remuxed_video() {
+        retry_complete_download(true).await;
+    }
+    async fn retry_complete_download(with_sidecars: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = CoreConfig::new(root.path().join("state"), root.path().join("out"));
+        // An unrelated replay entry makes any attempted API contact fail offline.
+        let replay_path = root.path().join("empty-replay.json");
+        std::fs::write(
+            &replay_path,
+            br#"{"schema_version":1,"responses":[{"path":"/unused","body":{}}]}"#,
+        )
+        .unwrap();
+        config.api_replay = Some(crate::OfflineApiReplay::load(&replay_path).unwrap());
+        let corpus = std::env::var_os("BILI_MEDIA_FIXTURES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/media-fixtures")
+            });
+        let source = corpus.join("h264-aac.mp4");
+        let destination = root.path().join("recovered.mp4");
+        let mut plan = offline_plan(destination.clone());
+        plan.video.width = Some(64);
+        plan.video.height = Some(64);
+        plan.video.fps = Some(Rational {
+            numerator: 12345,
+            denominator: 1000,
+        });
+        plan.sidecars = if with_sidecars {
+            SidecarPolicy::default()
+        } else {
+            SidecarPolicy {
+                subtitles: SubtitleSelection::None,
+                danmaku: false,
+            }
+        };
+        plan.keep_temp = true;
+        plan.context.as_mut().unwrap().profile_id = Some("removed-session-profile".into());
+        plan.fingerprint = crate::api::plan_fingerprint(&plan).unwrap();
+        let mut record = JobRecord::planned(JobId::new(), plan.clone());
+        record.snapshot.phase = JobPhase::NeedsAttention;
+        record.snapshot.error = Some(CoreError::new(
+            ErrorCode::RepresentationChanged,
+            "selected representation verification",
+        ));
+        let journal = Journal::open(&config.state_dir, StateMode::ReadWrite).unwrap();
+        let input = journal
+            .owned_file(record.snapshot.id, "resource-0.media")
+            .unwrap();
+        std::fs::copy(&source, &input).unwrap();
+        let (size, digest) = state::file_digest_cancel(&input, &CancellationToken::new()).unwrap();
+        state::atomic_json(
+            &input.with_extension("media.checkpoint.json"),
+            &ResourceCheckpoint {
+                durable_bytes: size,
+                expected_total: Some(size),
+                strong_etag: None,
+                sha256: Some(digest.clone()),
+                complete: true,
+            },
+        )
+        .unwrap();
+        record.resources.push(ResourceRecord {
+            name: "resource-0.media".into(),
+            identity: crate::api::planned_resource_identities(&plan)
+                .unwrap()
+                .remove(0),
+        });
+        let id = record.snapshot.id;
+        journal.save(1, &mut [record], None).unwrap();
+        drop(journal);
+        let core = Core::new(config.clone(), Handle::current()).unwrap();
+        core.control(id, JobAction::Retry).await.unwrap();
+        let mut jobs = core.jobs();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let job = jobs.borrow().jobs[0].clone();
+                if matches!(
+                    job.phase,
+                    JobPhase::Completed | JobPhase::Failed | JobPhase::NeedsAttention
+                ) {
+                    break job;
+                }
+                jobs.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        core.shutdown(StopMode::Pause).await.unwrap();
+        assert_eq!(
+            completed.phase,
+            if with_sidecars {
+                JobPhase::Failed
+            } else {
+                JobPhase::Completed
+            },
+            "{:?}",
+            completed.error
+        );
+        if with_sidecars {
+            assert!(completed.components.iter().any(|component| component
+                .error
+                .as_ref()
+                .is_some_and(|error| {
+                    error.code == ErrorCode::LoginRequired
+                        && error.operation == "selected credential profile unavailable"
+                })));
+        }
+        assert_eq!(completed.downloaded, size);
+        assert!(destination.is_file());
+        assert_eq!(
+            state::file_digest_cancel(&input, &CancellationToken::new())
+                .unwrap()
+                .1,
+            digest
+        );
+        let recovered = Journal::open(&config.state_dir, StateMode::ReadOnly)
+            .unwrap()
+            .load()
+            .unwrap()
+            .1;
+        assert!(recovered[0].completion.as_ref().unwrap().promoted);
+    }
     #[tokio::test]
     async fn a_batch_cannot_change_the_rate_of_previously_admitted_jobs() {
         let root = tempfile::tempdir().unwrap();
@@ -2105,6 +2299,78 @@ mod lifecycle_tests {
         assert_eq!(core.jobs().borrow().jobs.len(), 1);
         assert_eq!(core.jobs().borrow().jobs[0].phase, JobPhase::Paused);
         core.shutdown(StopMode::Pause).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recycling_project_outputs_removes_only_an_empty_generated_project_folder() {
+        fn remove_test_outputs(paths: &[std::path::PathBuf]) -> Result<()> {
+            for path in paths {
+                std::fs::remove_file(path).map_err(CoreError::io)?;
+            }
+            Ok(())
+        }
+        for keep_notes in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = CoreConfig::new(root.path().join("state"), root.path().join("output"));
+            config.recycle = Some(RecycleBin {
+                move_files: remove_test_outputs,
+            });
+            let directory = config.output_dir.join("source project_av7");
+            std::fs::create_dir_all(&directory).unwrap();
+            let video = directory.join("video.mp4");
+            std::fs::write(&video, b"verified video fixture").unwrap();
+            let subtitle = directory.join("video.srt");
+            let cancel = CancellationToken::new();
+            state::write_component(
+                &subtitle,
+                b"subtitle",
+                "fixture/subtitle",
+                &cancel,
+                &config.state_dir,
+            )
+            .unwrap();
+            let plan = offline_plan(video.clone());
+            let mut record = JobRecord::planned(JobId::new(), plan.clone());
+            record.snapshot.phase = JobPhase::Completed;
+            record.snapshot.output = Some(video.clone());
+            record.snapshot.components.push(ComponentResult {
+                name: "subtitle".into(),
+                path: Some(subtitle.clone()),
+                error: None,
+                omissions: 0,
+            });
+            let (size, sha256) = state::file_digest_cancel(&video, &cancel).unwrap();
+            record.completion = Some(Completion {
+                size,
+                sha256,
+                fingerprint: plan.fingerprint.clone(),
+                promoted: true,
+            });
+            let id = record.snapshot.id;
+            if keep_notes {
+                std::fs::write(directory.join("notes.txt"), b"user file").unwrap();
+            }
+            let journal = Journal::open(&config.state_dir, StateMode::ReadWrite).unwrap();
+            journal.save(1, &mut [record], None).unwrap();
+            drop(journal);
+            let core = Core::new(config.clone(), Handle::current()).unwrap();
+            let result = core
+                .remove_jobs(vec![id], RemoveMode::RecycleFiles)
+                .await
+                .unwrap();
+            core.shutdown(StopMode::Pause).await.unwrap();
+            assert_eq!(result.removed, vec![id]);
+            assert!(result.errors.is_empty());
+            assert!(!video.exists() && !subtitle.exists());
+            assert!(config.output_dir.is_dir());
+            assert_eq!(directory.exists(), keep_notes);
+            if keep_notes {
+                assert_eq!(
+                    std::fs::read(directory.join("notes.txt")).unwrap(),
+                    b"user file"
+                );
+            }
+        }
     }
     #[tokio::test]
     async fn completed_re_admission_cannot_replace_original_batch_profile_or_project() {

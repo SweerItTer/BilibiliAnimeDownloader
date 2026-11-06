@@ -233,3 +233,51 @@ async fn ignored_range_reports_only_the_invalidated_resource_reset() {
     assert!(run.request.contains("\r\nif-range: \"v1\"\r\n"));
     assert_completed(&run);
 }
+
+#[tokio::test]
+async fn completed_inputs_require_matching_identity_and_digest_without_modifying_files() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut worker, mut plan, _receiver) =
+        worker(root.path(), b"def", checkpoint(b"def", 3, true));
+    plan.topology = StreamTopology::Dash;
+    let mut audio = plan.video.clone();
+    audio.audio = true;
+    plan.audio = Some(audio);
+    for (resource, identity) in worker
+        .record
+        .resources
+        .iter_mut()
+        .zip(crate::api::planned_resource_identities(&plan).unwrap())
+    {
+        resource.identity = identity;
+    }
+    let paths = worker.completed_resources(&plan).await.unwrap().unwrap();
+    assert_eq!(paths.len(), 2);
+    assert_eq!(std::fs::read(&paths[1]).unwrap(), b"def");
+    worker.record.resources.push(ResourceRecord {
+        name: "resource-2.media".into(),
+        identity: "additional DASH segment".into(),
+    });
+    assert!(worker.completed_resources(&plan).await.unwrap().is_none());
+    worker.record.resources.pop();
+    let checkpoint_path = paths[1].with_extension("media.checkpoint.json");
+    let proof = std::fs::read(&checkpoint_path).unwrap();
+    std::fs::write(&paths[1], b"bad").unwrap();
+    assert_eq!(
+        worker.completed_resources(&plan).await.unwrap_err().code,
+        ErrorCode::Corruption
+    );
+    assert_eq!(std::fs::read(&paths[1]).unwrap(), b"bad");
+    assert_eq!(std::fs::read(&checkpoint_path).unwrap(), proof);
+    std::fs::write(&paths[1], b"def").unwrap();
+    worker.record.resources[0].identity = "different representation".into();
+    assert_eq!(
+        worker.completed_resources(&plan).await.unwrap_err().code,
+        ErrorCode::RepresentationChanged
+    );
+    worker.record.resources[0].identity = crate::api::planned_resource_identities(&plan)
+        .unwrap()
+        .remove(0);
+    state::atomic_json(&checkpoint_path, &checkpoint(b"def", 6, false)).unwrap();
+    assert!(worker.completed_resources(&plan).await.unwrap().is_none());
+}

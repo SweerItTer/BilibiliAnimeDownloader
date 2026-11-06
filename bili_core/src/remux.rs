@@ -650,22 +650,11 @@ fn validate_representation(expected: &RepresentationKey, actual: &ProbedStream) 
                 }
             }
         }
-        if let Some(fps) = &expected.fps {
-            let (Some(num), Some(den)) = (actual.frame_rate_num, actual.frame_rate_den) else {
-                return Err(invalid());
-            };
-            let expected_num = fps.numerator as i128;
-            let expected_den = fps.denominator as i128;
-            let actual_num = num as i128;
-            let actual_den = den as i128;
-            if expected_den == 0
-                || actual_den <= 0
-                || (actual_num * expected_den - expected_num * actual_den).abs() * 100
-                    > (expected_num * actual_den).abs().max(1)
-            {
-                return Err(invalid());
-            }
-        }
+        // API frameRate describes the catalogue entry, not an encoded-stream
+        // requirement. It can disagree with both header and packet timing
+        // (e.g. 24.390 advertised for a 24000/1001 stream). Keep the original
+        // key for exact locator renewal; remux verifies native input/output
+        // timing with the unchanged same_rate check above.
     }
     if expected.audio {
         if let Some(rate) = expected.sample_rate {
@@ -911,5 +900,43 @@ mod representation_validation_tests {
         let mut wrong_audio_channels = matching_audio;
         wrong_audio_channels.audio.as_mut().unwrap().channels = Some(1);
         assert_representation_changed(&audio_probe, &wrong_audio_channels);
+    }
+    #[test]
+    fn advertised_frame_rate_does_not_reject_verified_native_packet_timing() {
+        let mut selected = plan();
+        selected.video.codec = "hev1.1.6.L153.90".into();
+        selected.video.width = Some(3840);
+        selected.video.height = Some(2160);
+        selected.video.fps = Some(Rational {
+            numerator: 24_390,
+            denominator: 1000,
+        });
+        let original = selected.video.clone();
+        let mut probe = native_probe();
+        probe.streams[0].codec = "HEVC".into();
+        probe.streams[0].width = Some(3840);
+        probe.streams[0].height = Some(2160);
+        probe.streams[0].frame_rate_num = Some(24_000);
+        probe.streams[0].frame_rate_den = Some(1001);
+        assert!(validate_plan(&probe, &selected).is_ok());
+        assert_eq!(
+            selected.video, original,
+            "renewal identity must retain the original API key"
+        );
+        assert!(same_rate(
+            Some(24_000),
+            Some(1001),
+            Some(24_000),
+            Some(1001)
+        ));
+        assert!(
+            !same_rate(Some(24_000), Some(1001), Some(30), Some(1)),
+            "native packet-copy frame-rate checks remain strict"
+        );
+        probe.streams[0].width = Some(1920);
+        assert_representation_changed(&probe, &selected);
+        probe.streams[0].width = Some(3840);
+        probe.streams[0].codec = "H264".into();
+        assert_representation_changed(&probe, &selected);
     }
 }

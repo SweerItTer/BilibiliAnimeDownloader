@@ -1746,16 +1746,7 @@ fn locator(
         .host_str()
         .ok_or_else(|| invalid("stream host missing"))?
         .to_owned();
-    let identity_bytes = serde_json::to_vec(key)
-        .map_err(|_| CoreError::new(ErrorCode::Corruption, "serialize stream identity"))?;
-    let identity_hash = Sha256::digest(identity_bytes);
-    let identity = format!(
-        "{}:{}:{:x}:{}",
-        part.aid.get(),
-        part.cid.get(),
-        identity_hash,
-        ordinal
-    );
+    let identity = resource_identity(part, key, ordinal)?;
     Ok(ResolvedLocator {
         url,
         referer: REFERER.into(),
@@ -1764,6 +1755,34 @@ fn locator(
         expected_size: size,
         allowed_origins: vec![origin],
     })
+}
+fn resource_identity(part: &PartRef, key: &RepresentationKey, ordinal: u32) -> Result<String> {
+    let identity_bytes = serde_json::to_vec(key)
+        .map_err(|_| CoreError::new(ErrorCode::Corruption, "serialize stream identity"))?;
+    let identity_hash = Sha256::digest(identity_bytes);
+    Ok(format!(
+        "{}:{}:{:x}:{}",
+        part.aid.get(),
+        part.cid.get(),
+        identity_hash,
+        ordinal
+    ))
+}
+pub(crate) fn planned_resource_identities(plan: &StreamPlan) -> Result<Vec<String>> {
+    let keys: Vec<_> = match plan.topology {
+        StreamTopology::Dash => std::iter::once((&plan.video, 0))
+            .chain(plan.audio.iter().map(|key| (key, 0)))
+            .collect(),
+        StreamTopology::Direct => vec![(&plan.video, 0)],
+        StreamTopology::Sequential => plan
+            .segments
+            .iter()
+            .map(|segment| (&plan.video, segment.ordinal))
+            .collect(),
+    };
+    keys.into_iter()
+        .map(|(key, ordinal)| resource_identity(&plan.part, key, ordinal))
+        .collect()
 }
 fn stream_url(v: &Value) -> Result<Option<Url>> {
     let mut invalid_candidate = None;
