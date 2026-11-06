@@ -106,11 +106,11 @@ def fixture_data() -> dict:
     for section in (1, 2, 3, 4, 5, 7):
         row = {"season_id": 9001 if section in (1, 4) else 9002,
                "title": "离线番剧样例" if section in (1, 4) else "离线影视样例"}
-        add("/pgc/season/index/condition", {"season_type": section, "type": 0},
+        add("/pgc/season/index/condition", {"season_type": section, "type": 1},
             {"code": 0, "data": {"filter": [{"field": "style_id", "name": "风格", "values": [
                 {"keyword": "-1", "name": "全部"}, {"keyword": "1", "name": "演示类型"}]}]}})
         for genre in (-1, 1):
-            add("/pgc/season/index/result", {"season_type": section, "type": 0,
+            add("/pgc/season/index/result", {"season_type": section, "st": section,
                 "style_id": genre, "page": 1, "pagesize": 20},
                 {"code": 0, "data": {"list": [row], "total": 1, "size": 20, "has_next": 0}})
     # A documented keyword exercises real signed search, sorting and paging.

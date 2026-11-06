@@ -312,31 +312,109 @@ impl PgcSection {
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenreChoice {
-    pub id: i64,
+pub struct BrowseChoice {
+    pub value: String,
     pub label: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowseFilterField {
+    SeasonVersion,
+    SpokenLanguageType,
+    Area,
+    IsFinish,
+    Copyright,
+    SeasonStatus,
+    SeasonMonth,
+    Year,
+    StyleId,
+    ReleaseDate,
+    ProducerId,
+}
+impl BrowseFilterField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SeasonVersion => "season_version",
+            Self::SpokenLanguageType => "spoken_language_type",
+            Self::Area => "area",
+            Self::IsFinish => "is_finish",
+            Self::Copyright => "copyright",
+            Self::SeasonStatus => "season_status",
+            Self::SeasonMonth => "season_month",
+            Self::Year => "year",
+            Self::StyleId => "style_id",
+            Self::ReleaseDate => "release_date",
+            Self::ProducerId => "producer_id",
+        }
+    }
+    pub(crate) fn from_api(field: &str) -> Option<Self> {
+        [
+            Self::SeasonVersion,
+            Self::SpokenLanguageType,
+            Self::Area,
+            Self::IsFinish,
+            Self::Copyright,
+            Self::SeasonStatus,
+            Self::SeasonMonth,
+            Self::Year,
+            Self::StyleId,
+            Self::ReleaseDate,
+            Self::ProducerId,
+        ]
+        .into_iter()
+        .find(|choice| choice.as_str() == field)
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowseFilterGroup {
+    pub field: BrowseFilterField,
+    pub label: String,
+    pub choices: Vec<BrowseChoice>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowseOrderChoice {
+    pub id: u32,
+    pub label: String,
+    pub sorts: Vec<u8>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowseConditions {
     pub section: PgcSection,
-    pub genres: Vec<GenreChoice>,
+    pub filters: Vec<BrowseFilterGroup>,
+    pub orders: Vec<BrowseOrderChoice>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowseQuery {
     pub section: PgcSection,
-    pub genre: Option<i64>,
+    pub filters: std::collections::BTreeMap<BrowseFilterField, String>,
+    pub order: Option<u32>,
+    pub sort: u8,
     pub page: u32,
     pub page_size: u32,
 }
 impl BrowseQuery {
+    pub fn new(section: PgcSection) -> Self {
+        Self {
+            section,
+            filters: Default::default(),
+            order: None,
+            sort: 0,
+            page: 1,
+            page_size: 20,
+        }
+    }
     pub fn validate(&self) -> Result<()> {
         if self.page == 0
             || self.page > 1000
             || self.page_size == 0
             || self.page_size > 30
+            || self.sort > 1
+            || self.order.is_some_and(|order| order > 8)
             || self
-                .genre
-                .is_some_and(|id| !(-1..=i64::from(u32::MAX)).contains(&id))
+                .filters
+                .values()
+                .any(|value| !valid_browse_value(value))
         {
             return Err(CoreError::new(
                 ErrorCode::InvalidInput,
@@ -345,6 +423,13 @@ impl BrowseQuery {
         }
         Ok(())
     }
+}
+pub(crate) fn valid_browse_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || b"-,[](): ".contains(&byte))
 }
 impl SearchQuery {
     /// Validate before authentication, signing, or submitting a network request.

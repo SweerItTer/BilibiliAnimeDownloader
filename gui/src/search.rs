@@ -101,6 +101,8 @@ pub struct SearchState {
     requested_browse: Option<BrowseQuery>,
     conditions: Option<BrowseConditions>,
     condition_cache: std::collections::HashMap<PgcSection, BrowseConditions>,
+    browse_history: std::collections::HashMap<PgcSection, BrowseQuery>,
+    filter_notice: Option<String>,
     pub home_requested: bool,
 }
 impl Default for SearchState {
@@ -125,6 +127,8 @@ impl Default for SearchState {
             requested_browse: None,
             conditions: None,
             condition_cache: Default::default(),
+            browse_history: Default::default(),
+            filter_notice: None,
             home_requested: false,
         }
     }
@@ -133,6 +137,9 @@ impl SearchState {
     pub fn accept_results(&mut self, results: CandidatePage) {
         self.reset_scroll = true;
         self.browse = self.requested_browse.take();
+        if let Some(query) = &self.browse {
+            self.browse_history.insert(query.section, query.clone());
+        }
         self.results = Some(results);
         self.submitted = self.requested.take();
         self.started = None;
@@ -245,12 +252,77 @@ impl SearchState {
         Some(Operation::Search(query))
     }
     pub fn accept_conditions(&mut self, conditions: BrowseConditions) -> Operation {
-        let query = BrowseQuery {
-            section: conditions.section,
-            genre: None,
-            page: 1,
-            page_size: 20,
-        };
+        let previous = self
+            .requested_browse
+            .clone()
+            .or_else(|| self.browse.clone());
+        let mut query = self
+            .browse_history
+            .get(&conditions.section)
+            .cloned()
+            .unwrap_or_else(|| BrowseQuery::new(conditions.section));
+        query.page = 1;
+        let mut removed = Vec::new();
+        if let Some(previous) = previous {
+            for group in &conditions.filters {
+                if self
+                    .conditions
+                    .as_ref()
+                    .is_some_and(|old| old.filters.iter().any(|choice| choice.field == group.field))
+                {
+                    let value = previous
+                        .filters
+                        .get(&group.field)
+                        .map_or("-1", String::as_str);
+                    if group.choices.iter().any(|choice| choice.value == value) {
+                        if value == "-1" {
+                            query.filters.remove(&group.field);
+                        } else {
+                            query.filters.insert(group.field, value.to_owned());
+                        }
+                    } else {
+                        query.filters.remove(&group.field);
+                        if value != "-1" {
+                            removed.push(group.label.clone());
+                        }
+                    }
+                }
+            }
+            for field in previous.filters.keys() {
+                if !conditions.filters.iter().any(|group| group.field == *field) {
+                    if let Some(label) = self
+                        .conditions
+                        .as_ref()
+                        .and_then(|old| old.filters.iter().find(|group| group.field == *field))
+                        .map(|group| group.label.clone())
+                    {
+                        removed.push(label);
+                    }
+                }
+            }
+            query.order = previous.order;
+            query.sort = previous.sort;
+        }
+        query.filters.retain(|field, value| {
+            conditions.filters.iter().any(|group| {
+                group.field == *field && group.choices.iter().any(|choice| choice.value == *value)
+            })
+        });
+        if !conditions
+            .orders
+            .iter()
+            .any(|choice| Some(choice.id) == query.order && choice.sorts.contains(&query.sort))
+        {
+            query.order = conditions.orders.first().map(|choice| choice.id);
+            query.sort = conditions
+                .orders
+                .first()
+                .and_then(|choice| choice.sorts.first())
+                .copied()
+                .unwrap_or(0);
+        }
+        self.filter_notice = (!removed.is_empty())
+            .then(|| format!("当前分区不支持这些筛选，已移除：{}", removed.join("、")));
         self.condition_cache
             .insert(conditions.section, conditions.clone());
         self.conditions = Some(conditions);
@@ -384,39 +456,89 @@ impl SearchState {
                     });
                     if let Some(conditions) = &self.conditions {
                         if conditions.section.category() == self.category {
-                            let current = self
+                            let mut query = self
                                 .requested_browse
                                 .as_ref()
                                 .or(self.browse.as_ref())
-                                .and_then(|q| q.genre);
-                            let mut next = current;
+                                .filter(|query| query.section == conditions.section)
+                                .cloned()
+                                .unwrap_or_else(|| BrowseQuery::new(conditions.section));
                             let mut changed = false;
                             ui.horizontal_wrapped(|ui| {
-                                if ui.selectable_label(current.is_none(), "全部类型").clicked()
-                                {
-                                    next = None;
-                                    changed = true;
+                                for group in &conditions.filters {
+                                    ui.horizontal(|ui| {
+                                        ui.label(&group.label);
+                                        let mut value = query
+                                            .filters
+                                            .get(&group.field)
+                                            .cloned()
+                                            .unwrap_or_else(|| "-1".into());
+                                        let label = group
+                                            .choices
+                                            .iter()
+                                            .find(|choice| choice.value == value)
+                                            .map_or("全部", |choice| choice.label.as_str());
+                                        egui::ComboBox::from_id_salt(("pgc-filter", group.field))
+                                            .selected_text(label)
+                                            .width(132.0)
+                                            .height(320.0)
+                                            .show_ui(ui, |ui| {
+                                                for choice in &group.choices {
+                                                    if ui
+                                                        .selectable_value(
+                                                            &mut value,
+                                                            choice.value.clone(),
+                                                            &choice.label,
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        changed = true;
+                                                    }
+                                                }
+                                            });
+                                        if value == "-1" {
+                                            query.filters.remove(&group.field);
+                                        } else {
+                                            query.filters.insert(group.field, value);
+                                        }
+                                    });
                                 }
-                                for genre in &conditions.genres {
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                for order in &conditions.orders {
                                     if ui
-                                        .selectable_label(current == Some(genre.id), &genre.label)
+                                        .selectable_label(
+                                            query.order == Some(order.id),
+                                            &order.label,
+                                        )
                                         .clicked()
                                     {
-                                        next = Some(genre.id);
+                                        query.order = Some(order.id);
+                                        if !order.sorts.contains(&query.sort) {
+                                            query.sort = order.sorts[0];
+                                        }
                                         changed = true;
                                     }
                                 }
+                                if conditions.orders.iter().any(|order| {
+                                    Some(order.id) == query.order && order.sorts.len() > 1
+                                }) && ui
+                                    .button(if query.sort == 0 { "降序" } else { "升序" })
+                                    .clicked()
+                                {
+                                    query.sort = 1 - query.sort;
+                                    changed = true;
+                                }
                             });
                             if changed {
-                                let query = BrowseQuery {
-                                    section: conditions.section,
-                                    genre: next,
-                                    page: 1,
-                                    page_size: 20,
-                                };
+                                query.page = 1;
+                                self.filter_notice = None;
                                 self.requested = None;
                                 self.requested_browse = Some(query.clone());
                                 action = Some(Operation::Browse(query));
+                            }
+                            if let Some(notice) = &self.filter_notice {
+                                theme::muted(ui, notice);
                             }
                         }
                     }
@@ -1130,7 +1252,8 @@ mod tests {
         ));
         state.accept_conditions(BrowseConditions {
             section: PgcSection::Anime,
-            genres: vec![],
+            filters: vec![],
+            orders: vec![],
         });
         state.accept_results(CandidatePage { pages: vec![] });
         assert!(
@@ -1181,5 +1304,118 @@ mod tests {
             state.results.is_some(),
             "cancellation retains the committed result"
         );
+    }
+
+    #[test]
+    fn pgc_common_filters_survive_section_switches_and_failed_requests_preserve_committed_choices()
+    {
+        use bili_core::{
+            BrowseChoice, BrowseFilterField as Field, BrowseFilterGroup, BrowseOrderChoice,
+        };
+        fn conditions(section: PgcSection) -> BrowseConditions {
+            let mut filters = vec![
+                BrowseFilterGroup {
+                    field: Field::StyleId,
+                    label: "风格".into(),
+                    choices: vec![
+                        BrowseChoice {
+                            value: "-1".into(),
+                            label: "全部".into(),
+                        },
+                        BrowseChoice {
+                            value: "10010".into(),
+                            label: "原创".into(),
+                        },
+                    ],
+                },
+                BrowseFilterGroup {
+                    field: Field::Year,
+                    label: "年份".into(),
+                    choices: vec![
+                        BrowseChoice {
+                            value: "-1".into(),
+                            label: "全部".into(),
+                        },
+                        BrowseChoice {
+                            value: "[2024,2025)".into(),
+                            label: "2024".into(),
+                        },
+                    ],
+                },
+            ];
+            if section == PgcSection::Anime {
+                filters.push(BrowseFilterGroup {
+                    field: Field::SpokenLanguageType,
+                    label: "配音".into(),
+                    choices: vec![
+                        BrowseChoice {
+                            value: "-1".into(),
+                            label: "全部".into(),
+                        },
+                        BrowseChoice {
+                            value: "1".into(),
+                            label: "原声".into(),
+                        },
+                    ],
+                });
+            }
+            BrowseConditions {
+                section,
+                filters,
+                orders: vec![BrowseOrderChoice {
+                    id: 3,
+                    label: "追番人数".into(),
+                    sorts: vec![0, 1],
+                }],
+            }
+        }
+        let mut state = SearchState::default();
+        state.accept_conditions(conditions(PgcSection::Anime));
+        let mut selected = BrowseQuery::new(PgcSection::Anime);
+        selected.filters = [
+            (Field::StyleId, "10010".into()),
+            (Field::Year, "[2024,2025)".into()),
+            (Field::SpokenLanguageType, "1".into()),
+        ]
+        .into();
+        selected.order = Some(3);
+        selected.sort = 1;
+        selected.page = 3;
+        state.set_requested_browse(selected.clone());
+        state.accept_results(CandidatePage { pages: vec![] });
+        let Operation::Browse(next) =
+            state.accept_conditions(conditions(PgcSection::ChineseAnimation))
+        else {
+            panic!("expected browse");
+        };
+        assert_eq!(
+            next.filters.get(&Field::StyleId).map(String::as_str),
+            Some("10010")
+        );
+        assert_eq!(
+            next.filters.get(&Field::Year).map(String::as_str),
+            Some("[2024,2025)")
+        );
+        assert!(!next.filters.contains_key(&Field::SpokenLanguageType));
+        assert!(state.filter_notice.as_ref().unwrap().contains("配音"));
+        assert_eq!((next.page, next.order, next.sort), (1, Some(3), 1));
+        state.discard_request();
+        assert_eq!(state.browse.as_ref(), Some(&selected));
+        state.accept_conditions(conditions(PgcSection::ChineseAnimation));
+        state.accept_results(CandidatePage { pages: vec![] });
+        let Some(Operation::Browse(page)) = state.page(2) else {
+            panic!("expected next page");
+        };
+        assert_eq!(
+            page.filters.get(&Field::StyleId).map(String::as_str),
+            Some("10010")
+        );
+        assert_eq!(page.page, 2);
+        state.discard_request();
+        let Operation::Browse(restored) = state.accept_conditions(conditions(PgcSection::Anime))
+        else {
+            panic!("expected browse");
+        };
+        assert_eq!(restored.filters, selected.filters);
     }
 }

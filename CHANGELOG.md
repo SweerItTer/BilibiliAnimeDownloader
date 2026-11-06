@@ -15,6 +15,21 @@
 
 ### 🐞 Fixes
 
+- Match PGC filtering to the Bilibili web index, including source-provided fields and sorting. Preserve compatible selections between Anime and Chinese Animation and explain unavailable filters.
+- Return to the top after successful discovery pagination or filter changes while preserving position on failed or cancelled requests.
+- Keep internal sidecar JSON/lock files in the state directory, migrate old ownership records, and remove empty generated project folders after recycling media while preserving unrelated files.
+- Bound cover texture caching, skip offscreen image work and avoid copying every result card during each frame.
+
+- Use the current WBI search endpoint and obtain server-issued device cookies when needed. Pause subsequent API requests after HTTP 429 according to `Retry-After`, instead of allowing repeated requests during the cooldown.
+- Retry remuxing complete downloads from their validated local checkpoints without requiring fresh media addresses. Keep incomplete recovery and strict representation, file hash and output checks.
+- Explain when an old task references an unavailable account and direct users to select an existing account, instead of asking a currently logged-in user to scan again.
+- Preserve the active account's task identity when upgrading to remembered login, and offer a direct retry with the current account for old failed tasks. Allow complete media to finish local remux even when the captured account is unavailable; requested sidecar failures remain visible.
+
+- Treat API frame-rate labels as catalogue metadata while retaining strict native packet-copy timing checks, so a mislabeled frame rate does not reject a completed transfer. Preserve original representation keys and recovery files.
+- Simplify account menus and download configuration: show larger quality lists, pin folder/default controls, use a vector close icon, and remove Skip and the duplicate close action. Support opt-in saved login in an explicit persistent GUI profile.
+
+- Move GUI search beside the category tabs, increase text input padding, round filter surfaces and selected sort buttons, and center the empty search prompt. Add an explicit anonymous live launch with private storage and no response replay.
+
 - Keep search, browsing and detail requests visibly pending until they finish or are cancelled. Disable paging and bulk-selection controls during pending work, and retain actionable retry errors until dismissal or retry. Give foreground operations priority over bounded cover requests, retry transient API GET failures within configured limits, and retain safe failure stages and HTTP status codes.
 - Preserve the total validated bytes across video and audio when resuming a download, including retained data in later resources. Continue to reflect real resets when checkpoints are invalid or the server replaces a partial response with a full response.
 - Fill the detail page with a responsive full-width episode grid and a compact single-part download action. Wrap download-dialog episode choices across its available width. Preserve original part selection when reopening details or deliberately preparing a removed task again.
@@ -37,6 +52,7 @@
 
 ### 💥 Breaking Changes
 
+- Replace the genre-only `BrowseQuery` and `BrowseConditions` Rust fields with typed source filter groups, exact values and advertised sorting. Matched SDK consumers must update their callers and rebuild.
 - Add optional `CoreConfig.api_replay` and exported `OfflineApiReplay` for isolated response-data checks. Struct-literal and matched SDK consumers must rebuild; `CoreConfig::new` keeps replay disabled by default.
 - Extend public Rust discovery, plan, error and job structs with typed filters and optional metadata. Source consumers must supply the new fields and rebuild matched SDK binaries; older serialized state defaults missing optional fields. OS recycling is supplied through the trusted host adapter in `CoreConfig`.
 - Add `sort` to the public Rust `SearchQuery` struct. Source callers must supply `SearchSort` and rebuild matched consumers; serialized queries without the field retain the default order.

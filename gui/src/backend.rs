@@ -967,7 +967,8 @@ mod tests {
                         Operation::BrowseConditions(section) => {
                             Ok(Outcome::BrowseConditions(BrowseConditions {
                                 section,
-                                genres: vec![],
+                                filters: vec![],
+                                orders: vec![],
                             }))
                         }
                         _ => Ok(Outcome::Search(CandidatePage { pages: vec![] })),

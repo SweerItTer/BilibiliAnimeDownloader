@@ -329,7 +329,7 @@ impl Api {
                     "/pgc/season/index/condition",
                     &[
                         ("season_type", section.season_type().to_string()),
-                        ("type", "0".into()),
+                        ("type", "1".into()),
                     ],
                 )?,
                 REFERER,
@@ -345,13 +345,10 @@ impl Api {
 
     pub(crate) async fn browse(&self, query: BrowseQuery) -> Result<CandidatePage> {
         query.validate()?;
-        if let Some(genre) = query.genre.filter(|id| *id != -1) {
-            let conditions = self.browse_conditions(query.section).await?;
-            if !conditions.genres.iter().any(|choice| choice.id == genre) {
-                return Err(invalid("PGC genre is unavailable"));
-            }
-        }
-        let value: Value = self.get_json(browse_url(&query)?, REFERER).await?;
+        let conditions = self.browse_conditions(query.section).await?;
+        let value: Value = self
+            .get_json(browse_url(&query, &conditions)?, REFERER)
+            .await?;
         parse_browse_page(&query, &value).map(|page| CandidatePage { pages: vec![page] })
     }
 
@@ -683,51 +680,141 @@ impl Api {
 }
 
 fn parse_browse_conditions(section: PgcSection, value: &Value) -> Result<BrowseConditions> {
-    let data = api_result(value, "load PGC genres")?;
-    let filters = data
+    let data = api_result(value, "load PGC filters")?;
+    let raw_filters = data
         .get("filter")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("PGC condition shape invalid"))?;
-    let mut genres = Vec::new();
-    for filter in filters {
-        // Remote field names never become arbitrary request parameters.
-        if filter.get("field").and_then(Value::as_str) != Some("style_id") {
+    let mut filters = Vec::new();
+    for raw in raw_filters {
+        let Some(field) = raw
+            .get("field")
+            .and_then(Value::as_str)
+            .and_then(BrowseFilterField::from_api)
+        else {
+            continue;
+        };
+        if filters
+            .iter()
+            .any(|group: &BrowseFilterGroup| group.field == field)
+        {
             continue;
         }
-        let values = filter
+        let Some(label) =
+            text(raw.get("name")).filter(|name| !name.is_empty() && name.len() <= 128)
+        else {
+            continue;
+        };
+        let values = raw
             .get("values")
             .and_then(Value::as_array)
-            .ok_or_else(|| invalid("PGC genre shape invalid"))?;
-        for value in values {
-            let id = text_number(value.get("keyword"))
-                .or_else(|| text(value.get("keyword")))
-                .and_then(|id| id.parse::<i64>().ok());
-            let label = text(value.get("name"));
-            if let (Some(id), Some(label)) = (id, label) {
-                if (-1..=i64::from(u32::MAX)).contains(&id)
+            .ok_or_else(|| invalid("PGC filter choices invalid"))?;
+        let mut choices = Vec::new();
+        for raw_choice in values.iter().take(128) {
+            let value =
+                text(raw_choice.get("keyword")).or_else(|| text_number(raw_choice.get("keyword")));
+            let label = text(raw_choice.get("name"));
+            if let (Some(value), Some(label)) = (value, label) {
+                if valid_browse_value(&value)
                     && !label.is_empty()
-                    && !genres.iter().any(|choice: &GenreChoice| choice.id == id)
+                    && label.len() <= 128
+                    && !choices
+                        .iter()
+                        .any(|choice: &BrowseChoice| choice.value == value)
                 {
-                    genres.push(GenreChoice { id, label });
+                    choices.push(BrowseChoice { value, label });
+                }
+            }
+        }
+        if !choices.is_empty() {
+            filters.push(BrowseFilterGroup {
+                field,
+                label,
+                choices,
+            });
+        }
+    }
+    let mut orders = Vec::new();
+    if let Some(raw_orders) = data.get("order").and_then(Value::as_array) {
+        for raw in raw_orders.iter().take(16) {
+            let id = text(raw.get("field"))
+                .or_else(|| text_number(raw.get("field")))
+                .and_then(|id| id.parse::<u32>().ok());
+            let label = text(raw.get("name"));
+            let sorts: Vec<u8> = text(raw.get("sort"))
+                .unwrap_or_else(|| "0".into())
+                .split(',')
+                .filter_map(|sort| sort.parse::<u8>().ok())
+                .filter(|sort| *sort <= 1)
+                .collect();
+            if let (Some(id), Some(label)) = (id.filter(|id| *id <= 8), label) {
+                if !label.is_empty()
+                    && label.len() <= 128
+                    && !sorts.is_empty()
+                    && !orders
+                        .iter()
+                        .any(|order: &BrowseOrderChoice| order.id == id)
+                {
+                    orders.push(BrowseOrderChoice { id, label, sorts });
                 }
             }
         }
     }
-    Ok(BrowseConditions { section, genres })
+    Ok(BrowseConditions {
+        section,
+        filters,
+        orders,
+    })
 }
 
-fn browse_url(query: &BrowseQuery) -> Result<Url> {
+fn browse_url(query: &BrowseQuery, conditions: &BrowseConditions) -> Result<Url> {
     query.validate()?;
-    api_url(
-        "/pgc/season/index/result",
-        &[
-            ("season_type", query.section.season_type().to_string()),
-            ("type", "0".into()),
-            ("style_id", query.genre.unwrap_or(-1).to_string()),
-            ("page", query.page.to_string()),
-            ("pagesize", query.page_size.to_string()),
-        ],
-    )
+    if conditions.section != query.section {
+        return Err(invalid("PGC conditions do not match section"));
+    }
+    for (field, value) in &query.filters {
+        if !conditions.filters.iter().any(|group| {
+            group.field == *field && group.choices.iter().any(|choice| choice.value == *value)
+        }) {
+            return Err(invalid("PGC filter is unavailable"));
+        }
+    }
+    let mut params = vec![
+        ("season_type", query.section.season_type().to_string()),
+        ("st", query.section.season_type().to_string()),
+        ("page", query.page.to_string()),
+        ("pagesize", query.page_size.to_string()),
+    ];
+    for group in &conditions.filters {
+        let choice = query
+            .filters
+            .get(&group.field)
+            .map(String::as_str)
+            .or_else(|| {
+                group
+                    .choices
+                    .iter()
+                    .find(|choice| choice.value == "-1")
+                    .map(|choice| choice.value.as_str())
+            })
+            .or_else(|| group.choices.first().map(|choice| choice.value.as_str()))
+            .ok_or_else(|| invalid("PGC filter choices missing"))?;
+        params.push((group.field.as_str(), choice.to_owned()));
+    }
+    if let Some(id) = query
+        .order
+        .or_else(|| conditions.orders.first().map(|choice| choice.id))
+    {
+        let order = conditions
+            .orders
+            .iter()
+            .find(|choice| choice.id == id)
+            .filter(|choice| choice.sorts.contains(&query.sort))
+            .ok_or_else(|| invalid("PGC order is unavailable"))?;
+        params.push(("order", order.id.to_string()));
+        params.push(("sort", query.sort.to_string()));
+    }
+    api_url("/pgc/season/index/result", &params)
 }
 
 fn parse_browse_page(query: &BrowseQuery, value: &Value) -> Result<CategoryPage> {

@@ -137,18 +137,22 @@ fn pgc_browse_uses_dynamic_genres_and_keeps_unknown_totals_unknown() {
         {"field":"style_id","name":"风格","values":[{"keyword":"-1","name":"全部"},{"keyword":"10012","name":"科幻"}]},
         {"field":"unsafe_remote_parameter","name":"ignored","values":[{"keyword":"1","name":"ignored"}]}
     ]}})).unwrap();
-    assert_eq!(conditions.genres.len(), 2);
-    assert_eq!(conditions.genres[1].id, 10012);
+    assert_eq!(conditions.filters.len(), 1);
+    assert_eq!(conditions.filters[0].choices.len(), 2);
+    assert_eq!(conditions.filters[0].choices[1].value, "10012");
     let query = BrowseQuery {
         section: PgcSection::Film,
-        genre: Some(10012),
+        filters: [(BrowseFilterField::StyleId, "10012".into())].into(),
+        order: None,
+        sort: 0,
         page: 3,
         page_size: 20,
     };
-    let url = browse_url(&query).unwrap();
+    let url = browse_url(&query, &conditions).unwrap();
     let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
     assert_eq!(params.get("season_type").map(String::as_str), Some("2"));
-    assert_eq!(params.get("type").map(String::as_str), Some("0"));
+    assert_eq!(params.get("st").map(String::as_str), Some("2"));
+    assert!(!params.contains_key("type"));
     assert_eq!(params.get("style_id").map(String::as_str), Some("10012"));
     assert!(!params.contains_key("keyword"));
     let page = parse_browse_page(
@@ -168,6 +172,52 @@ fn pgc_browse_uses_dynamic_genres_and_keeps_unknown_totals_unknown() {
     )
     .unwrap();
     assert_eq!(known.total_pages, Some(6));
+}
+
+#[test]
+fn pgc_web_filters_preserve_composite_ranges_and_validate_source_order_choices() {
+    let conditions = parse_browse_conditions(PgcSection::Anime, &json!({"code":0,"data":{
+        "filter":[
+            {"field":"style_id","name":"风格","values":[{"keyword":"-1","name":"全部"},{"keyword":"10010","name":"原创"}]},
+            {"field":"area","name":"地区","values":[{"keyword":"-1","name":"全部"},{"keyword":"1,6,7","name":"国产"}]},
+            {"field":"year","name":"年份","values":[{"keyword":"-1","name":"全部"},{"keyword":"[2024,2025)","name":"2024"}]},
+            {"field":"private_remote_key","name":"ignored","values":[{"keyword":"1","name":"ignored"}]}
+        ], "order":[{"field":"3","name":"追番人数","sort":"0,1"},{"field":"4","name":"评分","sort":"0"}]
+    }})).unwrap();
+    let mut query = BrowseQuery::new(PgcSection::Anime);
+    query.filters = [
+        (BrowseFilterField::StyleId, "10010".into()),
+        (BrowseFilterField::Area, "1,6,7".into()),
+        (BrowseFilterField::Year, "[2024,2025)".into()),
+    ]
+    .into();
+    query.order = Some(3);
+    query.sort = 1;
+    query.page = 2;
+    let url = browse_url(&query, &conditions).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(params.get("style_id").map(String::as_str), Some("10010"));
+    assert_eq!(params.get("area").map(String::as_str), Some("1,6,7"));
+    assert_eq!(params.get("year").map(String::as_str), Some("[2024,2025)"));
+    assert_eq!(params.get("order").map(String::as_str), Some("3"));
+    assert_eq!(params.get("sort").map(String::as_str), Some("1"));
+    assert!(!params.contains_key("private_remote_key"));
+    let mut unavailable = query.clone();
+    unavailable
+        .filters
+        .insert(BrowseFilterField::StyleId, "999999".into());
+    assert_eq!(
+        browse_url(&unavailable, &conditions).unwrap_err().code,
+        ErrorCode::InvalidInput
+    );
+    unavailable = query.clone();
+    unavailable.order = Some(4);
+    assert!(browse_url(&unavailable, &conditions).is_err());
+    unavailable = query;
+    unavailable
+        .filters
+        .insert(BrowseFilterField::ProducerId, "1".into());
+    assert!(browse_url(&unavailable, &conditions).is_err());
 }
 
 #[test]
@@ -614,6 +664,33 @@ fn anonymous_nav_signing_keys_and_wbi_encoding_are_supported() {
 }
 
 #[test]
+fn server_issued_search_device_preserves_account_and_rejects_cookie_injection() {
+    let origin = Url::parse("https://api.bilibili.com/").unwrap();
+    let mut jar = CredentialJar::import_header("SESSDATA=synthetic-account").unwrap();
+    let cookies =
+        search_device_cookies(&json!({"b_3":"server-device-3","b_4":"base64/device+4=="})).unwrap();
+    jar.import_set_cookies(&origin, &cookies).unwrap();
+    assert_eq!(
+        jar.cookie_value_for("SESSDATA", &origin).as_deref(),
+        Some("synthetic-account")
+    );
+    assert_eq!(
+        jar.cookie_value_for("buvid3", &origin).as_deref(),
+        Some("server-device-3")
+    );
+    assert_eq!(
+        jar.cookie_value_for("buvid4", &origin).as_deref(),
+        Some("base64/device+4==")
+    );
+    assert!(jar
+        .header_for(&Url::parse("https://unrelated.invalid/").unwrap())
+        .is_none());
+    for bad in ["", "device; SESSDATA=injected", "device\r\nX-Secret: leak"] {
+        assert!(search_device_cookies(&json!({"b_3":bad,"b_4":"valid"})).is_err());
+    }
+}
+
+#[test]
 fn default_output_names_are_byte_bounded_and_media_distinct() {
     let title = "界😀".repeat(100);
     let first = safe_filename(&title, "_av1_cid2_part2");
@@ -679,31 +756,4 @@ fn typed_search_pages_video_bangumi_and_film_with_posters() {
         movies.items[0].cover.as_deref(),
         Some("https://i0.hdslb.com/bfs/bangumi/image/f8590ba633657af9c15e4754b3e60ee43f24860f.png")
     );
-}
-
-#[test]
-fn server_issued_search_device_preserves_account_and_rejects_cookie_injection() {
-    let origin = Url::parse("https://api.bilibili.com/").unwrap();
-    let mut jar = CredentialJar::import_header("SESSDATA=synthetic-account").unwrap();
-    let cookies =
-        search_device_cookies(&json!({"b_3":"server-device-3","b_4":"base64/device+4=="})).unwrap();
-    jar.import_set_cookies(&origin, &cookies).unwrap();
-    assert_eq!(
-        jar.cookie_value_for("SESSDATA", &origin).as_deref(),
-        Some("synthetic-account")
-    );
-    assert_eq!(
-        jar.cookie_value_for("buvid3", &origin).as_deref(),
-        Some("server-device-3")
-    );
-    assert_eq!(
-        jar.cookie_value_for("buvid4", &origin).as_deref(),
-        Some("base64/device+4==")
-    );
-    assert!(jar
-        .header_for(&Url::parse("https://unrelated.invalid/").unwrap())
-        .is_none());
-    for bad in ["", "device; SESSDATA=injected", "device\r\nX-Secret: leak"] {
-        assert!(search_device_cookies(&json!({"b_3":bad,"b_4":"valid"})).is_err());
-    }
 }

@@ -63,9 +63,10 @@ class DebugGuiTests(unittest.TestCase):
         index = {(row["path"], tuple(sorted(row["query"].items()))): row for row in rows}
         self.assertEqual(len(rows), len(index))
         for section in (1, 2, 3, 4, 5, 7):
-            query = {"season_type": str(section), "type": "0"}
+            query = {"season_type": str(section), "type": "1"}
             self.assertIn(("/pgc/season/index/condition", tuple(sorted(query.items()))), index)
-            query.update(style_id="-1", page="1", pagesize="20")
+            query.pop("type")
+            query.update(st=str(section), style_id="-1", page="1", pagesize="20")
             self.assertTrue(index[("/pgc/season/index/result", tuple(sorted(query.items())))]["body"]["data"]["list"])
         for kind in ("video", "media_bangumi", "media_ft"):
             for page in ("1", "2"):
