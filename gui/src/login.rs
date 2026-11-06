@@ -22,6 +22,7 @@ pub struct LoginView<'a> {
 #[derive(Default)]
 pub struct LoginState {
     pub open: bool,
+    pub adding: bool,
     pub error: Option<String>,
     texture: Option<egui::TextureHandle>,
     deadline: Option<Instant>,
@@ -31,6 +32,14 @@ pub struct LoginState {
 }
 
 impl LoginState {
+    pub fn begin_add(&mut self) {
+        self.open = true;
+        self.adding = true;
+        self.remember_choice = false;
+        self.confirm_logout = false;
+        self.error = None;
+        self.clear_challenge();
+    }
     pub fn update(&mut self, ctx: &egui::Context, snapshot: &AuthSnapshot) {
         self.confirmation = snapshot.qr_status == Some(QrStatus::WaitingForConfirmation);
         if let Some(challenge) = &snapshot.qr {
@@ -90,7 +99,7 @@ impl LoginState {
                 theme::inset(theme::card()).show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(6.0);
-                        if let Some(snapshot) = auth.filter(|a| a.logged_in) {
+                        if let Some(snapshot) = auth.filter(|a| a.logged_in && !self.adding) {
                             let name = snapshot.account.as_ref().map_or("Bilibili 用户", |a| a.name.as_str());
                             ui.label(RichText::new(name).size(23.0).strong());
                             theme::muted(
@@ -233,7 +242,7 @@ impl LoginState {
                                     }
                                 });
                             }
-                            if let Some(error) = &self.error { ui.colored_label(theme::ERROR, error); }
+                            if let Some(error) = &self.error { ui.colored_label(theme::error_color(), error); }
                             ui.add_space(8.0);
                             ui.label(RichText::new("仅本次登录不写盘；保持登录写入系统凭据库，可随时退出。").size(12.0).color(theme::muted_color()));
                             ui.label(RichText::new("点击获取后才会连接登录服务；登录成功前仍以访客身份使用。").size(12.0).color(theme::muted_color()));
@@ -314,5 +323,15 @@ mod tests {
         assert!(all
             .iter()
             .any(|text| text.contains("保持登录写入系统凭据库")));
+    }
+    #[test]
+    fn a_new_account_requires_a_fresh_remember_choice() {
+        let mut state = LoginState {
+            remember_choice: true,
+            ..Default::default()
+        };
+        state.begin_add();
+        assert!(state.open && state.adding);
+        assert!(!state.remember_choice);
     }
 }

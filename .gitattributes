@@ -7,3 +7,5 @@
 # picking either side (task state lives in task.json, not index.md). See
 # .trellis/spec/cli/backend/directory-structure.md for details.
 .trellis/workspace/*/journal-*.md merge=union
+# Preserve the upstream SDK notices byte-for-byte, including original whitespace.
+scripts/notices/webview2-sdk/*.txt -text -whitespace

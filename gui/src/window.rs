@@ -1,10 +1,10 @@
 //! Frameless window chrome: draggable title bar, window controls, resize edges,
-//! and rounded window corners that match QQ-style borders.
+//! and rounded window corners that follow the application theme.
 use crate::theme;
-use egui::{Color32, CursorIcon, Frame, Layout, RichText, Sense, Ui, ViewportCommand};
+use egui::{Color32, CursorIcon, Frame, Layout, Sense, Ui, ViewportCommand};
 
-pub const WINDOW_TITLE: &str = "Bili · 喜欢的，留在身边";
-const BAR_HEIGHT: f32 = 46.0;
+pub const WINDOW_TITLE: &str = "BiliDL";
+const BAR_HEIGHT: f32 = 32.0;
 const EDGE: f32 = 6.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -19,10 +19,10 @@ pub fn title_bar(ctx: &egui::Context, fill: Color32, maximized: bool) -> Option<
     egui::TopBottomPanel::top("window-titlebar")
         .exact_height(BAR_HEIGHT)
         .frame(Frame::none().fill(fill).inner_margin(egui::Margin {
-            left: 14.0,
+            left: 8.0,
             right: 8.0,
-            top: 6.0,
-            bottom: 6.0,
+            top: 0.0,
+            bottom: 0.0,
         }))
         .show(ctx, |ui| {
             let drag = ui.interact(
@@ -39,20 +39,6 @@ pub fn title_bar(ctx: &egui::Context, fill: Color32, maximized: bool) -> Option<
             drag.on_hover_cursor(CursorIcon::Default);
 
             ui.horizontal_centered(|ui| {
-                let (logo, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), Sense::hover());
-                theme::brand_mark(ui.painter(), logo, theme::primary());
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new("Bili")
-                        .size(16.0)
-                        .strong()
-                        .color(theme::ink()),
-                );
-                ui.label(
-                    RichText::new("喜欢的，留在身边")
-                        .size(11.5)
-                        .color(theme::muted_color()),
-                );
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if window_button(ui, theme::Icon::Close, true) {

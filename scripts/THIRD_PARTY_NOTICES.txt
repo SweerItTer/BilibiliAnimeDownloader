@@ -1,4 +1,4 @@
-Third-party notices for Bilibili CLI packages
+Third-party notices for Bilibili packages
 
 Application
 -----------
@@ -23,3 +23,7 @@ When required by the inspected import closure, the Windows package includes matc
 The applicable Microsoft terms are supplied separately under `licenses/windows-redist/`: the official Visual Studio 2022 Enterprise/Professional license and Visual C++ Runtime 2015–2022 EULA are preserved as DOCX files in `source/`, with full extracted text in `notices/` and source hashes, URLs and scope in `provenance.json`. The official Visual Studio 2022 third-party-notices file is included as supplementary unchanged material; it is not a claim that every listed component is shipped. The EULA alone does not grant redistribution rights. Recipients must agree to applicable protective terms and satisfy all conditions governing any redistributed Microsoft components. These files are disclosures, not legal approval or a representation that their inclusion alone satisfies every obligation.
 
 See Microsoft's official redistribution guidance: https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution . Windows system API-set imports are supplied by the supported Windows operating system and are not copied into the package.
+
+Windows GUI verification
+------------------------
+Windows GUI builds use Wry/WebView2 for explicitly requested CAPTCHA verification. The WebView2 runtime is not bundled or preloaded by the application; the verification window is created only when requested. The static WebView2 loader supplied by webview2-com-sys is matched by SHA-256 to the pinned Microsoft.Web.WebView2 SDK. Its original LICENSE.txt and NOTICE.txt are retained unchanged under licenses/native/webview2-sdk/ and listed in DEPENDENCY_LICENSES.json. The Rust binding licenses are separate from those SDK notices. CLI packages do not include the GUI verification integration.

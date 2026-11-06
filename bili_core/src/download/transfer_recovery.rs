@@ -89,6 +89,152 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[tokio::test]
+async fn concurrent_resources_share_one_batch_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let payload = "x".repeat(100);
+    let headers = "Content-Length: 100\r\nETag: \"shared-budget\"\r\n";
+    let (first_url, first_server) = serve(vec![response("200 OK", headers, &payload)]).await;
+    let (second_url, second_server) = serve(vec![response("200 OK", headers, &payload)]).await;
+    let budget = RateBudget::new(1000);
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let policy = RetryPolicy {
+        attempts: 1,
+        base_delay: Duration::ZERO,
+    };
+    let mut first = ResourceCheckpoint::default();
+    let mut second = ResourceCheckpoint::default();
+    let first_path = root.path().join("first.media");
+    let second_path = root.path().join("second.media");
+    let first_locator = locator(first_url, Some(100));
+    let second_locator = locator(second_url, Some(100));
+    let started = Instant::now();
+    let (a, b) = tokio::join!(
+        transfer(
+            &client,
+            &first_locator,
+            &first_path,
+            &mut first,
+            TransferOptions {
+                cancel: &cancel,
+                rate_limit: None,
+                budget: Some(&budget)
+            },
+            &policy,
+            |_| {}
+        ),
+        transfer(
+            &client,
+            &second_locator,
+            &second_path,
+            &mut second,
+            TransferOptions {
+                cancel: &cancel,
+                rate_limit: None,
+                budget: Some(&budget)
+            },
+            &policy,
+            |_| {}
+        )
+    );
+    first_server.await.unwrap();
+    second_server.await.unwrap();
+    a.unwrap();
+    b.unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(190));
+    assert_eq!(std::fs::read(first_path).unwrap(), payload.as_bytes());
+    assert_eq!(std::fs::read(second_path).unwrap(), payload.as_bytes());
+    assert_eq!(first.durable_bytes + second.durable_bytes, 200);
+}
+
+#[tokio::test]
+async fn cancelled_batch_debt_blocks_resumed_resource_before_receiving_more_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("paused.media");
+    let payload = "x".repeat(1024);
+    let (url, server) = serve(vec![response(
+        "200 OK",
+        "Content-Length: 1024\r\nETag: \"pause-debt\"\r\n",
+        &payload[..512],
+    )])
+    .await;
+    let budget = RateBudget::new(1);
+    let client = reqwest::Client::new();
+    let policy = RetryPolicy {
+        attempts: 1,
+        base_delay: Duration::ZERO,
+    };
+    let cancel = CancellationToken::new();
+    let signal = cancel.clone();
+    let mut checkpoint = ResourceCheckpoint::default();
+    let first = transfer(
+        &client,
+        &locator(url, Some(1024)),
+        &path,
+        &mut checkpoint,
+        TransferOptions {
+            cancel: &cancel,
+            rate_limit: None,
+            budget: Some(&budget),
+        },
+        &policy,
+        move |bytes| {
+            if bytes > 0 {
+                signal.cancel();
+            }
+        },
+    )
+    .await;
+    server.await.unwrap();
+    assert_eq!(first.unwrap_err().code, ErrorCode::Cancelled);
+    let retained = checkpoint.durable_bytes;
+    assert!(retained > 0 && retained < 1024);
+
+    let headers = format!("Content-Length: {}\r\nContent-Range: bytes {retained}-1023/1024\r\nETag: \"pause-debt\"\r\n", 1024 - retained);
+    let (url, server) = serve(vec![response(
+        "206 Partial Content",
+        &headers,
+        &payload[retained as usize..],
+    )])
+    .await;
+    let retry_cancel = CancellationToken::new();
+    let retry_locator = locator(url, Some(1024));
+    let (premature, result) = {
+        let resumed = transfer(
+            &client,
+            &retry_locator,
+            &path,
+            &mut checkpoint,
+            TransferOptions {
+                cancel: &retry_cancel,
+                rate_limit: None,
+                budget: Some(&budget),
+            },
+            &policy,
+            |_| {},
+        );
+        tokio::pin!(resumed);
+        match tokio::time::timeout(Duration::from_millis(50), resumed.as_mut()).await {
+            Ok(result) => (true, result),
+            Err(_) => {
+                retry_cancel.cancel();
+                (false, resumed.await)
+            }
+        }
+    };
+    let requests = server.await.unwrap();
+    assert!(!premature, "resume must retain the previous batch debt");
+    assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+    assert!(requests[0].contains(&format!("range: bytes={retained}-")));
+    assert_eq!(
+        checkpoint.durable_bytes, retained,
+        "resume must wait before consuming another response chunk"
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), retained);
+    assert_eq!(load_checkpoint(&path).unwrap().durable_bytes, retained);
+}
+
 async fn run(url: Url, path: &Path, checkpoint: &mut ResourceCheckpoint) -> Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -102,6 +248,7 @@ async fn run(url: Url, path: &Path, checkpoint: &mut ResourceCheckpoint) -> Resu
         TransferOptions {
             cancel: &CancellationToken::new(),
             rate_limit: None,
+            budget: None,
         },
         &RetryPolicy {
             attempts: 1,
@@ -472,50 +619,54 @@ fn honors_delta_seconds_and_http_date_retry_after() {
 
 #[tokio::test]
 async fn cancellation_during_rate_limit_flushes_latest_bytes() {
-    let (url, server) = serve(vec![response(
-        "200 OK",
-        "Content-Length: 3\r\nETag: \"v1\"\r\n",
-        "xyz",
-    )])
-    .await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("resource.bin");
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let cancel = CancellationToken::new();
-    let progress_cancel = cancel.clone();
-    let mut checkpoint = ResourceCheckpoint::default();
+    for shared in [false, true] {
+        let (url, server) = serve(vec![response(
+            "200 OK",
+            "Content-Length: 3\r\nETag: \"v1\"\r\n",
+            "xyz",
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resource.bin");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let progress_cancel = cancel.clone();
+        let mut checkpoint = ResourceCheckpoint::default();
+        let budget = RateBudget::new(1);
 
-    let result = transfer(
-        &client,
-        &locator(url, None),
-        &path,
-        &mut checkpoint,
-        TransferOptions {
-            cancel: &cancel,
-            rate_limit: Some(1),
-        },
-        &RetryPolicy {
-            attempts: 1,
-            base_delay: Duration::ZERO,
-        },
-        move |_| progress_cancel.cancel(),
-    )
-    .await;
+        let result = transfer(
+            &client,
+            &locator(url, None),
+            &path,
+            &mut checkpoint,
+            TransferOptions {
+                cancel: &cancel,
+                rate_limit: if shared { None } else { Some(1) },
+                budget: shared.then_some(&budget),
+            },
+            &RetryPolicy {
+                attempts: 1,
+                base_delay: Duration::ZERO,
+            },
+            move |_| progress_cancel.cancel(),
+        )
+        .await;
 
-    assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
-    assert!(checkpoint.durable_bytes > 0);
-    assert_eq!(
-        tokio::fs::metadata(&path).await.unwrap().len(),
-        checkpoint.durable_bytes
-    );
-    let persisted = load_checkpoint(&path).unwrap();
-    assert_eq!(persisted.durable_bytes, checkpoint.durable_bytes);
-    assert_eq!(persisted.sha256, checkpoint.sha256);
-    assert!(!persisted.complete);
-    server.await.unwrap();
+        assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+        assert!(checkpoint.durable_bytes > 0);
+        assert_eq!(
+            tokio::fs::metadata(&path).await.unwrap().len(),
+            checkpoint.durable_bytes
+        );
+        let persisted = load_checkpoint(&path).unwrap();
+        assert_eq!(persisted.durable_bytes, checkpoint.durable_bytes);
+        assert_eq!(persisted.sha256, checkpoint.sha256);
+        assert!(!persisted.complete);
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -545,6 +696,7 @@ async fn retries_transient_responses_with_a_finite_attempt_budget() {
         TransferOptions {
             cancel: &CancellationToken::new(),
             rate_limit: None,
+            budget: None,
         },
         &RetryPolicy {
             attempts: 2,
@@ -591,6 +743,7 @@ async fn stops_after_retry_policy_attempts_are_exhausted() {
         TransferOptions {
             cancel: &CancellationToken::new(),
             rate_limit: None,
+            budget: None,
         },
         &RetryPolicy {
             attempts: 2,

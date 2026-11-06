@@ -37,7 +37,7 @@ WINDOWS_SYSTEM = {
     "ucrtbase.dll", "shlwapi.dll", "combase.dll", "imm32.dll", "wintrust.dll", "psapi.dll", "userenv.dll",
     "profapi.dll", "cfgmgr32.dll", "rpcrt4.dll", "winhttp.dll", "dnsapi.dll",
 }
-WINDOWS_GUI_SYSTEM = {"dwmapi.dll", "opengl32.dll", "uiautomationcore.dll", "uxtheme.dll"}
+WINDOWS_GUI_SYSTEM = {"comctl32.dll", "dwmapi.dll", "opengl32.dll", "uiautomationcore.dll", "uxtheme.dll"}
 
 
 def has_forbidden_native_options(text):

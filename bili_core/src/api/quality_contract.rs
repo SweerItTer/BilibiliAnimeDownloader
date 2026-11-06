@@ -173,6 +173,66 @@ fn obtainable_resolution_beats_a_higher_numeric_quality() {
 }
 
 #[test]
+fn explicit_1080p_tier_preserves_cinemascope_dimensions_without_downgrading() {
+    let payload = json!({"code":0,"data":{
+        "support_formats":[
+            {"quality":80,"new_description":"1080P"},
+            {"quality":64,"new_description":"720P"}
+        ],
+        "dash":{"video":[
+            {"id":80,"codecs":"avc1.640032","width":1920,"height":804,
+             "frameRate":"24/1","bandwidth":6_000_000,
+             "baseUrl":"https://v.bilivideo.com/cinemascope-1080"},
+            {"id":64,"codecs":"avc1.64001F","width":1280,"height":536,
+             "frameRate":"24/1","bandwidth":2_000_000,
+             "baseUrl":"https://v.bilivideo.com/cinemascope-720"}
+        ],"audio":[]}
+    }});
+    let mut catalog = parse_catalog(part(), &payload).unwrap();
+    let mut choice = selection(part());
+    choice.quality = Some(80);
+    let (selected, audio) = catalog.select(&choice).unwrap();
+    assert_eq!(
+        catalog
+            .advertised
+            .iter()
+            .find(|entry| entry.id == 80)
+            .unwrap()
+            .label,
+        "1080P"
+    );
+    assert_eq!(
+        (
+            selected.quality,
+            selected.width,
+            selected.height,
+            selected.codec.as_str()
+        ),
+        (80, Some(1920), Some(804), "avc1.640032")
+    );
+    assert_eq!(
+        &selected,
+        catalog
+            .representations
+            .iter()
+            .find(|representation| representation.quality == 80)
+            .unwrap()
+    );
+    assert!(audio.is_none());
+
+    // Even with a usable lower tier, an absent explicit tier must fail.
+    catalog
+        .representations
+        .retain(|representation| representation.quality != 80);
+    assert_eq!(
+        catalog.select(&choice).unwrap_err().code,
+        ErrorCode::Unavailable
+    );
+    choice.quality = Some(64);
+    assert_eq!(catalog.select(&choice).unwrap().0.quality, 64);
+}
+
+#[test]
 fn repeated_numeric_id_across_codecs_requires_an_explicit_filter() {
     let payload = json!({"code":0,"data":{"dash":{"video":[{"id":80,"codecs":"avc","width":1920,"height":1080},{"id":80,"codecs":"hev","width":3840,"height":2160}],"audio":[]},"support_formats":[{"quality":80,"new_description":"quality"}]}});
     let catalog = parse_catalog(part(), &payload).unwrap();
@@ -574,6 +634,7 @@ fn plan_fingerprint_tracks_media_not_presentation_or_delivery_policy() {
         sidecars: SidecarPolicy::default(),
         keep_temp: false,
         catalog_revision: 1,
+        context: None,
     };
     let original = plan_fingerprint(&plan).unwrap();
     plan.title = "renamed".into();

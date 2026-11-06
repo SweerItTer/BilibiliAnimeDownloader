@@ -1,6 +1,421 @@
 use super::*;
 use serde_json::json;
 
+async fn search_server(responses: Vec<Value>) -> (Url, tokio::task::JoinHandle<Vec<Url>>) {
+    let count = responses.len();
+    let mut responses = responses.into_iter();
+    search_server_with(count, move |_| responses.next().unwrap()).await
+}
+
+async fn search_server_with(
+    count: usize,
+    mut respond: impl FnMut(&Url) -> Value + Send + 'static,
+) -> (Url, tokio::task::JoinHandle<Vec<Url>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let origin = endpoint.clone();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for _ in 0..count {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buffer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(count > 0 && request.len() + count <= 8192);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let target = request
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap();
+            let url = origin.join(target).unwrap();
+            let response = respond(&url);
+            requests.push(url);
+            let body = serde_json::to_vec(&response).unwrap();
+            socket.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ).as_bytes(),
+            ).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+        }
+        requests
+    });
+    (endpoint, server)
+}
+
+async fn search_loopback(query: SearchQuery, endpoint: &Url) -> Result<CandidatePage> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    search_pages(query, |original| {
+        let mut url = endpoint.clone();
+        url.set_path(original.path());
+        url.set_query(original.query());
+        let client = &client;
+        async move {
+            client
+                .get(url)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .map_err(|_| invalid("fixture JSON"))
+        }
+    })
+    .await
+}
+
+fn video_search_page(page: u32, ids: &[u64]) -> Value {
+    json!({"code":0,"data":{
+        "page":page,"pagesize":2,"numPages":2,"numResults":4,
+        "result":ids.iter().map(|id| json!({"aid":id,"title":format!("Video {id}")})).collect::<Vec<_>>()
+    }})
+}
+
+#[tokio::test]
+async fn channel_filter_is_sent_to_source_and_page_bounds_survive_deduplication() {
+    let response = json!({"code":0,"data":{"page":2,"pagesize":20,"numPages":96,"numResults":1915,
+        "result":[{"aid":1,"title":"<em>标题</em>","author":"作者","pubdate":123,"play":456,"video_review":7},
+                  {"aid":1,"title":"重复"}]}});
+    let (endpoint, server) = search_server(vec![response]).await;
+    let results = search_loopback(
+        SearchQuery {
+            keyword: "fixture".into(),
+            category: SearchCategory::Video,
+            page: 2,
+            sort: SearchSort::Newest,
+            filter: SearchFilter {
+                video_channel: Some(1),
+            },
+        },
+        &endpoint,
+    )
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+    assert_eq!(
+        requests[0]
+            .query_pairs()
+            .find(|(key, _)| key == "tids")
+            .unwrap()
+            .1,
+        "1"
+    );
+    let page = &results.pages[0];
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.page_size, Some(20));
+    assert_eq!(page.total_pages, Some(96));
+    let item = &page.items[0];
+    assert_eq!(item.title, "标题");
+    assert_eq!(item.author.as_deref(), Some("作者"));
+    assert_eq!(
+        (item.published_at, item.plays, item.danmaku),
+        (Some(123), Some(456), Some(7))
+    );
+}
+
+#[test]
+fn pgc_browse_uses_dynamic_genres_and_keeps_unknown_totals_unknown() {
+    let conditions = parse_browse_conditions(PgcSection::Film,&json!({"code":0,"data":{"filter":[
+        {"field":"style_id","name":"风格","values":[{"keyword":"-1","name":"全部"},{"keyword":"10012","name":"科幻"}]},
+        {"field":"unsafe_remote_parameter","name":"ignored","values":[{"keyword":"1","name":"ignored"}]}
+    ]}})).unwrap();
+    assert_eq!(conditions.filters.len(), 1);
+    assert_eq!(conditions.filters[0].choices.len(), 2);
+    assert_eq!(conditions.filters[0].choices[1].value, "10012");
+    let query = BrowseQuery {
+        section: PgcSection::Film,
+        filters: [(BrowseFilterField::StyleId, "10012".into())].into(),
+        order: None,
+        sort: 0,
+        page: 3,
+        page_size: 20,
+    };
+    let url = browse_url(&query, &conditions).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(params.get("season_type").map(String::as_str), Some("2"));
+    assert_eq!(params.get("st").map(String::as_str), Some("2"));
+    assert!(!params.contains_key("type"));
+    assert_eq!(params.get("style_id").map(String::as_str), Some("10012"));
+    assert!(!params.contains_key("keyword"));
+    let page = parse_browse_page(
+        &query,
+        &json!({"code":0,"data":{"has_next":1,"list":[
+            {"season_id":12,"title":"Fixture film","cover":"https://i0.hdslb.com/fixture.jpg"}
+        ]}}),
+    )
+    .unwrap();
+    assert!(page.has_more);
+    assert_eq!(page.total, None);
+    assert_eq!(page.total_pages, None);
+    assert_eq!(page.items[0].category, SearchCategory::Film);
+    let known = parse_browse_page(
+        &query,
+        &json!({"code":0,"data":{"total":101,"size":20,"has_next":true,"list":[]}}),
+    )
+    .unwrap();
+    assert_eq!(known.total_pages, Some(6));
+}
+
+#[test]
+fn pgc_web_filters_preserve_composite_ranges_and_validate_source_order_choices() {
+    let conditions = parse_browse_conditions(PgcSection::Anime, &json!({"code":0,"data":{
+        "filter":[
+            {"field":"style_id","name":"风格","values":[{"keyword":"-1","name":"全部"},{"keyword":"10010","name":"原创"}]},
+            {"field":"area","name":"地区","values":[{"keyword":"-1","name":"全部"},{"keyword":"1,6,7","name":"国产"}]},
+            {"field":"year","name":"年份","values":[{"keyword":"-1","name":"全部"},{"keyword":"[2024,2025)","name":"2024"}]},
+            {"field":"private_remote_key","name":"ignored","values":[{"keyword":"1","name":"ignored"}]}
+        ], "order":[{"field":"3","name":"追番人数","sort":"0,1"},{"field":"4","name":"评分","sort":"0"}]
+    }})).unwrap();
+    let mut query = BrowseQuery::new(PgcSection::Anime);
+    query.filters = [
+        (BrowseFilterField::StyleId, "10010".into()),
+        (BrowseFilterField::Area, "1,6,7".into()),
+        (BrowseFilterField::Year, "[2024,2025)".into()),
+    ]
+    .into();
+    query.order = Some(3);
+    query.sort = 1;
+    query.page = 2;
+    let url = browse_url(&query, &conditions).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(params.get("style_id").map(String::as_str), Some("10010"));
+    assert_eq!(params.get("area").map(String::as_str), Some("1,6,7"));
+    assert_eq!(params.get("year").map(String::as_str), Some("[2024,2025)"));
+    assert_eq!(params.get("order").map(String::as_str), Some("3"));
+    assert_eq!(params.get("sort").map(String::as_str), Some("1"));
+    assert!(!params.contains_key("private_remote_key"));
+    let mut unavailable = query.clone();
+    unavailable
+        .filters
+        .insert(BrowseFilterField::StyleId, "999999".into());
+    assert_eq!(
+        browse_url(&unavailable, &conditions).unwrap_err().code,
+        ErrorCode::InvalidInput
+    );
+    unavailable = query.clone();
+    unavailable.order = Some(4);
+    assert!(browse_url(&unavailable, &conditions).is_err());
+    unavailable = query;
+    unavailable
+        .filters
+        .insert(BrowseFilterField::ProducerId, "1".into());
+    assert!(browse_url(&unavailable, &conditions).is_err());
+}
+
+#[test]
+fn challenge_payload_stays_transient_in_safe_discovery_errors() {
+    let error = parse_search_page(
+        SearchCategory::Video,
+        1,
+        &json!({"code":0,"data":{"v_voucher":"synthetic-voucher-private"}}),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::VerificationRequired);
+    let serialized = serde_json::to_string(&error).unwrap();
+    assert!(!serialized.contains("synthetic-voucher-private"));
+    assert!(!format!("{error:?}").contains("synthetic-voucher-private"));
+}
+
+#[tokio::test]
+async fn server_sorting_preserves_two_page_order_and_parameters() {
+    let choices = [
+        (SearchSort::Relevance, None),
+        (SearchSort::Views, Some("click")),
+        (SearchSort::Newest, Some("pubdate")),
+        (SearchSort::Danmaku, Some("dm")),
+        (SearchSort::Favorites, Some("stow")),
+        (SearchSort::Comments, Some("scores")),
+    ];
+    let responses = (0..choices.len() as u64)
+        .flat_map(|index| {
+            let base = index * 10 + 1;
+            [
+                video_search_page(1, &[base + 3, base]),
+                video_search_page(2, &[base + 2, base + 1]),
+            ]
+        })
+        .collect();
+    let (endpoint, server) = search_server(responses).await;
+    let mut actual = Vec::new();
+    for (sort, _) in choices {
+        for page in 1..=2 {
+            actual.push(
+                search_loopback(
+                    SearchQuery {
+                        keyword: "动画 A B".into(),
+                        category: SearchCategory::Video,
+                        page,
+                        sort,
+
+                        filter: Default::default(),
+                    },
+                    &endpoint,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+    }
+    let requests = server.await.unwrap();
+    for (index, (sort, parameter)) in choices.into_iter().enumerate() {
+        let base = index as u64 * 10 + 1;
+        let mut ids = Vec::new();
+        for page in 1..=2 {
+            let position = index * 2 + page - 1;
+            let response = &actual[position].pages[0];
+            let params: std::collections::HashMap<_, _> =
+                requests[position].query_pairs().into_owned().collect();
+            assert_eq!(
+                requests[position].path(),
+                "/x/web-interface/wbi/search/type"
+            );
+            assert_eq!(params.get("search_type").map(String::as_str), Some("video"));
+            assert_eq!(params.get("keyword").map(String::as_str), Some("动画 A B"));
+            assert_eq!(params.get("page"), Some(&page.to_string()));
+            assert_eq!(
+                params.get("order").map(String::as_str),
+                parameter,
+                "{sort:?}"
+            );
+            assert_eq!(response.page, page as u32);
+            assert_eq!(response.category, SearchCategory::Video);
+            assert_eq!(response.total, Some(4));
+            assert_eq!(response.has_more, page == 1);
+            ids.extend(response.items.iter().map(|item| item.reference.clone()));
+        }
+        assert_eq!(
+            ids,
+            [base + 3, base, base + 2, base + 1].map(|id| ContentRef::Video(Aid::new(id).unwrap()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn default_mixed_search_preserves_category_pages_and_deduplication() {
+    let (endpoint, server) = search_server_with(3, |url| {
+        let kind = url.query_pairs().find(|(key, _)| key == "search_type").unwrap().1;
+        match kind.as_ref() {
+            "video" => video_search_page(1, &[9, 3]),
+            "media_bangumi" => json!({"code":0,"data":{"numPages":1,"numResults":1,"result":[{"season_id":7,"title":"Series"}]}}),
+            "media_ft" => json!({"code":0,"data":{"numPages":1,"numResults":2,"result":[{"season_id":7,"title":"Duplicate"},{"season_id":8,"title":"Film"}]}}),
+            _ => panic!("unexpected category"),
+        }
+    }).await;
+    let response = search_loopback(
+        SearchQuery {
+            keyword: "sample".into(),
+            category: SearchCategory::All,
+            page: 1,
+            sort: SearchSort::Relevance,
+
+            filter: Default::default(),
+        },
+        &endpoint,
+    )
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+    assert!(requests
+        .iter()
+        .all(|request| !request.query_pairs().any(|(key, _)| key == "order")));
+    assert_eq!(
+        response
+            .pages
+            .iter()
+            .map(|page| page.category)
+            .collect::<Vec<_>>(),
+        vec![
+            SearchCategory::Video,
+            SearchCategory::Bangumi,
+            SearchCategory::Film
+        ]
+    );
+    assert_eq!(
+        response
+            .pages
+            .iter()
+            .map(|page| page.items.len())
+            .collect::<Vec<_>>(),
+        vec![2, 1, 1]
+    );
+    assert_eq!(
+        response.pages[2].items[0].reference,
+        ContentRef::Bangumi(SeasonId::new(8).unwrap())
+    );
+}
+
+#[tokio::test]
+async fn sorted_empty_and_access_failures_are_not_conflated() {
+    let responses = vec![
+        json!({"code":0,"data":{"numPages":1,"numResults":0,"result":[]}}),
+        json!({"code":0,"data":{"v_voucher":"opaque"}}),
+        json!({"code":-101}),
+    ];
+    let (endpoint, server) = search_server(responses).await;
+    let query = SearchQuery {
+        keyword: "sample".into(),
+        category: SearchCategory::Video,
+        page: 1,
+        sort: SearchSort::Newest,
+
+        filter: Default::default(),
+    };
+    let empty = search_loopback(query.clone(), &endpoint).await.unwrap();
+    let challenge = search_loopback(query.clone(), &endpoint).await.unwrap_err();
+    let login = search_loopback(query, &endpoint).await.unwrap_err();
+    let _ = server.await.unwrap();
+    assert!(empty.pages[0].items.is_empty());
+    assert!(!empty.pages[0].has_more);
+    assert_eq!(challenge.code, ErrorCode::VerificationRequired);
+    assert_eq!(login.code, ErrorCode::LoginRequired);
+}
+
+#[tokio::test]
+async fn unsupported_sort_never_calls_the_fetch_boundary() {
+    for category in [
+        SearchCategory::All,
+        SearchCategory::Bangumi,
+        SearchCategory::Film,
+    ] {
+        for &sort in SearchSort::available_for(SearchCategory::Video)
+            .iter()
+            .skip(1)
+        {
+            let query = SearchQuery {
+                keyword: "sample".into(),
+                category,
+                page: 1,
+                sort,
+
+                filter: Default::default(),
+            };
+            let result = search_pages(query, |_| async {
+                panic!("invalid sort must fail before fetching or signing")
+            })
+            .await;
+            assert_eq!(result.unwrap_err().code, ErrorCode::InvalidInput);
+        }
+    }
+}
+
 #[test]
 fn accepts_only_strict_supported_identifier_forms() {
     assert!(matches!(
@@ -246,6 +661,33 @@ fn anonymous_nav_signing_keys_and_wbi_encoding_are_supported() {
     assert_eq!(wbi_key_from_nav(&nav).unwrap().len(), 32);
     let params = vec![("keyword".to_owned(), "A B!'()*東".to_owned())];
     assert_eq!(canonical_wbi_query(&params), "keyword=A%20B%E6%9D%B1");
+}
+
+#[test]
+fn server_issued_search_device_preserves_account_and_rejects_cookie_injection() {
+    let origin = Url::parse("https://api.bilibili.com/").unwrap();
+    let mut jar = CredentialJar::import_header("SESSDATA=synthetic-account").unwrap();
+    let cookies =
+        search_device_cookies(&json!({"b_3":"server-device-3","b_4":"base64/device+4=="})).unwrap();
+    jar.import_set_cookies(&origin, &cookies).unwrap();
+    assert_eq!(
+        jar.cookie_value_for("SESSDATA", &origin).as_deref(),
+        Some("synthetic-account")
+    );
+    assert_eq!(
+        jar.cookie_value_for("buvid3", &origin).as_deref(),
+        Some("server-device-3")
+    );
+    assert_eq!(
+        jar.cookie_value_for("buvid4", &origin).as_deref(),
+        Some("base64/device+4==")
+    );
+    assert!(jar
+        .header_for(&Url::parse("https://unrelated.invalid/").unwrap())
+        .is_none());
+    for bad in ["", "device; SESSDATA=injected", "device\r\nX-Secret: leak"] {
+        assert!(search_device_cookies(&json!({"b_3":bad,"b_4":"valid"})).is_err());
+    }
 }
 
 #[test]

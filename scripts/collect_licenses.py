@@ -14,6 +14,7 @@ import tempfile
 
 import tarfile
 import tomllib
+import webview2_notices
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PREFIX = "registry+https://github.com/rust-lang/crates.io-index"
 LICENSE_IDS = frozenset({
@@ -281,7 +282,7 @@ def pinned_declared_license(package, version, declaration, output_root):
         raise ValueError(f"no exact pinned full-text source for {package} {version} ({declaration})")
     return fetch_pinned_text(
         source, f"{package}-{version}", output_root,
-        f"pinned canonical SPDX license text: {source['url']}",
+        f"pinned full license text: {source['url']}",
     )
 
 
@@ -402,6 +403,9 @@ def collect(args):
                                 f"Cargo registry archive {path.relative_to(crate_root).as_posix()}",
                                 verified_texts[path]) for path in texts],
         })
+    for package in packages:
+        if package["name"] == "webview2-com-sys":
+            records.append(webview2_notices.collect(package, args.target, output_root))
     if args.rust_runtime:
         sysroot, license_dir = runtime_root(args.target)
         doc_root = sysroot / "share/doc/rust"

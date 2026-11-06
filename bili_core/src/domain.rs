@@ -36,6 +36,9 @@ pub struct CoreError {
     /// Original signed FFmpeg AVERROR value; never native text, paths or URLs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_code: Option<i32>,
+    /// Transient user-verification request. Never journal or print its voucher.
+    #[serde(skip)]
+    pub verification: Option<crate::verification::VerificationRequest>,
 }
 impl CoreError {
     /// Operation is a static, trusted label; never pass remote text or URLs.
@@ -46,6 +49,7 @@ impl CoreError {
             retryable: false,
             http_status: None,
             native_code: None,
+            verification: None,
         }
     }
     pub fn io(_: std::io::Error) -> Self {
@@ -201,6 +205,12 @@ pub struct MediaItem {
     pub cover: Option<String>,
     pub duration_ms: Option<u64>,
     pub parts: Vec<Part>,
+    #[serde(default)]
+    pub source: Option<SourceProject>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub author: Option<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchCategory {
@@ -209,11 +219,251 @@ pub enum SearchCategory {
     Bangumi,
     Film,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchSort {
+    #[default]
+    Relevance,
+    Views,
+    Newest,
+    Danmaku,
+    Favorites,
+    Comments,
+}
+impl SearchSort {
+    /// Only video searches currently have a supported non-default server order.
+    pub fn available_for(category: SearchCategory) -> &'static [Self] {
+        if category == SearchCategory::Video {
+            &[
+                Self::Relevance,
+                Self::Views,
+                Self::Newest,
+                Self::Danmaku,
+                Self::Favorites,
+                Self::Comments,
+            ]
+        } else {
+            &[Self::Relevance]
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchQuery {
     pub keyword: String,
     pub category: SearchCategory,
     pub page: u32,
+    #[serde(default)]
+    pub sort: SearchSort,
+    #[serde(default)]
+    pub filter: SearchFilter,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFilter {
+    pub video_channel: Option<u32>,
+}
+impl SearchFilter {
+    pub fn video_channels() -> &'static [(u32, &'static str)] {
+        &[
+            (1, "动画"),
+            (3, "音乐"),
+            (4, "游戏"),
+            (5, "娱乐"),
+            (36, "知识"),
+            (119, "鬼畜"),
+            (129, "舞蹈"),
+            (155, "时尚"),
+            (160, "生活"),
+            (181, "影视"),
+            (188, "科技"),
+            (202, "资讯"),
+            (211, "美食"),
+            (217, "动物"),
+            (223, "汽车"),
+            (234, "运动"),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PgcSection {
+    Anime,
+    ChineseAnimation,
+    Film,
+    Documentary,
+    Tv,
+    Variety,
+}
+impl PgcSection {
+    pub fn season_type(self) -> u32 {
+        match self {
+            Self::Anime => 1,
+            Self::Film => 2,
+            Self::Documentary => 3,
+            Self::ChineseAnimation => 4,
+            Self::Tv => 5,
+            Self::Variety => 7,
+        }
+    }
+    pub fn category(self) -> SearchCategory {
+        match self {
+            Self::Anime | Self::ChineseAnimation => SearchCategory::Bangumi,
+            _ => SearchCategory::Film,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowseChoice {
+    pub value: String,
+    pub label: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowseFilterField {
+    SeasonVersion,
+    SpokenLanguageType,
+    Area,
+    IsFinish,
+    Copyright,
+    SeasonStatus,
+    SeasonMonth,
+    Year,
+    StyleId,
+    ReleaseDate,
+    ProducerId,
+}
+impl BrowseFilterField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SeasonVersion => "season_version",
+            Self::SpokenLanguageType => "spoken_language_type",
+            Self::Area => "area",
+            Self::IsFinish => "is_finish",
+            Self::Copyright => "copyright",
+            Self::SeasonStatus => "season_status",
+            Self::SeasonMonth => "season_month",
+            Self::Year => "year",
+            Self::StyleId => "style_id",
+            Self::ReleaseDate => "release_date",
+            Self::ProducerId => "producer_id",
+        }
+    }
+    pub(crate) fn from_api(field: &str) -> Option<Self> {
+        [
+            Self::SeasonVersion,
+            Self::SpokenLanguageType,
+            Self::Area,
+            Self::IsFinish,
+            Self::Copyright,
+            Self::SeasonStatus,
+            Self::SeasonMonth,
+            Self::Year,
+            Self::StyleId,
+            Self::ReleaseDate,
+            Self::ProducerId,
+        ]
+        .into_iter()
+        .find(|choice| choice.as_str() == field)
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowseFilterGroup {
+    pub field: BrowseFilterField,
+    pub label: String,
+    pub choices: Vec<BrowseChoice>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowseOrderChoice {
+    pub id: u32,
+    pub label: String,
+    pub sorts: Vec<u8>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowseConditions {
+    pub section: PgcSection,
+    pub filters: Vec<BrowseFilterGroup>,
+    pub orders: Vec<BrowseOrderChoice>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowseQuery {
+    pub section: PgcSection,
+    pub filters: std::collections::BTreeMap<BrowseFilterField, String>,
+    pub order: Option<u32>,
+    pub sort: u8,
+    pub page: u32,
+    pub page_size: u32,
+}
+impl BrowseQuery {
+    pub fn new(section: PgcSection) -> Self {
+        Self {
+            section,
+            filters: Default::default(),
+            order: None,
+            sort: 0,
+            page: 1,
+            page_size: 20,
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        if self.page == 0
+            || self.page > 1000
+            || self.page_size == 0
+            || self.page_size > 30
+            || self.sort > 1
+            || self.order.is_some_and(|order| order > 8)
+            || self
+                .filters
+                .values()
+                .any(|value| !valid_browse_value(value))
+        {
+            return Err(CoreError::new(
+                ErrorCode::InvalidInput,
+                "invalid PGC browse query",
+            ));
+        }
+        Ok(())
+    }
+}
+pub(crate) fn valid_browse_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || b"-,[](): ".contains(&byte))
+}
+impl SearchQuery {
+    /// Validate before authentication, signing, or submitting a network request.
+    pub fn validate(&self) -> Result<()> {
+        if self.keyword.trim().is_empty()
+            || self.keyword.len() > 256
+            || self.page == 0
+            || self.page > 1000
+        {
+            return Err(CoreError::new(
+                ErrorCode::InvalidInput,
+                "invalid search query",
+            ));
+        }
+        if !SearchSort::available_for(self.category).contains(&self.sort) {
+            return Err(CoreError::new(
+                ErrorCode::InvalidInput,
+                "non-default search sorting requires video category",
+            ));
+        }
+        if let Some(channel) = self.filter.video_channel {
+            if self.category != SearchCategory::Video
+                || !SearchFilter::video_channels()
+                    .iter()
+                    .any(|(id, _)| *id == channel)
+            {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidInput,
+                    "unsupported video search channel",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
@@ -222,6 +472,14 @@ pub struct Candidate {
     pub title: String,
     pub cover: Option<String>,
     pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<u64>,
+    #[serde(default)]
+    pub plays: Option<u64>,
+    #[serde(default)]
+    pub danmaku: Option<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryPage {
@@ -230,6 +488,10 @@ pub struct CategoryPage {
     pub total: Option<u64>,
     pub has_more: bool,
     pub items: Vec<Candidate>,
+    #[serde(default)]
+    pub page_size: Option<u32>,
+    #[serde(default)]
+    pub total_pages: Option<u32>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidatePage {
@@ -353,6 +615,28 @@ pub struct DownloadSelection {
     pub sidecars: SidecarPolicy,
     pub keep_temp: bool,
 }
+/// Display identity of the resolved work. This is independent from the output folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceProject {
+    pub reference: ContentRef,
+    pub title: String,
+    pub category: Option<SearchCategory>,
+    pub cover: Option<String>,
+    pub ordinal: u32,
+}
+/// One aggregate byte budget is shared by every resource admitted to this batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchSettings {
+    pub id: String,
+    pub rate_limit: Option<u64>,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadContext {
+    pub project: Option<SourceProject>,
+    pub batch: Option<BatchSettings>,
+    /// An opaque credential profile identifier; None means anonymous.
+    pub profile_id: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamPlan {
     pub schema_version: u32,
@@ -368,6 +652,8 @@ pub struct StreamPlan {
     pub sidecars: SidecarPolicy,
     pub keep_temp: bool,
     pub catalog_revision: u64,
+    #[serde(default)]
+    pub context: Option<DownloadContext>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobPhase {
@@ -431,6 +717,27 @@ pub struct JobSnapshot {
     pub skipped: bool,
     pub error: Option<CoreError>,
     pub components: Vec<ComponentResult>,
+    /// Original admission time in Unix milliseconds, unknown for legacy records.
+    #[serde(default)]
+    pub created_at: Option<u64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputInfo {
+    pub job: JobId,
+    pub output: Option<PathBuf>,
+    pub media: Option<crate::remux::MediaProbe>,
+    pub components: Vec<ComponentResult>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveMode {
+    RecordsOnly,
+    RecycleFiles,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemovalReport {
+    pub removed: Vec<JobId>,
+    pub recycled: Vec<PathBuf>,
+    pub errors: Vec<CoreError>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueueSnapshot {
@@ -504,6 +811,10 @@ impl Default for RetryPolicy {
         }
     }
 }
+#[derive(Debug, Clone, Copy)]
+pub struct RecycleBin {
+    pub move_files: fn(&[PathBuf]) -> Result<()>,
+}
 #[derive(Debug, Clone)]
 pub struct CoreConfig {
     pub state_dir: PathBuf,
@@ -514,7 +825,13 @@ pub struct CoreConfig {
     pub timeout: Duration,
     pub retry: RetryPolicy,
     pub rate_limit: Option<u64>,
+    /// Trusted host OS adapter, called only with core-verified owned file paths.
+    /// None rejects recycling; it must never fall back to permanent deletion.
+    pub recycle: Option<RecycleBin>,
     pub credential_store: crate::cookie::StorePolicy,
+    /// Explicit local API JSON responses for offline inspection. Core-owned
+    /// HTTP clients are restricted to closed loopback; requires memory-only auth.
+    pub api_replay: Option<crate::OfflineApiReplay>,
 }
 impl CoreConfig {
     pub fn new(state_dir: PathBuf, output_dir: PathBuf) -> Self {
@@ -527,7 +844,9 @@ impl CoreConfig {
             timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             rate_limit: None,
+            recycle: None,
             credential_store: crate::cookie::StorePolicy::MemoryOnly,
+            api_replay: None,
         }
     }
 }

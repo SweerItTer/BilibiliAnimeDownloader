@@ -21,6 +21,8 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [Shared Update Protocol](../../bili_core/backend/update-protocol.md) | Core static catalog, descriptor identity and installation transaction | Required |
 | [GUI update integration](update-protocol.md) | Host runtime ownership, headless GUI doctor, preferences, versioned package and restart | Implemented; runtime evidence recorded separately |
+| [Shared search sorting](../../bili_core/backend/search-sorting.md) | Core-supported choices, page-one sort changes and submitted-query pagination | Implemented contract; verification recorded separately |
+| [Native browse/download interaction](browse-download-ux.md) | Approved header/grid/detail/bulk/history/account flow, async intent and on-demand verification | Implemented contract; verification recorded separately |
 
 ---
 

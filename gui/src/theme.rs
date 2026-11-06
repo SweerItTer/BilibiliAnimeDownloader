@@ -1,52 +1,88 @@
 //! Shared visual tokens and native painter widgets; no remote assets.
 use egui::{pos2, vec2, Align2, Color32, FontId, Frame, Id, Rect, Response, Sense, Stroke, Ui};
-use std::sync::RwLock;
+use std::cell::Cell;
 use std::time::Duration;
 
-pub const OUTER_RADIUS: f32 = 24.0;
+pub const OUTER_RADIUS: f32 = 10.0;
 pub const INSET: f32 = 8.0;
 pub const MOTION: f32 = 0.18;
 pub const ON_PRIMARY: Color32 = Color32::WHITE;
 pub const ERROR: Color32 = Color32::from_rgb(174, 62, 85);
-pub const GREEN: Color32 = Color32::from_rgb(50, 132, 112);
+pub const GREEN: Color32 = Color32::from_rgb(33, 111, 80);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
+    pub dark_mode: bool,
     pub background: Color32,
     pub card: Color32,
     pub ink: Color32,
     pub muted: Color32,
     pub primary: Color32,
     pub primary_hover: Color32,
+    pub on_primary: Color32,
     pub soft: Color32,
     pub soft_hover: Color32,
     pub border: Color32,
     pub rose: Color32,
+    pub error: Color32,
+    pub success: Color32,
 }
 
-pub const DEFAULT_PALETTE: Palette = Palette {
-    background: Color32::from_rgb(245, 245, 250),
-    card: Color32::WHITE,
-    ink: Color32::from_rgb(36, 36, 56),
-    muted: Color32::from_rgb(112, 112, 132),
-    primary: Color32::from_rgb(115, 87, 217),
-    primary_hover: Color32::from_rgb(97, 68, 195),
-    soft: Color32::from_rgb(239, 235, 252),
-    soft_hover: Color32::from_rgb(226, 218, 248),
-    border: Color32::from_rgb(229, 228, 238),
-    rose: Color32::from_rgb(249, 232, 239),
-};
-
-static PALETTE: RwLock<Palette> = RwLock::new(DEFAULT_PALETTE);
-
-pub fn set_palette(palette: Palette) {
-    if let Ok(mut current) = PALETTE.write() {
-        *current = palette;
+pub const fn light_palette(primary: Color32, primary_hover: Color32) -> Palette {
+    Palette {
+        dark_mode: false,
+        background: Color32::from_rgb(240, 242, 245),
+        card: Color32::from_rgb(250, 251, 252),
+        ink: Color32::from_rgb(32, 37, 45),
+        muted: Color32::from_rgb(89, 99, 113),
+        primary,
+        primary_hover,
+        on_primary: ON_PRIMARY,
+        soft: Color32::from_rgb(232, 234, 240),
+        soft_hover: Color32::from_rgb(221, 225, 233),
+        border: Color32::from_rgb(164, 173, 186),
+        rose: Color32::from_rgb(248, 232, 236),
+        error: ERROR,
+        success: GREEN,
     }
 }
 
+pub const fn dark_palette(primary: Color32, primary_hover: Color32) -> Palette {
+    Palette {
+        dark_mode: true,
+        background: Color32::from_rgb(22, 25, 31),
+        card: Color32::from_rgb(31, 35, 43),
+        ink: Color32::from_rgb(228, 232, 239),
+        muted: Color32::from_rgb(162, 173, 190),
+        primary,
+        primary_hover,
+        on_primary: Color32::from_rgb(18, 22, 28),
+        soft: Color32::from_rgb(43, 48, 59),
+        soft_hover: Color32::from_rgb(54, 60, 72),
+        border: Color32::from_rgb(94, 105, 124),
+        rose: Color32::from_rgb(62, 36, 44),
+        error: Color32::from_rgb(244, 143, 157),
+        success: Color32::from_rgb(137, 207, 166),
+    }
+}
+
+pub const DEFAULT_PALETTE: Palette = light_palette(
+    Color32::from_rgb(99, 81, 171),
+    Color32::from_rgb(80, 65, 147),
+);
+
+thread_local! {
+    // A native app paints on its UI thread. Independent headless contexts on
+    // other threads must not replace one another's current presentation tokens.
+    static PALETTE: Cell<Palette> = const { Cell::new(DEFAULT_PALETTE) };
+}
+
+pub fn set_palette(palette: Palette) {
+    PALETTE.set(palette);
+}
+
 pub fn palette() -> Palette {
-    PALETTE.read().map(|p| *p).unwrap_or(DEFAULT_PALETTE)
+    PALETTE.get()
 }
 
 pub fn background() -> Color32 {
@@ -73,19 +109,15 @@ pub fn border() -> Color32 {
 pub fn rose() -> Color32 {
     palette().rose
 }
+pub fn error_color() -> Color32 {
+    palette().error
+}
+pub fn success_color() -> Color32 {
+    palette().success
+}
 
 pub fn inner_radius(outer: f32, inset: f32) -> f32 {
     (outer - inset).max(0.0)
-}
-
-/// Blend `fill` toward transparent by `keep` (1.0 keeps the color opaque).
-pub fn alpha(fill: Color32, keep: f32) -> Color32 {
-    Color32::from_rgba_unmultiplied(
-        fill.r(),
-        fill.g(),
-        fill.b(),
-        (keep.clamp(0.0, 1.0) * 255.0).round() as u8,
-    )
 }
 
 pub fn install(ctx: &egui::Context, fonts: Option<egui::FontDefinitions>) {
@@ -98,7 +130,11 @@ pub fn install(ctx: &egui::Context, fonts: Option<egui::FontDefinitions>) {
 pub fn apply_style(ctx: &egui::Context, compact: bool) {
     let p = palette();
     let mut style = (*ctx.style()).clone();
-    style.visuals = egui::Visuals::light();
+    style.visuals = if p.dark_mode {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
     style.visuals.panel_fill = p.background;
     style.visuals.window_fill = p.card;
     style.visuals.window_rounding = egui::Rounding::same(OUTER_RADIUS);
@@ -109,18 +145,33 @@ pub fn apply_style(ctx: &egui::Context, compact: bool) {
     style.visuals.selection.bg_fill = p.soft;
     style.visuals.selection.stroke = Stroke::new(1.0_f32, p.primary);
     style.visuals.hyperlink_color = p.primary;
-    style.visuals.widgets.inactive.rounding = egui::Rounding::same(12.0);
+    style.visuals.error_fg_color = p.error;
+    style.visuals.warn_fg_color = if p.dark_mode {
+        Color32::from_rgb(233, 187, 112)
+    } else {
+        Color32::from_rgb(139, 88, 19)
+    };
+    style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
+    style.visuals.widgets.noninteractive.bg_fill = p.card;
+    style.visuals.widgets.noninteractive.weak_bg_fill = p.card;
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border);
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.ink);
+    style.visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
     style.visuals.widgets.inactive.bg_fill = p.background;
+    style.visuals.widgets.inactive.weak_bg_fill = p.background;
     style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.border);
     style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, p.ink);
-    style.visuals.widgets.hovered.rounding = egui::Rounding::same(12.0);
+    style.visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
     style.visuals.widgets.hovered.bg_fill = p.soft;
+    style.visuals.widgets.hovered.weak_bg_fill = p.soft;
     style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.primary);
     style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, p.primary);
-    style.visuals.widgets.active.rounding = egui::Rounding::same(12.0);
+    style.visuals.widgets.active.rounding = egui::Rounding::same(6.0);
     style.visuals.widgets.active.bg_fill = p.soft;
+    style.visuals.widgets.active.weak_bg_fill = p.soft;
     style.visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, p.primary);
     style.visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, p.primary);
+    style.visuals.widgets.open = style.visuals.widgets.active;
     style.spacing.item_spacing = if compact {
         vec2(8.0, 6.0)
     } else {
@@ -215,6 +266,50 @@ pub fn hint(ui: &mut Ui, text: impl Into<String>) {
     ui.label(egui::RichText::new(text).size(12.0).color(muted_color()));
 }
 
+/// Single-line controls share text metrics even when a caller gives the frame
+/// extra height. Explicit hint color avoids inheriting the app's ink override.
+pub fn singleline_input<'a>(
+    ui: &Ui,
+    text: &'a mut dyn egui::TextBuffer,
+    hint: &str,
+    height: f32,
+) -> egui::TextEdit<'a> {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let row_height = ui.fonts(|fonts| fonts.row_height(&font));
+    let height = height.max(row_height + 4.0);
+    // egui 0.29 hit testing starts at the inner rect's top. Put the extra
+    // height in symmetric margins so painting and pointer coordinates agree.
+    egui::TextEdit::singleline(text)
+        .font(font)
+        .margin(vec2(12.0, (height - row_height) * 0.5))
+        .hint_text_font(egui::TextStyle::Body)
+        .hint_text(
+            egui::RichText::new(hint)
+                .text_style(egui::TextStyle::Body)
+                .color(muted_color()),
+        )
+}
+
+/// Scalable native-vector close control, with a text label for accessibility.
+pub fn close_button(ui: &mut Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "关闭")
+    });
+    let visuals = ui.style().interact(&response);
+    if response.hovered() || response.has_focus() {
+        ui.painter()
+            .rect(rect, 6.0, visuals.weak_bg_fill, visuals.bg_stroke);
+    }
+    icon(
+        ui.painter(),
+        rect.shrink(6.0),
+        Icon::Close,
+        visuals.text_color(),
+    );
+    response.on_hover_text("关闭")
+}
+
 pub fn section(ui: &mut Ui, title: &str, description: &str) {
     ui.label(egui::RichText::new(title).size(17.0).strong());
     ui.add_space(3.0);
@@ -226,38 +321,15 @@ pub fn hint_indented(ui: &mut Ui, id: &str, text: impl Into<String>) {
     ui.indent(id, |ui| hint(ui, text));
 }
 
-/// Hollow in-app brand mark. The filled raster icon is reserved for the OS shell.
-pub fn brand_mark(painter: &egui::Painter, rect: Rect, accent: Color32) {
-    let rounding = rect.width() * 0.32;
-    painter.rect_filled(rect, rounding, alpha(accent, 0.08));
-    painter.rect_stroke(rect, rounding, Stroke::new(1.8_f32, accent));
-    icon(
-        painter,
-        rect.shrink(rect.width() * 0.27),
-        Icon::Download,
-        accent,
-    );
-    let dot = rect.width() * 0.075;
-    painter.circle_filled(
-        pos2(rect.right() - dot * 1.4, rect.top() + dot * 1.4),
-        dot,
-        Color32::from_rgb(255, 126, 168),
-    );
-}
-
 #[derive(Clone, Copy)]
 pub enum Icon {
-    Search,
     Download,
     Check,
-    Settings,
     User,
     Arrow,
     Back,
-    Pause,
     Play,
     Close,
-    Copy,
     Refresh,
     Folder,
     Image,
@@ -266,7 +338,6 @@ pub enum Icon {
     Minus,
     Window,
     Restore,
-    Info,
 }
 
 pub fn icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -281,23 +352,13 @@ pub fn icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         ));
     };
     match icon {
-        Icon::Search => {
-            painter.circle_stroke(p(-2.0, -2.0), 6.0 * s, stroke);
-            line(&[(2.5, 2.5), (8.0, 8.0)]);
-        }
         Icon::Download => {
             line(&[(0.0, -9.0), (0.0, 3.0)]);
             line(&[(-4.0, -1.0), (0.0, 3.0), (4.0, -1.0)]);
             line(&[(-8.0, 2.0), (-8.0, 8.0), (8.0, 8.0), (8.0, 2.0)]);
         }
         Icon::Check => line(&[(-7.0, 0.0), (-2.0, 5.0), (8.0, -5.0)]),
-        Icon::Settings => {
-            for (y, x) in [(-6.0, -3.0), (0.0, 4.0), (6.0, -1.0)] {
-                line(&[(-9.0, y), (9.0, y)]);
-                painter.circle_filled(p(x, y), 2.5 * s, card());
-                painter.circle_stroke(p(x, y), 2.5 * s, stroke);
-            }
-        }
+
         Icon::User => {
             painter.circle_stroke(p(0.0, -5.0), 4.0 * s, stroke);
             line(&[
@@ -317,29 +378,13 @@ pub fn icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[(8.0, 0.0), (-8.0, 0.0)]);
             line(&[(-2.0, -6.0), (-8.0, 0.0), (-2.0, 6.0)]);
         }
-        Icon::Pause => {
-            line(&[(-4.0, -7.0), (-4.0, 7.0)]);
-            line(&[(4.0, -7.0), (4.0, 7.0)]);
-        }
+
         Icon::Play => line(&[(-5.0, -8.0), (8.0, 0.0), (-5.0, 8.0), (-5.0, -8.0)]),
         Icon::Close => {
             line(&[(-6.0, -6.0), (6.0, 6.0)]);
             line(&[(6.0, -6.0), (-6.0, 6.0)]);
         }
-        Icon::Copy => {
-            painter.rect_stroke(
-                Rect::from_min_max(p(-4.0, -4.0), p(8.0, 9.0)),
-                2.0 * s,
-                stroke,
-            );
-            line(&[
-                (-7.0, 5.0),
-                (-9.0, 5.0),
-                (-9.0, -9.0),
-                (3.0, -9.0),
-                (3.0, -7.0),
-            ]);
-        }
+
         Icon::Refresh => {
             line(&[
                 (8.0, -2.0),
@@ -401,11 +446,6 @@ pub fn icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 stroke,
             );
         }
-        Icon::Info => {
-            painter.circle_stroke(c, 8.5 * s, stroke);
-            line(&[(0.0, -1.5), (0.0, 5.0)]);
-            painter.circle_filled(p(0.0, -5.0), 1.1 * s, color);
-        }
     }
 }
 
@@ -459,10 +499,10 @@ pub fn button_width(
     );
     let p = palette();
     let (base, hover, foreground) = match kind {
-        ButtonKind::Primary => (p.primary, p.primary_hover, ON_PRIMARY),
+        ButtonKind::Primary => (p.primary, p.primary_hover, p.on_primary),
         ButtonKind::Soft => (p.soft, p.soft_hover, p.primary),
         ButtonKind::Quiet => (p.card, p.soft, p.muted),
-        ButtonKind::Danger => (p.rose, mix(p.rose, ERROR, 0.12), ERROR),
+        ButtonKind::Danger => (p.rose, mix(p.rose, p.error, 0.12), p.error),
     };
     let pressed = response.is_pointer_button_down_on();
     let fill = if !ui.is_enabled() {
@@ -473,12 +513,14 @@ pub fn button_width(
     let foreground = if ui.is_enabled() {
         foreground
     } else {
-        p.muted.gamma_multiply(0.55)
+        // Disabled egui UIs already tint painter colors toward the card.
+        // Keep the input opaque: fading alpha again washes out light-mode text.
+        p.ink
     };
     let painted = if pressed { rect.shrink(1.0) } else { rect };
     ui.painter().rect(
         painted,
-        12.0,
+        6.0,
         fill,
         if response.has_focus() {
             Stroke::new(2.0_f32, p.primary)
@@ -561,67 +603,192 @@ pub fn progress(ui: &mut Ui, id: Id, value: Option<f32>, active: bool, reduced: 
     }
 }
 
-pub fn empty_art(ui: &mut Ui) {
-    let p = palette();
-    let (rect, _) = ui.allocate_exact_size(vec2(240.0, 178.0), Sense::hover());
-    let painter = ui.painter();
-    let c = rect.center();
-    painter.circle_filled(c, 76.0, p.soft);
-    painter.circle_filled(c + vec2(77.0, -40.0), 16.0, p.rose);
-    painter.circle_filled(c + vec2(-84.0, 26.0), 7.0, mix(p.soft, p.primary, 0.25));
-    let sheet = Rect::from_center_size(c + vec2(0.0, -18.0), vec2(78.0, 94.0));
-    painter.rect(
-        sheet.translate(vec2(10.0, -6.0)),
-        16.0,
-        mix(p.soft, p.primary, 0.18),
-        Stroke::NONE,
-    );
-    painter.rect(sheet, 16.0, p.card, Stroke::new(1.0_f32, p.border));
-    icon(
-        painter,
-        Rect::from_center_size(sheet.center() - vec2(0.0, 4.0), vec2(36.0, 36.0)),
-        Icon::Download,
-        p.primary,
-    );
-    let tray = Rect::from_center_size(c + vec2(0.0, 39.0), vec2(132.0, 53.0));
-    painter.rect_filled(tray, 20.0, p.primary);
-    painter.rect_filled(
-        Rect::from_center_size(tray.center() - vec2(0.0, 8.0), vec2(116.0, 21.0)),
-        12.0,
-        mix(p.primary, Color32::WHITE, 0.32),
-    );
-    painter.line_segment(
-        [
-            tray.center() + vec2(-13.0, 10.0),
-            tray.center() + vec2(13.0, 10.0),
-        ],
-        Stroke::new(3.0_f32, ON_PRIMARY),
-    );
-    for offset in [vec2(-80.0, -52.0), vec2(84.0, 50.0)] {
-        painter.line_segment(
-            [c + offset - vec2(4.0, 0.0), c + offset + vec2(4.0, 0.0)],
-            Stroke::new(1.5_f32, p.primary),
-        );
-        painter.line_segment(
-            [c + offset - vec2(0.0, 4.0), c + offset + vec2(0.0, 4.0)],
-            Stroke::new(1.5_f32, p.primary),
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn nested_corners_share_the_same_center() {
-        assert_eq!(inner_radius(OUTER_RADIUS, INSET), 16.0);
-        assert_eq!(inner_radius(6.0, 8.0), 0.0);
+    fn independent_ui_threads_keep_their_own_palette() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = [false, true]
+            .into_iter()
+            .map(|dark| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let expected = crate::prefs::THEMES[2].palette_for(dark);
+                    set_palette(expected);
+                    barrier.wait();
+                    assert!(palette() == expected);
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 
     #[test]
-    fn translucent_overlay_keeps_requested_alpha() {
-        let color = alpha(Color32::from_rgb(10, 20, 30), 0.5);
-        assert_eq!(color.a(), 128);
-        assert_eq!(alpha(ON_PRIMARY, 2.0).a(), 255);
+    fn primary_button_paints_the_mode_specific_foreground() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            let expected = crate::prefs::THEMES[1].palette_for(dark);
+            set_palette(expected);
+            apply_style(&ctx, false);
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 200.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    button(ui, "Start", Icon::Download, ButtonKind::Primary, true);
+                });
+            });
+            fn color(shape: &egui::Shape) -> Option<Color32> {
+                match shape {
+                    egui::Shape::Text(text) if text.galley.job.text == "Start" => {
+                        Some(text.fallback_color)
+                    }
+                    egui::Shape::Vec(children) => children.iter().find_map(color),
+                    _ => None,
+                }
+            }
+            let actual = output
+                .shapes
+                .iter()
+                .find_map(|shape| color(&shape.shape))
+                .unwrap();
+            assert_eq!(actual, expected.on_primary);
+        }
+    }
+
+    #[test]
+    fn nested_corners_share_the_same_center() {
+        assert_eq!(inner_radius(OUTER_RADIUS, INSET), 2.0);
+        assert_eq!(inner_radius(6.0, 8.0), 0.0);
+    }
+
+    fn input_frame(
+        ctx: &egui::Context,
+        text: &mut String,
+        height: f32,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, egui::text_edit::TextEditOutput) {
+        let mut edit = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(600.0, 250.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    edit = Some(
+                        ui.allocate_ui_with_layout(
+                            vec2(240.0, height),
+                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                            |ui| {
+                                singleline_input(ui, text, "Search hint", height)
+                                    .id_salt("input-under-test")
+                                    .show(ui)
+                            },
+                        )
+                        .inner,
+                    );
+                });
+            },
+        );
+        (output, edit.unwrap())
+    }
+    #[test]
+    fn singleline_text_and_hint_are_centered_with_distinct_normal_hint_color() {
+        for height in [30.0, 34.0, 54.0] {
+            for value in ["", "Entered value"] {
+                let ctx = egui::Context::default();
+                apply_style(&ctx, false);
+                let mut text = value.to_owned();
+                let (output, edit) = input_frame(&ctx, &mut text, height, vec![]);
+                let expected = if value.is_empty() {
+                    "Search hint"
+                } else {
+                    value
+                };
+                fn find(
+                    shapes: &[egui::epaint::ClippedShape],
+                    text: &str,
+                ) -> Option<egui::epaint::TextShape> {
+                    fn shape(node: &egui::Shape, text: &str) -> Option<egui::epaint::TextShape> {
+                        match node {
+                            egui::Shape::Text(t) if t.galley.job.text == text => Some(t.clone()),
+                            egui::Shape::Vec(v) => v.iter().find_map(|s| shape(s, text)),
+                            _ => None,
+                        }
+                    }
+                    shapes.iter().find_map(|s| shape(&s.shape, text))
+                }
+                let painted = find(&output.shapes, expected).expect("painted input text");
+                let bounds = painted.galley.rect.translate(painted.pos.to_vec2());
+                assert!(
+                    (bounds.center().y - edit.response.rect.center().y).abs() < 0.6,
+                    "{height}: {bounds:?} in {:?}",
+                    edit.response.rect
+                );
+                let format = &painted.galley.job.sections[0].format;
+                assert_eq!(format.font_id, egui::TextStyle::Body.resolve(&ctx.style()));
+                assert_eq!(
+                    format.color,
+                    if value.is_empty() {
+                        muted_color()
+                    } else {
+                        ink()
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn pointer_clicks_in_both_halves_of_centered_text_insert_at_the_clicked_character() {
+        for height in [30.0, 34.0, 54.0] {
+            for y in [0.25, 0.5, 0.8] {
+                for index in [0, 4, 10] {
+                    let ctx = egui::Context::default();
+                    apply_style(&ctx, false);
+                    let mut text = "abcdefghij".to_owned();
+                    let (_, edit) = input_frame(&ctx, &mut text, height, vec![]);
+                    let caret = edit
+                        .galley
+                        .pos_from_ccursor(egui::text::CCursor::new(index));
+                    let pos = edit.galley_pos + vec2(caret.left() + 0.1, edit.galley.size().y * y);
+                    let _ = input_frame(
+                        &ctx,
+                        &mut text,
+                        height,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                    );
+                    let _ = input_frame(
+                        &ctx,
+                        &mut text,
+                        height,
+                        vec![egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        }],
+                    );
+                    let _ =
+                        input_frame(&ctx, &mut text, height, vec![egui::Event::Text("|".into())]);
+                    let mut expected = "abcdefghij".to_owned();
+                    expected.insert(index, '|');
+                    assert_eq!(text, expected, "height={height}, y={y}, index={index}");
+                }
+            }
+        }
     }
 }

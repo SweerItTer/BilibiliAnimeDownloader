@@ -25,6 +25,22 @@ class ClassifyPathsTests(unittest.TestCase):
         self.assertFalse(gui["run_cli"])
         self.assertTrue(gui["run_gui"])
 
+    def test_cli_guides_use_docs_without_widening_mixed_routes(self):
+        for guide in ("CLI.md", "CLI.zh-CN.md"):
+            with self.subTest(guide=guide):
+                docs = classify_paths((guide,))
+                self.assertEqual(docs, {
+                    "scope": "docs", "docs_changed": True,
+                    "run_cli": False, "run_gui": False,
+                })
+                cli = classify_paths((guide, "core-cli/src/main.rs"))
+                self.assertEqual(cli["scope"], "cli")
+                self.assertTrue(cli["docs_changed"])
+                gui = classify_paths((guide, "gui/src/main.rs"))
+                self.assertEqual(gui["scope"], "gui")
+                self.assertTrue(gui["docs_changed"])
+        self.assertEqual(classify_paths(("docs/CLI.md",))["scope"], "full")
+
     def test_core_bootstrap_uses_the_existing_cli_route(self):
         self.assertEqual(classify_paths(("core-bootstrap/src/main.rs",))["scope"], "cli")
         self.assertEqual(

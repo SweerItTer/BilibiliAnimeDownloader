@@ -16,6 +16,9 @@ use tokio::{
     time::Instant,
 };
 
+mod offline_replay;
+pub use offline_replay::OfflineApiReplay;
+
 const API: &str = "https://api.bilibili.com";
 pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 const REFERER: &str = "https://www.bilibili.com/";
@@ -23,6 +26,8 @@ const MAX_JSON: usize = 8 * 1024 * 1024;
 const MAX_COVER: usize = 8 * 1024 * 1024;
 const WBI_KEY_TTL: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
+const MAX_API_ATTEMPTS: u32 = 3;
+const MAX_API_BACKOFF: Duration = Duration::from_secs(2);
 
 pub(crate) struct ResolvedLocator {
     pub url: Url,
@@ -60,21 +65,50 @@ pub(crate) struct Api {
     client: reqwest::Client,
     credentials: Arc<RwLock<CredentialJar>>,
     connections: Arc<Semaphore>,
-    wbi_key: Mutex<Option<(Instant, String)>>,
+    retry: RetryPolicy,
+    replay: Option<OfflineApiReplay>,
+    wbi_key: Arc<Mutex<Option<(Instant, String)>>>,
+    search_device: Arc<Mutex<Option<[String; 2]>>>,
+    cooldown: Arc<ApiCooldown>,
+    pgc_conditions: Arc<Mutex<std::collections::HashMap<PgcSection, BrowseConditions>>>,
 }
 
 impl Api {
+    pub(crate) fn with_credentials(&self, credentials: Arc<RwLock<CredentialJar>>) -> Self {
+        Self {
+            client: self.client.clone(),
+            credentials,
+            connections: self.connections.clone(),
+            retry: self.retry.clone(),
+            replay: self.replay.clone(),
+            wbi_key: self.wbi_key.clone(),
+            search_device: self.search_device.clone(),
+            cooldown: self.cooldown.clone(),
+            pgc_conditions: self.pgc_conditions.clone(),
+        }
+    }
     pub(crate) fn new(
         client: reqwest::Client,
         credentials: Arc<RwLock<CredentialJar>>,
         connections: Arc<Semaphore>,
+        retry: RetryPolicy,
     ) -> Self {
         Self {
             client,
             credentials,
             connections,
-            wbi_key: Mutex::new(None),
+            retry,
+            replay: None,
+            wbi_key: Arc::new(Mutex::new(None)),
+            search_device: Arc::new(Mutex::new(None)),
+            cooldown: Arc::new(ApiCooldown::default()),
+            pgc_conditions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    pub(crate) fn with_replay(mut self, replay: Option<OfflineApiReplay>) -> Self {
+        self.replay = replay;
+        self
     }
 
     pub(crate) async fn resolve(&self, input: ContentInput) -> Result<MediaItem> {
@@ -243,53 +277,79 @@ impl Api {
     }
 
     pub(crate) async fn search(&self, query: SearchQuery) -> Result<CandidatePage> {
-        if query.keyword.trim().is_empty()
-            || query.keyword.len() > 256
-            || query.page == 0
-            || query.page > 1000
-        {
-            return Err(invalid("invalid search query"));
-        }
-        let categories: &[(&str, SearchCategory)] = match query.category {
-            SearchCategory::All => &[
-                ("video", SearchCategory::Video),
-                ("media_bangumi", SearchCategory::Bangumi),
-                ("media_ft", SearchCategory::Film),
-            ],
-            SearchCategory::Video => &[("video", SearchCategory::Video)],
-            SearchCategory::Bangumi => &[("media_bangumi", SearchCategory::Bangumi)],
-            SearchCategory::Film => &[("media_ft", SearchCategory::Film)],
-        };
-        let futures = categories.iter().map(|(kind, category)| {
-            let kind = *kind;
-            let category = *category;
-            let keyword = query.keyword.as_str();
-            let page = query.page;
-            async move {
-                let url = api_url(
-                    "/x/web-interface/search/type",
-                    &[
-                        ("search_type", kind.to_owned()),
-                        ("keyword", keyword.to_owned()),
-                        ("page", page.to_string()),
-                    ],
-                )?;
-                let value: Value = self
-                    .get_json(self.sign_wbi(url, &[]).await?, REFERER)
-                    .await?;
-                parse_search_page(category, page, &value)
+        query.validate()?;
+        let api = self.search_session().await?;
+        let api = &api;
+        search_pages(query, |mut url| async move {
+            let token = api
+                .credentials
+                .read()
+                .map_err(|_| {
+                    CoreError::new(ErrorCode::CredentialStore, "credential lock unavailable")
+                })?
+                .cookie_value_for("x-bili-gaia-vtoken", &url);
+            if let Some(token) = token {
+                url.query_pairs_mut().append_pair("gaia_vtoken", &token);
             }
-        });
-        let mut pages = futures_util::future::join_all(futures)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        let mut seen = HashSet::new();
-        for page in &mut pages {
-            page.items
-                .retain(|item| seen.insert(item.reference.clone()));
+            api.get_json(api.sign_wbi(url, &[]).await?, REFERER).await
+        })
+        .await
+    }
+
+    async fn search_session(&self) -> Result<Self> {
+        let origin = api_url("/", &[])?;
+        let mut jar = self
+            .credentials
+            .read()
+            .map_err(|_| CoreError::new(ErrorCode::CredentialStore, "credential lock unavailable"))?
+            .clone();
+        if jar.cookie_value_for("buvid3", &origin).is_none() {
+            // Obtain the same server-issued device identity used by web search.
+            // This cache is transient and never changes/persists account credentials.
+            let mut cached = self.search_device.lock().await;
+            if cached.is_none() {
+                let response: Value = self
+                    .get_json(api_url("/x/frontend/finger/spi", &[])?, REFERER)
+                    .await?;
+                let data = api_result(&response, "initialize search session")?;
+                *cached = Some(search_device_cookies(data)?);
+            }
+            jar.import_set_cookies(&origin, cached.as_ref().unwrap())?;
         }
-        Ok(CandidatePage { pages })
+        Ok(self.with_credentials(Arc::new(RwLock::new(jar))))
+    }
+
+    pub(crate) async fn browse_conditions(&self, section: PgcSection) -> Result<BrowseConditions> {
+        if let Some(conditions) = self.pgc_conditions.lock().await.get(&section).cloned() {
+            return Ok(conditions);
+        }
+        let value: Value = self
+            .get_json(
+                api_url(
+                    "/pgc/season/index/condition",
+                    &[
+                        ("season_type", section.season_type().to_string()),
+                        ("type", "1".into()),
+                    ],
+                )?,
+                REFERER,
+            )
+            .await?;
+        let conditions = parse_browse_conditions(section, &value)?;
+        self.pgc_conditions
+            .lock()
+            .await
+            .insert(section, conditions.clone());
+        Ok(conditions)
+    }
+
+    pub(crate) async fn browse(&self, query: BrowseQuery) -> Result<CandidatePage> {
+        query.validate()?;
+        let conditions = self.browse_conditions(query.section).await?;
+        let value: Value = self
+            .get_json(browse_url(&query, &conditions)?, REFERER)
+            .await?;
+        parse_browse_page(&query, &value).map(|page| CandidatePage { pages: vec![page] })
     }
 
     pub(crate) async fn cover(&self, request: CoverRequest) -> Result<CoverBytes> {
@@ -500,6 +560,7 @@ impl Api {
             sidecars: selection.sidecars,
             keep_temp: selection.keep_temp,
             catalog_revision: catalog.revision,
+            context: None,
         };
         plan.fingerprint = plan_fingerprint(&plan)?;
         Ok(plan)
@@ -601,14 +662,356 @@ impl Api {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, url: Url, referer: &str) -> Result<T> {
+        if let Some(replay) = &self.replay {
+            // Replay is an explicit response source, never an HTTP fallback.
+            return replay.response(&url).await;
+        }
         get_json_with(
             &self.client,
             &self.credentials,
             url,
             referer,
             &self.connections,
+            &self.retry,
+            &self.cooldown,
         )
         .await
+    }
+}
+
+fn parse_browse_conditions(section: PgcSection, value: &Value) -> Result<BrowseConditions> {
+    let data = api_result(value, "load PGC filters")?;
+    let raw_filters = data
+        .get("filter")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("PGC condition shape invalid"))?;
+    let mut filters = Vec::new();
+    for raw in raw_filters {
+        let Some(field) = raw
+            .get("field")
+            .and_then(Value::as_str)
+            .and_then(BrowseFilterField::from_api)
+        else {
+            continue;
+        };
+        if filters
+            .iter()
+            .any(|group: &BrowseFilterGroup| group.field == field)
+        {
+            continue;
+        }
+        let Some(label) =
+            text(raw.get("name")).filter(|name| !name.is_empty() && name.len() <= 128)
+        else {
+            continue;
+        };
+        let values = raw
+            .get("values")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid("PGC filter choices invalid"))?;
+        let mut choices = Vec::new();
+        for raw_choice in values.iter().take(128) {
+            let value =
+                text(raw_choice.get("keyword")).or_else(|| text_number(raw_choice.get("keyword")));
+            let label = text(raw_choice.get("name"));
+            if let (Some(value), Some(label)) = (value, label) {
+                if valid_browse_value(&value)
+                    && !label.is_empty()
+                    && label.len() <= 128
+                    && !choices
+                        .iter()
+                        .any(|choice: &BrowseChoice| choice.value == value)
+                {
+                    choices.push(BrowseChoice { value, label });
+                }
+            }
+        }
+        if !choices.is_empty() {
+            filters.push(BrowseFilterGroup {
+                field,
+                label,
+                choices,
+            });
+        }
+    }
+    let mut orders = Vec::new();
+    if let Some(raw_orders) = data.get("order").and_then(Value::as_array) {
+        for raw in raw_orders.iter().take(16) {
+            let id = text(raw.get("field"))
+                .or_else(|| text_number(raw.get("field")))
+                .and_then(|id| id.parse::<u32>().ok());
+            let label = text(raw.get("name"));
+            let sorts: Vec<u8> = text(raw.get("sort"))
+                .unwrap_or_else(|| "0".into())
+                .split(',')
+                .filter_map(|sort| sort.parse::<u8>().ok())
+                .filter(|sort| *sort <= 1)
+                .collect();
+            if let (Some(id), Some(label)) = (id.filter(|id| *id <= 8), label) {
+                if !label.is_empty()
+                    && label.len() <= 128
+                    && !sorts.is_empty()
+                    && !orders
+                        .iter()
+                        .any(|order: &BrowseOrderChoice| order.id == id)
+                {
+                    orders.push(BrowseOrderChoice { id, label, sorts });
+                }
+            }
+        }
+    }
+    Ok(BrowseConditions {
+        section,
+        filters,
+        orders,
+    })
+}
+
+fn browse_url(query: &BrowseQuery, conditions: &BrowseConditions) -> Result<Url> {
+    query.validate()?;
+    if conditions.section != query.section {
+        return Err(invalid("PGC conditions do not match section"));
+    }
+    for (field, value) in &query.filters {
+        if !conditions.filters.iter().any(|group| {
+            group.field == *field && group.choices.iter().any(|choice| choice.value == *value)
+        }) {
+            return Err(invalid("PGC filter is unavailable"));
+        }
+    }
+    let mut params = vec![
+        ("season_type", query.section.season_type().to_string()),
+        ("st", query.section.season_type().to_string()),
+        ("page", query.page.to_string()),
+        ("pagesize", query.page_size.to_string()),
+    ];
+    for group in &conditions.filters {
+        let choice = query
+            .filters
+            .get(&group.field)
+            .map(String::as_str)
+            .or_else(|| {
+                group
+                    .choices
+                    .iter()
+                    .find(|choice| choice.value == "-1")
+                    .map(|choice| choice.value.as_str())
+            })
+            .or_else(|| group.choices.first().map(|choice| choice.value.as_str()))
+            .ok_or_else(|| invalid("PGC filter choices missing"))?;
+        params.push((group.field.as_str(), choice.to_owned()));
+    }
+    if let Some(id) = query
+        .order
+        .or_else(|| conditions.orders.first().map(|choice| choice.id))
+    {
+        let order = conditions
+            .orders
+            .iter()
+            .find(|choice| choice.id == id)
+            .filter(|choice| choice.sorts.contains(&query.sort))
+            .ok_or_else(|| invalid("PGC order is unavailable"))?;
+        params.push(("order", order.id.to_string()));
+        params.push(("sort", query.sort.to_string()));
+    }
+    api_url("/pgc/season/index/result", &params)
+}
+
+fn parse_browse_page(query: &BrowseQuery, value: &Value) -> Result<CategoryPage> {
+    let data = api_result(value, "browse PGC index")?;
+    let rows = data
+        .get("list")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("PGC index shape invalid"))?;
+    let category = query.section.category();
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for row in rows {
+        let Some(season) = row
+            .get("season_id")
+            .and_then(Value::as_u64)
+            .and_then(|id| SeasonId::new(id).ok())
+        else {
+            continue;
+        };
+        if !seen.insert(season.get()) {
+            continue;
+        }
+        let Some(title) = text(row.get("title"))
+            .map(|title| strip_markup(&title))
+            .filter(|title| !title.is_empty())
+        else {
+            continue;
+        };
+        items.push(Candidate {
+            reference: ContentRef::Bangumi(season),
+            category,
+            title,
+            cover: safe_cover_url(text(row.get("cover"))),
+            duration_ms: None,
+            author: None,
+            published_at: row.get("pub_time").and_then(Value::as_u64),
+            plays: row.get("play").and_then(Value::as_u64),
+            danmaku: row.get("danmaku").and_then(Value::as_u64),
+        });
+    }
+    let total = data.get("total").and_then(Value::as_u64);
+    let page_size = data
+        .get("size")
+        .or_else(|| data.get("pagesize"))
+        .or_else(|| data.get("page_size"))
+        .and_then(Value::as_u64)
+        .and_then(|size| u32::try_from(size).ok())
+        .filter(|size| *size > 0);
+    let total_pages = data
+        .get("numPages")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| {
+            total
+                .zip(page_size)
+                .and_then(|(total, size)| u32::try_from(total.div_ceil(u64::from(size))).ok())
+        });
+    let has_more = data
+        .get("has_next")
+        .map(|value| truthy(Some(value)))
+        .unwrap_or_else(|| total_pages.is_some_and(|n| query.page < n));
+    Ok(CategoryPage {
+        category,
+        page: query.page,
+        total,
+        has_more,
+        items,
+        page_size,
+        total_pages,
+    })
+}
+
+/// The shared search request/response path. The private fetch boundary lets
+/// deterministic tests use loopback without changing production host policy.
+async fn search_pages<F, Response>(query: SearchQuery, fetch: F) -> Result<CandidatePage>
+where
+    F: Fn(Url) -> Response,
+    Response: std::future::Future<Output = Result<Value>>,
+{
+    query.validate()?;
+    let categories: &[(&str, SearchCategory)] = match query.category {
+        SearchCategory::All => &[
+            ("video", SearchCategory::Video),
+            ("media_bangumi", SearchCategory::Bangumi),
+            ("media_ft", SearchCategory::Film),
+        ],
+        SearchCategory::Video => &[("video", SearchCategory::Video)],
+        SearchCategory::Bangumi => &[("media_bangumi", SearchCategory::Bangumi)],
+        SearchCategory::Film => &[("media_ft", SearchCategory::Film)],
+    };
+    let futures = categories.iter().map(|(kind, category)| {
+        let fetch = &fetch;
+        let keyword = query.keyword.as_str();
+        let page = query.page;
+        let sort = query.sort;
+        let channel = query.filter.video_channel;
+        async move {
+            let mut params = vec![
+                ("search_type", (*kind).to_owned()),
+                ("keyword", keyword.to_owned()),
+                ("page", page.to_string()),
+            ];
+            let order = match sort {
+                SearchSort::Relevance => None,
+                SearchSort::Views => Some("click"),
+                SearchSort::Newest => Some("pubdate"),
+                SearchSort::Danmaku => Some("dm"),
+                SearchSort::Favorites => Some("stow"),
+                SearchSort::Comments => Some("scores"),
+            };
+            if let Some(order) = order {
+                params.push(("order", order.to_owned()));
+            }
+            if let Some(channel) = channel {
+                params.push(("tids", channel.to_string()));
+            }
+            let value = fetch(api_url("/x/web-interface/wbi/search/type", &params)?).await?;
+            parse_search_page(*category, page, &value)
+        }
+    });
+    let mut pages = futures_util::future::join_all(futures)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let mut seen = HashSet::new();
+    for page in &mut pages {
+        page.items
+            .retain(|item| seen.insert(item.reference.clone()));
+    }
+    Ok(CandidatePage { pages })
+}
+
+fn search_device_cookies(data: &Value) -> Result<[String; 2]> {
+    let mut cookies = Vec::new();
+    for (field, name) in [("b_3", "buvid3"), ("b_4", "buvid4")] {
+        let value = data
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 256
+                    && value.bytes().all(|b| {
+                        b.is_ascii_alphanumeric()
+                            || matches!(b, b'-' | b'_' | b'.' | b'=' | b'+' | b'/')
+                    })
+            })
+            .ok_or_else(|| invalid("search device identity malformed"))?;
+        cookies.push(format!(
+            "{name}={value}; Domain=bilibili.com; Path=/; Secure"
+        ));
+    }
+    cookies
+        .try_into()
+        .map_err(|_| invalid("search device identity malformed"))
+}
+
+#[derive(Default)]
+struct ApiCooldown(std::sync::Mutex<Option<Instant>>);
+impl ApiCooldown {
+    fn check(&self) -> Result<()> {
+        let until = self
+            .0
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::Corruption, "API cooldown lock unavailable"))?;
+        if until.is_some_and(|until| Instant::now() < until) {
+            let mut error = http_response_failure(429);
+            error.operation = "wait before retrying Bilibili API".into();
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn record(&self, value: Option<&header::HeaderValue>) -> Result<()> {
+        let now = std::time::SystemTime::now();
+        let delay = value
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .map(Duration::from_secs)
+                    .or_else(|| {
+                        httpdate::parse_http_date(value)
+                            .ok()
+                            .map(|at| at.duration_since(now).unwrap_or_default())
+                    })
+            })
+            .unwrap_or(Duration::from_secs(60))
+            .max(Duration::from_secs(1));
+        let deadline = Instant::now()
+            .checked_add(delay)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400));
+        let mut until = self
+            .0
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::Corruption, "API cooldown lock unavailable"))?;
+        *until = Some(until.map_or(deadline, |previous| previous.max(deadline)));
+        Ok(())
     }
 }
 
@@ -618,14 +1021,12 @@ async fn get_json_with<T: DeserializeOwned>(
     url: Url,
     referer: &str,
     connections: &Semaphore,
+    retry: &RetryPolicy,
+    cooldown: &ApiCooldown,
 ) -> Result<T> {
     if url.scheme() != "https" || !is_api_host(url.host_str().unwrap_or_default()) {
         return Err(invalid("API host is not allowed"));
     }
-    let _permit = connections
-        .acquire()
-        .await
-        .map_err(|_| CoreError::new(ErrorCode::Shutdown, "core connection pool closed"))?;
     let cookie = {
         let credentials = jar.read().map_err(|_| {
             CoreError::new(ErrorCode::CredentialStore, "credential lock unavailable")
@@ -639,9 +1040,68 @@ async fn get_json_with<T: DeserializeOwned>(
     if let Some(cookie) = cookie {
         req = req.header(header::COOKIE, cookie);
     }
+    get_json_request(req, connections, retry, cooldown).await
+}
+
+// Only the trusted-host adapter above constructs production requests. Keeping
+// the request executor private also permits real loopback transport tests.
+async fn get_json_request<T: DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    connections: &Semaphore,
+    retry: &RetryPolicy,
+    cooldown: &ApiCooldown,
+) -> Result<T> {
+    let attempts = retry.attempts.clamp(1, MAX_API_ATTEMPTS);
+    for attempt in 1..=attempts {
+        let result = {
+            let _permit = connections
+                .acquire()
+                .await
+                .map_err(|_| CoreError::new(ErrorCode::Shutdown, "core connection pool closed"))?;
+            let request = request
+                .try_clone()
+                .ok_or_else(|| invalid("clone API GET request"))?;
+            cooldown.check()?;
+            read_json_response(request, cooldown).await
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(mut error) => {
+                if !error.retryable {
+                    return Err(error);
+                }
+                if attempt == attempts {
+                    if attempt > 1 {
+                        error.code = ErrorCode::RetryExhausted;
+                    }
+                    return Err(error);
+                }
+                // No permit or response survives backoff. Dropping this future
+                // cancels the entire operation; retries own no spawned work.
+                tokio::time::sleep(api_retry_delay(retry, attempt)).await;
+            }
+        }
+    }
+    unreachable!("API attempts are nonzero")
+}
+
+fn api_retry_delay(retry: &RetryPolicy, completed_attempts: u32) -> Duration {
+    retry
+        .base_delay
+        .saturating_mul(1 << completed_attempts.saturating_sub(1).min(2))
+        .min(MAX_API_BACKOFF)
+}
+
+async fn read_json_response<T: DeserializeOwned>(
+    req: reqwest::RequestBuilder,
+    cooldown: &ApiCooldown,
+) -> Result<T> {
     let mut response = req.send().await.map_err(|error| request_failure(&error))?;
     let status = response.status().as_u16();
     if !response.status().is_success() {
+        if status == 429 {
+            cooldown.record(response.headers().get(header::RETRY_AFTER))?;
+        }
         return Err(http_response_failure(status));
     }
     if response
@@ -657,7 +1117,7 @@ async fn get_json_with<T: DeserializeOwned>(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| with_http_status(transport("read Bilibili API response"), status))?
+        .map_err(|error| body_failure(&error, status))?
     {
         if bytes.len().saturating_add(chunk.len()) > MAX_JSON {
             return Err(with_http_status(
@@ -703,6 +1163,13 @@ fn parse_search_page(category: SearchCategory, page: u32, value: &Value) -> Resu
             cover: safe_cover_url(text(row.get("pic")).or_else(|| text(row.get("cover")))),
             duration_ms: duration_ms(row.get("duration"))
                 .or_else(|| parse_duration(row.get("duration"))),
+            author: text(row.get("author")).or_else(|| text(row.get("up_name"))),
+            published_at: row.get("pubdate").and_then(Value::as_u64),
+            plays: row.get("play").and_then(Value::as_u64),
+            danmaku: row
+                .get("danmaku")
+                .and_then(Value::as_u64)
+                .or_else(|| row.get("video_review").and_then(Value::as_u64)),
         });
     }
     let total = data
@@ -721,12 +1188,29 @@ fn parse_search_page(category: SearchCategory, page: u32, value: &Value) -> Resu
         },
         |page_count| u64::from(page) < page_count,
     );
+    let page_size = data
+        .get("pagesize")
+        .or_else(|| data.get("page_size"))
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0);
+    let total_pages = data
+        .get("numPages")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| {
+            total
+                .zip(page_size)
+                .and_then(|(total, size)| u32::try_from(total.div_ceil(u64::from(size))).ok())
+        });
     Ok(CategoryPage {
         category,
         page,
         total,
         has_more,
         items,
+        page_size,
+        total_pages,
     })
 }
 
@@ -786,6 +1270,27 @@ fn parse_season_item(
     Ok(MediaItem {
         reference,
         bvid: None,
+        source: Some(SourceProject {
+            reference: ContentRef::Bangumi(season),
+            title: title.clone(),
+            category: match result
+                .get("type")
+                .or_else(|| result.get("season_type"))
+                .and_then(Value::as_u64)
+            {
+                Some(1 | 4) => Some(SearchCategory::Bangumi),
+                Some(2 | 3 | 5 | 7) => Some(SearchCategory::Film),
+                _ => None,
+            },
+            cover: cover.clone(),
+            ordinal: if selected.is_some() {
+                parts[0].ordinal
+            } else {
+                0
+            },
+        }),
+        description: text(result.get("evaluate")),
+        author: text(result.pointer("/up_info/uname")),
         title,
         cover,
         duration_ms: None,
@@ -848,6 +1353,15 @@ fn parse_video_item(
     Ok(MediaItem {
         reference: ContentRef::Video(aid),
         bvid,
+        source: Some(SourceProject {
+            reference: ContentRef::Video(aid),
+            title: title.clone(),
+            category: Some(SearchCategory::Video),
+            cover: cover.clone(),
+            ordinal: 0,
+        }),
+        description: text(data.get("desc")),
+        author: text(data.pointer("/owner/name")),
         title,
         cover,
         duration_ms: duration_ms(data.get("duration")),
@@ -952,6 +1466,9 @@ fn select_video_part(mut item: MediaItem, ordinal: Option<u32>) -> Result<MediaI
             .find(|part| part.ordinal == ordinal)
             .ok_or_else(|| invalid("video part does not exist"))?;
         item.duration_ms = part.duration_ms;
+        if let Some(source) = &mut item.source {
+            source.ordinal = part.ordinal;
+        }
         item.parts = vec![part];
     }
     Ok(item)
@@ -1426,16 +1943,7 @@ fn locator(
         .host_str()
         .ok_or_else(|| invalid("stream host missing"))?
         .to_owned();
-    let identity_bytes = serde_json::to_vec(key)
-        .map_err(|_| CoreError::new(ErrorCode::Corruption, "serialize stream identity"))?;
-    let identity_hash = Sha256::digest(identity_bytes);
-    let identity = format!(
-        "{}:{}:{:x}:{}",
-        part.aid.get(),
-        part.cid.get(),
-        identity_hash,
-        ordinal
-    );
+    let identity = resource_identity(part, key, ordinal)?;
     Ok(ResolvedLocator {
         url,
         referer: REFERER.into(),
@@ -1444,6 +1952,34 @@ fn locator(
         expected_size: size,
         allowed_origins: vec![origin],
     })
+}
+fn resource_identity(part: &PartRef, key: &RepresentationKey, ordinal: u32) -> Result<String> {
+    let identity_bytes = serde_json::to_vec(key)
+        .map_err(|_| CoreError::new(ErrorCode::Corruption, "serialize stream identity"))?;
+    let identity_hash = Sha256::digest(identity_bytes);
+    Ok(format!(
+        "{}:{}:{:x}:{}",
+        part.aid.get(),
+        part.cid.get(),
+        identity_hash,
+        ordinal
+    ))
+}
+pub(crate) fn planned_resource_identities(plan: &StreamPlan) -> Result<Vec<String>> {
+    let keys: Vec<_> = match plan.topology {
+        StreamTopology::Dash => std::iter::once((&plan.video, 0))
+            .chain(plan.audio.iter().map(|key| (key, 0)))
+            .collect(),
+        StreamTopology::Direct => vec![(&plan.video, 0)],
+        StreamTopology::Sequential => plan
+            .segments
+            .iter()
+            .map(|segment| (&plan.video, segment.ordinal))
+            .collect(),
+    };
+    keys.into_iter()
+        .map(|(key, ordinal)| resource_identity(&plan.part, key, ordinal))
+        .collect()
 }
 fn stream_url(v: &Value) -> Result<Option<Url>> {
     let mut invalid_candidate = None;
@@ -1701,18 +2237,12 @@ fn api_result<'a>(v: &'a Value, operation: &'static str) -> Result<&'a Value> {
             .or_else(|| root.get("result"))
             .ok_or_else(|| response_error(v, operation))?;
         if data.get("v_voucher").is_some() {
-            Err(CoreError::new(
-                ErrorCode::VerificationRequired,
-                "Bilibili verification required",
-            ))
+            Err(verification_required(v))
         } else {
             Ok(data)
         }
     } else if code == -352 || code == -412 || has_voucher(v) {
-        Err(CoreError::new(
-            ErrorCode::VerificationRequired,
-            "Bilibili verification required",
-        ))
+        Err(verification_required(v))
     } else if matches!(code, -101 | -111) {
         Err(CoreError::new(
             ErrorCode::LoginRequired,
@@ -1784,13 +2314,18 @@ fn raw_durl_count(raw: &Value) -> usize {
 }
 fn response_error(v: &Value, op: &'static str) -> CoreError {
     if has_voucher(v) {
-        CoreError::new(
-            ErrorCode::VerificationRequired,
-            "Bilibili verification required",
-        )
+        verification_required(v)
     } else {
         CoreError::new(ErrorCode::Transport, op)
     }
+}
+fn verification_required(value: &Value) -> CoreError {
+    let mut error = CoreError::new(
+        ErrorCode::VerificationRequired,
+        "Bilibili verification required",
+    );
+    error.verification = crate::verification::VerificationRequest::from_response(value);
+    error
 }
 fn api_url(path: &str, params: &[(&str, String)]) -> Result<Url> {
     let mut u = Url::parse(&format!("{API}{path}")).map_err(|_| invalid("invalid API endpoint"))?;
@@ -1998,7 +2533,7 @@ fn strip_markup(s: &str) -> String {
     }
     out
 }
-fn safe_filename(title: &str, suffix: &str) -> String {
+pub(crate) fn safe_filename(title: &str, suffix: &str) -> String {
     const MAX_COMPONENT_BYTES: usize = 255;
     let cleaned: String = title
         .chars()
@@ -2108,10 +2643,54 @@ fn request_failure(error: &reqwest::Error) -> CoreError {
     } else {
         "request Bilibili API"
     };
-    transport(operation)
+    let mut failure = transport(operation);
+    failure.retryable = transient_network_failure(error);
+    failure
+}
+fn body_failure(error: &reqwest::Error, status: u16) -> CoreError {
+    let operation = if error.is_timeout() {
+        "read Bilibili API response timed out"
+    } else {
+        "read Bilibili API response"
+    };
+    let mut failure = with_http_status(transport(operation), status);
+    failure.retryable = transient_network_failure(error);
+    failure
+}
+fn transient_network_failure(error: &reqwest::Error) -> bool {
+    use std::error::Error;
+
+    if error.is_timeout() || error.is_connect() || error.is_body() {
+        return true;
+    }
+    // Response::chunk wraps transport-body errors as Decode. Inspect typed
+    // causes, never their text; JSON deserialization below is not retried.
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_timeout() || error.is_connect() || error.is_body())
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::TimedOut
+                )
+            })
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 fn http_response_failure(status: u16) -> CoreError {
-    with_http_status(transport("request Bilibili API"), status)
+    let mut failure = with_http_status(transport("request Bilibili API"), status);
+    failure.retryable = matches!(status, 408 | 500 | 502 | 503 | 504);
+    failure
 }
 fn with_http_status(mut error: CoreError, status: u16) -> CoreError {
     error.http_status = Some(status);

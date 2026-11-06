@@ -8,6 +8,8 @@ import subprocess
 DOC_FILES = frozenset({
     "README.md",
     "README.zh-CN.md",
+    "CLI.md",
+    "CLI.zh-CN.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "CODE_OF_CONDUCT.md",

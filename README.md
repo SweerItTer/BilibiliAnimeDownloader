@@ -4,6 +4,10 @@ English | [简体中文](README.zh-CN.md)
 
 A Rust CLI for searching and downloading Bilibili videos. It can combine downloaded audio and video into a playable file and save subtitle and danmaku files. `bili_core` is reusable by Rust applications; `bili` is the command-line client.
 
+- [CLI guide and all commands](CLI.md): login, search, quality selection, downloads, recovery, cleanup, configuration and updates.
+- [Native GUI build and update instructions](gui/README.md).
+- [Developer build setup](BUILDING.md).
+
 ## Download and status
 
 Version `2.0.0-alpha.6` is a Linux x86_64 CLI prerelease. Its package and checksums are available on the [version's release page](https://github.com/SweerItTer/BilibiliAnimeDownloader/releases/tag/v2.0.0-alpha.6). Release CI validates packages offline; online checks are separate, explicitly authorized manual acceptance, and access to external services is not guaranteed. Older releases contain the former Python application. Windows packages are not included in this Alpha; macOS is out of scope.
@@ -16,47 +20,43 @@ Replace `KEYWORD` with a search term and `VIDEO_ID` with an ID from the results 
 
 ```sh
 ./bin/bili search "KEYWORD" --type video --page 1 --auth anonymous
-./bin/bili download VIDEO_ID --list-resolutions --parts all --auth anonymous
+./bin/bili qualities VIDEO_ID --auth anonymous
 ./bin/bili download VIDEO_ID --parts all --output "$HOME/Videos/Bilibili" --auth anonymous
 ```
 
-Use `--list-resolutions` to view each part's quality IDs, actual dimensions, frame rate, codec and access status without starting a download. Select a listed Quality ID with `download VIDEO_ID --quality QUALITY_ID`; dimensions and Stream IDs are different values. Missing metadata or access reasons appear as unknown. Use `--parts 1,3-5` to choose parts, or `qualities VIDEO_ID --part 3` for one part. Add `--json` for machine-readable output. On Windows, use `.\bili.exe` in PowerShell with the same arguments.
+`qualities` inspects one part without starting a download; use `--part 3` to inspect its original part number 3. Select a listed Quality ID with `download VIDEO_ID --quality QUALITY_ID`; dimensions and Stream IDs are different values. Use `--parts 1,3-5` to choose download parts. Current source also provides `download VIDEO_ID --list-resolutions` for a multi-part catalog; Alpha 6 does not. Add `--json` for machine-readable output. On Windows source builds, use `.\bili.exe` in PowerShell with the same arguments.
 
-The CLI prints completed file paths. It does not install or launch a video player. Use `./bin/bili --help` for other commands and options.
+The CLI prints completed file paths. It does not install or launch a video player. Continue with the [full CLI guide](CLI.md), or run `./bin/bili download --help` for a command's options. Source builds also support [video search sorting](CLI.md#search); the published Alpha 6 package does not.
 
 ## Checking and installing updates
 
-A CLI **built from this branch** supports checking and manually installing updates from a compatible versioned package. Use isolated installations for this unreleased updater. The published `2.0.0-alpha.6` package has no `update` subcommand:
+A CLI **built from current source** supports checking and manually installing compatible updates on Linux and native Windows. The published `2.0.0-alpha.6` package has no `update` subcommand and needs a manual first installation of a compatible package:
 
 ```sh
 ./bin/bili update --check
 ./bin/bili update
 ```
 
-Checks read a fixed HTTPS static index; archives download directly from the matching tagged GitHub Release. The client does not call the Releases API or require an API key. `--pre-release` also considers pre-release versions for that one command (`--pre-release=false` forces the stable channel even when the settings file opts in).
-
-The updater uses the same versioned installation protocol on Linux and native Windows. In Windows PowerShell, run:
-
-```powershell
-.\bili.exe update --check
-.\bili.exe update
-```
-
-For the first compatible package, extract the complete tree into a writable installation directory. Later updates locate that directory from the running executable, prepare and validate a separate version, then switch `CURRENT`; they do not overwrite the running payload or delete the previous version. Windows retains the canonical executable path when checking and starting deeply installed payloads, including paths with spaces or non-ASCII names. Filesystem path and component limits still apply.
-
-`2.0.0-alpha.6` predates this protocol and cannot update itself: extract the first compatible package into a new directory by hand.
-
-The shared protocol, descriptor format, configuration keys, verification results and known limits are documented in [the update protocol spec](.trellis/spec/bili_core/backend/update-protocol.md). `auto_update` there is a GUI-only preference; the CLI only ever checks unless you run `bili update` yourself.
+Stable releases are the default. Add `--pre-release` to consider prereleases for that command only; `--pre-release=false` forces stable. Checks use a fixed HTTPS catalog and require a matching product/platform package. Installation validates a separate new version before selecting it and retains the old one. The CLI installs only when you explicitly run `update`. See [updates and compatibility](CLI.md#updates) for package layout, Windows invocation, persistent preferences and automatic-check behavior.
 
 ## Login and privacy
 
-Login is not saved by default. For a one-command QR login, use `--auth qr` on the command that needs it, such as `download`; the login ends when that command ends. To use a QR login in later commands, explicitly save it with `./bin/bili login qr --remember`, then use `--auth stored`. Secure OS storage is preferred; if unavailable, the CLI warns that saved login may be stored as plaintext in the local user configuration directory. Never save test-only credentials or put cookies in command text, logs, or reports.
+To stay logged in across commands, explicitly remember the account once:
+
+```sh
+./bin/bili login qr --remember
+./bin/bili download VIDEO_ID --parts 1
+```
+
+Later commands use the saved account automatically through the default `--auth auto`; you do not need to log in again or repeat `--auth stored`. For a login used only by one download, use `download VIDEO_ID --auth qr` instead. A standalone `login qr` without `--remember` validates the login but does not make it available to the next process.
+
+Secure OS storage is preferred; if unavailable, a warning explains possible plaintext fallback. The [login guide](CLI.md#login) covers disabling that fallback, Cookie input, status and logout. Never put Cookies in command text or save test-only credentials.
 
 Only download content you are authorized to save. The application does not bypass login, entitlements, regional restrictions, or DRM. If the website asks for additional verification, stop; the CLI reports an error.
 
 ## Limits and build
 
-This branch adds the native desktop GUI; the Alpha release still targets Linux x86_64, and Windows release assets are not published yet. Aria2, verification WebView, search sorting, and corrupted-segment repair are not included. Stability, performance, and recovery have not been fully tested. FFmpeg is supplied as replaceable shared libraries; no FFmpeg executable or player is shipped or launched. The application is under the [MIT License with Commons Clause](LICENSE); FFmpeg and other third-party components have separate terms in the package notices.
+Current source includes a native desktop GUI and video search sorting; the published Alpha still targets Linux x86_64 CLI, without Windows or GUI release assets. Aria2, verification WebView and corrupted-segment repair are not included. Stability, performance, and abnormal-exit recovery have not been fully qualified. FFmpeg is supplied as replaceable shared libraries; no FFmpeg executable or player is shipped or launched. The application is under the [MIT License with Commons Clause](LICENSE); FFmpeg and other third-party components have separate terms in the package notices.
 
 See [BUILDING.md](BUILDING.md) for developer build requirements and commands.
 

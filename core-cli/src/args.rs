@@ -29,6 +29,9 @@ pub enum Command {
         category: Category,
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
+        /// Server-side order; non-default choices require --type video.
+        #[arg(long, value_enum, default_value = "relevance")]
+        sort: SearchSort,
         #[command(flatten)]
         auth: AuthOptions,
     },
@@ -114,6 +117,16 @@ pub enum Login {
         remember: bool,
     },
     Status,
+    /// List remembered credential profiles without contacting Bilibili.
+    List,
+    /// Select a remembered credential profile by its opaque ID.
+    Select {
+        id: String,
+    },
+    /// Forget one remembered credential profile.
+    Forget {
+        id: String,
+    },
 }
 
 #[derive(Args)]
@@ -124,6 +137,9 @@ pub struct AuthOptions {
     /// Persist this invocation's production login explicitly (off by default).
     #[arg(long)]
     pub remember: bool,
+    /// Select a remembered credential profile (use `login list` to obtain IDs).
+    #[arg(long, conflicts_with = "remember")]
+    pub profile: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -141,6 +157,27 @@ pub enum Category {
     Video,
     Bangumi,
     Film,
+}
+#[derive(Clone, Copy, ValueEnum)]
+pub enum SearchSort {
+    Relevance,
+    Views,
+    Newest,
+    Danmaku,
+    Favorites,
+    Comments,
+}
+impl From<SearchSort> for bili_core::SearchSort {
+    fn from(sort: SearchSort) -> Self {
+        match sort {
+            SearchSort::Relevance => Self::Relevance,
+            SearchSort::Views => Self::Views,
+            SearchSort::Newest => Self::Newest,
+            SearchSort::Danmaku => Self::Danmaku,
+            SearchSort::Favorites => Self::Favorites,
+            SearchSort::Comments => Self::Comments,
+        }
+    }
 }
 #[derive(Clone, Copy, ValueEnum)]
 pub enum MergeMode {
@@ -191,4 +228,41 @@ pub struct Download {
     pub connections: Option<u16>,
     #[arg(long)]
     pub keep_temp: bool,
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn profile_management_and_authenticated_commands_share_the_selector() {
+        assert!(matches!(
+            Cli::try_parse_from(["bili", "login", "list"])
+                .unwrap()
+                .command,
+            Command::Login {
+                method: Login::List
+            }
+        ));
+        assert!(
+            matches!(Cli::try_parse_from(["bili","login","select","opaque-id"]).unwrap().command,
+            Command::Login {method:Login::Select { id }} if id=="opaque-id")
+        );
+        let command = Cli::try_parse_from(["bili", "download", "av1", "--profile", "opaque-id"])
+            .unwrap()
+            .command;
+        assert!(
+            matches!(command,Command::Download(download) if download.auth.profile.as_deref()==Some("opaque-id"))
+        );
+        assert!(Cli::try_parse_from([
+            "bili",
+            "download",
+            "av1",
+            "--profile",
+            "opaque-id",
+            "--remember"
+        ])
+        .is_err());
+    }
 }

@@ -4,6 +4,10 @@
 
 ### ✨ Features
 
+- Restructure the native GUI around browsing, content details and one shared single/bulk download dialog. Add strict per-part quality checks, batch directories and rate limits, retained admission receipts, grouped three-state history, media information, Windows file location and ownership-verified recycling.
+- Add saved Light, Dark and System GUI appearance with neutral surfaces, readable status colors and restrained corners. Keep the accent color, background brightness and image opacity independent.
+- Add shared credential profiles with explicit remembering, isolated job identities and CLI profile selection; support video channels, source pagination metadata and dynamic genre browsing. Open supported Windows verification challenges only on request and keep verification tokens out of persistent storage.
+- Add shared video search sorting to Core, CLI and GUI: relevance, views, newest, danmaku, favorites and comments. Preserve server pagination and reject unsupported category/order combinations before authentication or network requests.
 - Add the native GUI, including search, queues, session login and appearance settings. GUI updating now uses the shared static catalog, GUI identity, headless native validation and core installation transaction.
 - Add `download --list-resolutions` and readable `qualities` output: one table per part retains descriptions, dimensions, frame rate and codecs, with separate login/VIP requirements and returned-address evidence. Queries create no download jobs and keep machine-readable JSON output.
 - Add a shared update protocol in `bili_core` and the `bili update [--check] [--pre-release[=true|false]]` command on top of it: per-product release descriptors, SemVer-precedence selection across stable and pre-release channels, verified archive download, a versioned install layout with an atomic `CURRENT` pointer, and a throttled reminder that announces each available version at most once per channel.
@@ -11,6 +15,32 @@
 
 ### 🐞 Fixes
 
+- Match PGC filtering to the Bilibili web index, including source-provided fields and sorting. Preserve compatible selections between Anime and Chinese Animation and explain unavailable filters.
+- Return to the top after successful discovery pagination or filter changes while preserving position on failed or cancelled requests.
+- Keep internal sidecar JSON/lock files in the state directory, migrate old ownership records, and remove empty generated project folders after recycling media while preserving unrelated files.
+- Bound cover texture caching, skip offscreen image work and avoid copying every result card during each frame.
+
+- Use the current WBI search endpoint and obtain server-issued device cookies when needed. Pause subsequent API requests after HTTP 429 according to `Retry-After`, instead of allowing repeated requests during the cooldown.
+- Retry remuxing complete downloads from their validated local checkpoints without requiring fresh media addresses. Keep incomplete recovery and strict representation, file hash and output checks.
+- Explain when an old task references an unavailable account and direct users to select an existing account, instead of asking a currently logged-in user to scan again.
+- Preserve the active account's task identity when upgrading to remembered login, and offer a direct retry with the current account for old failed tasks. Allow complete media to finish local remux even when the captured account is unavailable; requested sidecar failures remain visible.
+
+- Treat API frame-rate labels as catalogue metadata while retaining strict native packet-copy timing checks, so a mislabeled frame rate does not reject a completed transfer. Preserve original representation keys and recovery files.
+- Simplify account menus and download configuration: show larger quality lists, pin folder/default controls, use a vector close icon, and remove Skip and the duplicate close action. Support opt-in saved login in an explicit persistent GUI profile.
+
+- Move GUI search beside the category tabs, increase text input padding, round filter surfaces and selected sort buttons, and center the empty search prompt. Add an explicit anonymous live launch with private storage and no response replay.
+
+- Keep search, browsing and detail requests visibly pending until they finish or are cancelled. Disable paging and bulk-selection controls during pending work, and retain actionable retry errors until dismissal or retry. Give foreground operations priority over bounded cover requests, retry transient API GET failures within configured limits, and retain safe failure stages and HTTP status codes.
+- Preserve the total validated bytes across video and audio when resuming a download, including retained data in later resources. Continue to reflect real resets when checkpoints are invalid or the server replaces a partial response with a full response.
+- Fill the detail page with a responsive full-width episode grid and a compact single-part download action. Wrap download-dialog episode choices across its available width. Preserve original part selection when reopening details or deliberately preparing a removed task again.
+- Keep whole-video and explicit-part detail drafts separate, so opening `?p=2` after the whole video retains the requested original part through configuration and admission.
+- Distinguish provider quality names from video pixel dimensions in download preparation and history; retain widescreen source dimensions without resizing or silently selecting a lower quality.
+- Blend GUI background opacity once over a neutral light/dark base, with a separate neutral brightness control. Full opacity and brightness preserve original colors; changing the accent does not tint the image.
+- Keep the GUI header and window controls readable over background photos, remove duplicate title-bar branding, and disable history verification actions while another request is pending.
+- Keep disabled GUI button labels readable in Light and Dark appearances by applying the native disabled tint once.
+- Bound download preparation to a floating dialog, move batch limits into collapsed advanced options, and inherit a separately saved default limit for new drafts. Show concrete obtainable quality choices instead of advertised-only or duplicate highest options.
+- Preserve portrait and landscape cover proportions in the GUI, use poster slots for Bangumi/Film, remove the redundant category caption, and center single-line input text with clearly muted placeholders.
+- Restrict the Windows recycle-bin adapter to its supported platform so Linux GUI workspace checks can compile.
 - Keep packaging-time diagnostic profiles in an independent system temporary directory, so Windows extended staging paths do not make the CLI doctor reject its private profile.
 - Ignore a null or non-numeric top-level play URL quality when matching returned-address evidence, falling back to the direct segment quality as the representation parser already does.
 - Fill a missing `support_formats` description from the same-ID accepted-quality description instead of exposing a placeholder label; richer per-format descriptions still win.
@@ -22,10 +52,15 @@
 
 ### 💥 Breaking Changes
 
+- Replace the genre-only `BrowseQuery` and `BrowseConditions` Rust fields with typed source filter groups, exact values and advertised sorting. Matched SDK consumers must update their callers and rebuild.
+- Add optional `CoreConfig.api_replay` and exported `OfflineApiReplay` for isolated response-data checks. Struct-literal and matched SDK consumers must rebuild; `CoreConfig::new` keeps replay disabled by default.
+- Extend public Rust discovery, plan, error and job structs with typed filters and optional metadata. Source consumers must supply the new fields and rebuild matched SDK binaries; older serialized state defaults missing optional fields. OS recycling is supplied through the trusted host adapter in `CoreConfig`.
+- Add `sort` to the public Rust `SearchQuery` struct. Source callers must supply `SearchSort` and rebuild matched consumers; serialized queries without the field retain the default order.
 - The stable package entry remains unchanged, but the CLI and native runtime now live under `versions/<id>/`, selected by `CURRENT`. `2.0.0-alpha.6` cannot update to this layout; manually extract the first compatible package into a new directory rather than overwriting an Alpha 6 installation. No automatic migration is provided.
 
 ### 📝 Documentation
 
+- Add complete English and Chinese CLI guides covering commands, options, login reuse, quality/part selection, downloads, recovery, cleanup, configuration, JSON and updates. Keep README quick starts compatible with the published Alpha 6 and distinguish newer source-only features.
 - Add community conduct, contribution, security and accessibility guidance, plus issue forms and a pull request template.
 - Document the shared CLI update protocol, Windows path handling and reproducible offline package acceptance; retain historical Linux/Windows results and the GUI's implemented product isolation and headless validation contract.
 
@@ -47,6 +82,12 @@
 - Archive successful CI runs' non-product handoffs in GHCR with digest-pinned readback before deleting Actions copies. Use a trusted default-branch workflow; preserve failed-run inputs and both SDK verification modes without uploading the unused rlib SDK archive.
 - Rebuild and deploy the complete static update catalog after qualified release publication, with an index-only manual entry in the same workflow; preserve ordinary tag/main release gates and the six-asset release bundle.
 
+
+### ✅ Tests
+
+- Add disposable debugging of the actual native GUI with private settings/tasks/output, memory-only accounts, required process-local proxy restrictions and no update worker. Preserve the private settings destination when resetting appearance.
+- Add bounded local API response replay for the real Core and GUI detail/selection/configuration path; reject missing responses without live fallback and remove the alternate Review GUI. Supply reproducible synthetic scenarios through `scripts/debug_gui.py`.
+- Add an offline child-process crash regression for committed job recovery, uncommitted media tails and Range continuation with ETag and SHA-256 checks. This covers process termination, not physical power-loss qualification.
 
 ## [2.0.0-alpha.6] - 2026-10-29
 

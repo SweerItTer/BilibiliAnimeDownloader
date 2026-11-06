@@ -4,15 +4,16 @@ use crate::{
     background::{Background, CropEvent},
     covers::CoverCache,
     detail::DetailState,
+    download_config::ConfigState,
     download_panel::QueueState,
     login::{LoginAction, LoginState},
-    prefs::{BackgroundScope, GuiPrefs, StartPage, UpdateChannel, THEMES},
+    prefs::{AppearanceMode, BackgroundScope, GuiPrefs, StartPage, UpdateChannel, THEMES},
     search::SearchState,
     theme::{self, ButtonKind, Icon},
     update::{self, Status as UpdateStatus, UpdateState},
     window::{self, Action as WindowAction},
 };
-use bili_core::{AuthSnapshot, ContentRef, ErrorCode, JobId, JobPhase, QueueSnapshot, SearchQuery};
+use bili_core::{AuthSnapshot, ContentRef, ErrorCode, JobId, QueueSnapshot, SearchQuery};
 use egui::{RichText, Ui};
 use std::{
     collections::{HashMap, HashSet},
@@ -21,17 +22,28 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const SIDEBAR_WIDTH: f32 = 210.0;
-const CONTENT_MAX_WIDTH: f32 = 1120.0;
 const TOAST_WIDTH: f32 = 380.0;
 const TOAST_ERROR_TTL: Duration = Duration::from_secs(12);
 const TOAST_NOTICE_TTL: Duration = Duration::from_secs(8);
+
+type DetailDraftKey = (ContentRef, Vec<bili_core::PartRef>);
+
+// Whole-content and explicit-part responses may share a ContentRef. Restore
+// only a draft for the incoming original parts, preserving their order.
+fn detail_draft_key(item: &bili_core::MediaItem) -> DetailDraftKey {
+    (
+        item.reference.clone(),
+        item.parts
+            .iter()
+            .map(|part| part.reference.clone())
+            .collect(),
+    )
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Page {
     Discover,
     Queue,
-    Completed,
     Settings,
     About,
 }
@@ -45,6 +57,9 @@ enum Busy {
     Restore,
     Logout,
     Output,
+    Account,
+    Verification,
+    Files,
 }
 
 impl Busy {
@@ -57,6 +72,9 @@ impl Busy {
             Self::Restore => "正在恢复保存的登录…",
             Self::Logout => "正在清除登录状态…",
             Self::Output => "正在检查保存位置…",
+            Self::Account => "正在更新账号…",
+            Self::Verification => "正在处理安全验证…",
+            Self::Files => "正在处理下载文件…",
         }
     }
 }
@@ -64,7 +82,14 @@ impl Busy {
 #[derive(Clone)]
 enum Retry {
     Search(SearchQuery),
+    Browse(bili_core::BrowseQuery),
+    BrowseConditions(bili_core::PgcSection),
     Resolve(String),
+    Prepare {
+        inputs: Vec<backend::PrepareInput>,
+        profile: Option<String>,
+        refresh: bool,
+    },
     Login,
     Output(PathBuf),
     Restore,
@@ -76,6 +101,7 @@ struct Banner {
     hint: Option<String>,
     code: Option<String>,
     retry: Option<Retry>,
+    verification: Option<bili_core::VerificationRequest>,
 }
 
 impl From<String> for Banner {
@@ -85,6 +111,7 @@ impl From<String> for Banner {
             hint: None,
             code: None,
             retry: None,
+            verification: None,
         }
     }
 }
@@ -99,6 +126,7 @@ impl From<&str> for Banner {
 struct Notice {
     text: String,
     open_about: bool,
+    open_downloads: bool,
 }
 
 impl From<String> for Notice {
@@ -106,6 +134,7 @@ impl From<String> for Notice {
         Self {
             text,
             open_about: false,
+            open_downloads: false,
         }
     }
 }
@@ -124,11 +153,27 @@ pub struct App {
     page: Page,
     search: SearchState,
     detail: Option<DetailState>,
+    detail_drafts: HashMap<DetailDraftKey, DetailState>,
+    config_drafts: HashMap<String, ConfigState>,
+    navigation: u64,
+    operation_navigation: Option<u64>,
+    pending_default: Option<PathBuf>,
+    awaiting_snapshot: HashSet<JobId>,
+    config: ConfigState,
+    account_menu: bool,
+    account_manager: bool,
+    auth_target: Option<JobId>,
+    switching_account: bool,
+    verification: Option<bili_core::VerificationChallenge>,
+    verification_view: Option<crate::verification::View>,
+    verification_started: Option<Instant>,
     queue: QueueState,
     login: LoginState,
     auth: Option<AuthSnapshot>,
     snapshot: Arc<QueueSnapshot>,
     busy: Option<Busy>,
+    busy_started: Option<Instant>,
+    busy_description: Option<String>,
     cancelling: bool,
     controls: HashSet<JobId>,
     notice: Option<Notice>,
@@ -136,10 +181,10 @@ pub struct App {
     error: Option<Banner>,
     error_at: Option<Instant>,
     covers: CoverCache,
-    cover_index: HashMap<u64, String>,
     login_remember: bool,
     settings_jump: Option<usize>,
-    retry_resolve: Option<String>,
+    retry_resolve: Option<Retry>,
+    retry_discovery: Option<Retry>,
     retry_output: Option<PathBuf>,
     output: PathBuf,
     output_input: String,
@@ -148,12 +193,13 @@ pub struct App {
     prefs: GuiPrefs,
     background: Background,
     prefs_dirty: bool,
-    appearance: (usize, f32, bool),
+    appearance: Option<(usize, f32, bool, AppearanceMode, bool)>,
     scale_draft: f32,
     confirming_close: bool,
     updates: UpdateState,
     restart: Option<std::sync::mpsc::Sender<PathBuf>>,
     app_icon: Option<egui::TextureHandle>,
+    scroll_timings: crate::render_diagnostics::ScrollTimings,
     font_missing: bool,
     closing: bool,
     stopped: bool,
@@ -176,7 +222,6 @@ impl App {
             StartPage::Queue => Page::Queue,
         };
         let reduced = prefs.reduced_motion;
-        let appearance = (prefs.theme_index(), prefs.ui_scale, prefs.compact);
         let scale_draft = prefs.ui_scale;
         Self {
             bridge,
@@ -186,11 +231,27 @@ impl App {
             page,
             search: SearchState::default(),
             detail: None,
+            detail_drafts: HashMap::new(),
+            config_drafts: HashMap::new(),
+            navigation: 0,
+            operation_navigation: None,
+            pending_default: None,
+            awaiting_snapshot: HashSet::new(),
+            config: ConfigState::default(),
+            account_menu: false,
+            account_manager: false,
+            auth_target: None,
+            switching_account: false,
+            verification: None,
+            verification_view: None,
+            verification_started: None,
             queue: QueueState::default(),
             login: LoginState::default(),
             auth: None,
             snapshot: Arc::new(QueueSnapshot::default()),
             busy: None,
+            busy_started: None,
+            busy_description: None,
             cancelling: false,
             controls: HashSet::new(),
             notice: None,
@@ -198,10 +259,10 @@ impl App {
             error: None,
             error_at: None,
             covers: CoverCache::default(),
-            cover_index: HashMap::new(),
             login_remember: false,
             settings_jump: None,
             retry_resolve: None,
+            retry_discovery: None,
             retry_output: None,
             output_input: output.display().to_string(),
             output,
@@ -210,12 +271,13 @@ impl App {
             prefs,
             background: Background::default(),
             prefs_dirty: false,
-            appearance,
+            appearance: None,
             scale_draft,
             confirming_close: false,
             updates: UpdateState::default(),
             restart: None,
             app_icon: None,
+            scroll_timings: crate::render_diagnostics::ScrollTimings::from_environment(),
             font_missing,
             closing: false,
             stopped: false,
@@ -251,6 +313,10 @@ impl App {
         if self
             .error_at
             .is_some_and(|shown| shown.elapsed() >= TOAST_ERROR_TTL)
+            && self
+                .error
+                .as_ref()
+                .is_none_or(|e| e.verification.is_none() && e.retry.is_none())
         {
             self.error = None;
             self.error_at = None;
@@ -266,10 +332,19 @@ impl App {
 
     fn reset_appearance(&mut self) {
         let output = self.prefs.output.clone();
+        let default_download_rate_mib = self.prefs.default_download_rate_mib;
+        let storage_path = self.prefs.storage_path.clone();
+        let persistent_login = self.prefs.persistent_login;
+        let remember_login = self.prefs.remember_login;
         self.prefs = GuiPrefs {
             output,
+            default_download_rate_mib,
+            storage_path,
+            persistent_login,
+            remember_login,
             ..GuiPrefs::default()
         };
+        self.prefs.enforce_isolation();
         self.reduced = self.prefs.reduced_motion;
         self.scale_draft = self.prefs.ui_scale;
         self.touch_prefs();
@@ -280,10 +355,12 @@ impl App {
             self.prefs.theme_index(),
             self.prefs.ui_scale,
             self.prefs.compact,
+            self.prefs.appearance,
+            self.prefs.resolved_dark(ctx),
         );
-        if current != self.appearance {
+        if Some(current) != self.appearance {
             self.prefs.apply(ctx);
-            self.appearance = current;
+            self.appearance = Some(current);
         }
         let animation = if self.reduced { 0.0 } else { theme::MOTION };
         if (ctx.style().animation_time - animation).abs() > f32::EPSILON {
@@ -303,47 +380,98 @@ impl App {
     }
 
     fn surface(&self, covers_image: bool) -> egui::Color32 {
-        let base = theme::background();
-        if !covers_image || !self.background.has_image() {
-            return base;
-        }
-        let alpha = (238.0 - self.prefs.opacity * 0.85).clamp(120.0, 255.0);
-        theme::alpha(base, alpha / 255.0)
+        self.background
+            .surface_fill(covers_image, &self.prefs, theme::background())
     }
 
     fn available(&self) -> bool {
-        self.ready && self.busy.is_none() && !self.closing && !self.stopped
+        self.ready
+            && self.busy.is_none()
+            && self.awaiting_snapshot.is_empty()
+            && !self.closing
+            && !self.stopped
     }
 
     fn send(&mut self, operation: Operation) {
         if !self.available() {
             return;
         }
+        if matches!(operation, Operation::Resolve(_) | Operation::Prepare { .. }) {
+            self.operation_navigation = Some(self.navigation);
+        }
+        if let Operation::Enqueue { output_dir, .. } = &operation {
+            self.pending_default = self.config.make_default.then(|| output_dir.clone());
+        }
+        if matches!(
+            operation,
+            Operation::Profiles | Operation::SelectProfile(_) | Operation::ForgetProfile(_)
+        ) {
+            self.switching_account = matches!(operation, Operation::SelectProfile(_));
+        }
         let kind = match &operation {
-            Operation::Search(_) => {
-                self.search.start_wait();
-                Busy::Search
-            }
+            Operation::Search(_) => Busy::Search,
             Operation::Resolve(_) => Busy::Resolve,
             Operation::Enqueue { .. } => Busy::Enqueue,
-            Operation::Login { remember } => {
+            Operation::Prepare { .. } => Busy::Resolve,
+            Operation::BrowseConditions(_) | Operation::Browse(_) => Busy::Search,
+            Operation::Profiles | Operation::SelectProfile(_) | Operation::ForgetProfile(_) => {
+                Busy::Account
+            }
+            Operation::BeginVerification { .. } | Operation::CompleteVerification { .. } => {
+                Busy::Verification
+            }
+            Operation::OutputInfo(_) | Operation::Remove { .. } | Operation::Reveal { .. } => {
+                Busy::Files
+            }
+            Operation::RetargetProfile { .. } => Busy::Account,
+            Operation::Login { remember, .. } => {
                 self.login_remember = *remember;
                 Busy::Login
             }
             Operation::RestoreSession => Busy::Restore,
-            Operation::Logout => Busy::Logout,
+            Operation::Logout | Operation::Anonymous => Busy::Logout,
             Operation::ValidateOutput(_) => Busy::Output,
         };
-        if let Operation::Resolve(input) = &operation {
-            self.retry_resolve = Some(input.clone());
+        match &operation {
+            Operation::Resolve(input) => self.retry_resolve = Some(Retry::Resolve(input.clone())),
+            Operation::Prepare {
+                inputs,
+                profile,
+                refresh,
+            } => {
+                self.retry_resolve = Some(Retry::Prepare {
+                    inputs: inputs.clone(),
+                    profile: profile.clone(),
+                    refresh: *refresh,
+                })
+            }
+            Operation::Search(query) => self.retry_discovery = Some(Retry::Search(query.clone())),
+            Operation::Browse(query) => self.retry_discovery = Some(Retry::Browse(query.clone())),
+            Operation::BrowseConditions(section) => {
+                self.retry_discovery = Some(Retry::BrowseConditions(*section))
+            }
+            _ => {}
         }
         if let Operation::ValidateOutput(path) = &operation {
             self.retry_output = Some(path.clone());
         }
+        let description = match &operation {
+            Operation::Search(query) => format!("正在搜索第 {} 页", query.page),
+            Operation::Browse(query) => format!("正在加载第 {} 页", query.page),
+            Operation::BrowseConditions(_) => "正在加载分类条件".into(),
+            Operation::Resolve(_) => "正在加载内容详情".into(),
+            Operation::Prepare { .. } => "正在获取可用画质".into(),
+            _ => kind.label().trim_end_matches('…').to_owned(),
+        };
         if let Some(bridge) = &self.bridge {
             match bridge.send(Command::Run(operation)) {
                 Ok(()) => {
                     self.busy = Some(kind);
+                    self.busy_started = Some(Instant::now());
+                    self.busy_description = Some(description);
+                    if kind == Busy::Search {
+                        self.search.start_wait();
+                    }
                     self.cancelling = false;
                     self.error = None;
                     self.notice = None;
@@ -370,6 +498,9 @@ impl App {
             match bridge.send(Command::Cancel) {
                 Ok(()) => {
                     self.cancelling = true;
+                    if self.busy == Some(Busy::Resolve) {
+                        self.operation_navigation = None;
+                    }
                     self.login.clear_challenge();
                 }
                 Err(error) => self.raise(error),
@@ -384,7 +515,24 @@ impl App {
                 self.search.set_requested(query.clone());
                 self.send(Operation::Search(query));
             }
+            Retry::Browse(query) => {
+                self.search.set_requested_browse(query.clone());
+                self.send(Operation::Browse(query));
+            }
+            Retry::BrowseConditions(section) => {
+                self.search.category = section.category();
+                self.send(Operation::BrowseConditions(section));
+            }
             Retry::Resolve(input) => self.send(Operation::Resolve(input)),
+            Retry::Prepare {
+                inputs,
+                profile,
+                refresh,
+            } => self.send(Operation::Prepare {
+                inputs,
+                profile,
+                refresh,
+            }),
             Retry::Login => {
                 self.login.error = None;
                 self.login.open = true;
@@ -419,6 +567,8 @@ impl App {
         if let Some(bridge) = &self.bridge {
             self.snapshot = bridge.snapshots.borrow().clone();
         }
+        self.awaiting_snapshot
+            .retain(|id| !self.snapshot.jobs.iter().any(|j| j.id == *id));
         while let Some(event) = self.next_event() {
             match event {
                 Event::Ready => {
@@ -427,6 +577,8 @@ impl App {
                     self.init_error = None;
                     if self.prefs.remember_login {
                         self.send(Operation::RestoreSession);
+                    } else {
+                        self.send(Operation::Profiles);
                     }
                 }
                 Event::InitFailed(error) => {
@@ -442,6 +594,7 @@ impl App {
                 Event::Cover { url, image } => {
                     self.covers.insert(ctx, url, image);
                 }
+                Event::CoverDeferred { url } => self.covers.defer(&url),
                 Event::Controlled(id, result) => {
                     self.controls.remove(&id);
                     if let Err(error) = result {
@@ -449,12 +602,32 @@ impl App {
                     }
                 }
                 Event::Finished(result) => {
+                    let switched_account =
+                        self.busy == Some(Busy::Account) && self.switching_account;
+                    self.switching_account = false;
                     let was_login = self.busy == Some(Busy::Login);
                     let was_restore = self.busy == Some(Busy::Restore);
                     let was_logout = self.busy == Some(Busy::Logout);
                     let was_search = self.busy == Some(Busy::Search);
                     let was_resolve = self.busy == Some(Busy::Resolve);
                     let was_output = self.busy == Some(Busy::Output);
+                    // A read-only result racing with the user's Cancel must not
+                    // reopen the dismissed flow or replace the committed search.
+                    // Admission receipts and committed QR logins are still applied.
+                    let result = if self.cancelling && (was_search || was_resolve) {
+                        Err(bili_core::CoreError::new(
+                            ErrorCode::Cancelled,
+                            "GUI request cancelled",
+                        ))
+                    } else {
+                        result
+                    };
+                    let retry_discovery = was_search.then(|| self.retry_discovery.take()).flatten();
+                    let requested_navigation = if was_resolve {
+                        self.operation_navigation.take()
+                    } else {
+                        None
+                    };
                     let retry_query = if was_search {
                         self.search.requested_query().cloned()
                     } else {
@@ -465,57 +638,165 @@ impl App {
                         self.search.mark_stale();
                     }
                     self.busy = None;
+                    self.busy_started = None;
+                    self.busy_description = None;
                     self.cancelling = false;
                     if was_login {
                         self.login.clear_challenge();
                     }
                     match result {
                         Ok(Outcome::Search(results)) => {
-                            for page in &results.pages {
-                                for item in &page.items {
-                                    if let (ContentRef::Video(aid), Some(cover)) =
-                                        (&item.reference, &item.cover)
-                                    {
-                                        self.cover_index.insert(aid.get(), cover.clone());
-                                    }
-                                }
-                            }
                             self.search.accept_results(results);
-                            self.detail = None;
-                            self.page = Page::Discover;
                         }
                         Ok(Outcome::Detail(item)) => {
-                            if let Some(cover) = &item.cover {
-                                for part in &item.parts {
-                                    self.cover_index
-                                        .insert(part.reference.aid.get(), cover.clone());
-                                }
+                            let mut detail = DetailState::new(item);
+                            if let Some(category) =
+                                self.search.result_category(&detail.item.reference)
+                            {
+                                detail.category = category;
                             }
-                            self.detail = Some(DetailState::new(item));
-                            self.page = Page::Discover;
+                            let key = detail_draft_key(&detail.item);
+                            if requested_navigation == Some(self.navigation) {
+                                self.detail = self.detail_drafts.remove(&key).or(Some(detail));
+                            } else {
+                                self.detail_drafts.entry(key).or_insert(detail);
+                            }
                         }
                         Ok(Outcome::Enqueued {
-                            count,
+                            receipts,
                             cancelled,
                             error,
                         }) => {
-                            self.inform(format!(
-                                "已添加 {count} 项到队列。{}",
-                                if cancelled {
-                                    "已停止添加后续分集；已添加的任务仍在队列中。"
-                                } else {
-                                    ""
-                                }
-                            ));
+                            let count = receipts.len();
+                            self.awaiting_snapshot.extend(
+                                receipts
+                                    .iter()
+                                    .filter(|r| !self.snapshot.jobs.iter().any(|j| j.id == r.id))
+                                    .map(|r| r.id),
+                            );
+                            let parts: Vec<_> =
+                                receipts.iter().map(|r| r.plan.part.clone()).collect();
+                            if let Some(detail) = &mut self.detail {
+                                detail.acknowledge(&parts);
+                            }
+                            if let Some(directory) =
+                                self.pending_default.take().filter(|_| count > 0)
+                            {
+                                self.output = directory;
+                                self.output_input = self.output.display().to_string();
+                                self.prefs.output = Some(self.output.clone());
+                                self.touch_prefs();
+                            }
+                            self.config.acknowledge(
+                                receipts,
+                                cancelled,
+                                error.as_ref().map(backend::error_message),
+                            );
+                            self.config.verification =
+                                error.as_ref().and_then(|e| e.verification.clone());
+                            self.inform(Notice {
+                                text: format!(
+                                    "已添加 {count} 项到队列。{}",
+                                    if cancelled {
+                                        "已停止添加后续分集；已添加的任务仍在队列中。"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                                open_about: false,
+                                open_downloads: count > 0,
+                            });
                             if let Some(error) = error {
                                 self.raise(control_banner(&error));
                             }
-                            if count > 0 {
-                                self.page = Page::Queue;
+                        }
+                        Ok(Outcome::Prepared {
+                            items,
+                            profile,
+                            refresh,
+                        }) => {
+                            let open = requested_navigation == Some(self.navigation);
+                            let next_key = ConfigState::intent_key(&items);
+                            if !refresh && !self.config.matches_intent(&items) {
+                                if let Some(key) = self.config.key() {
+                                    self.config_drafts.insert(key, self.config.clone());
+                                }
+                                self.config =
+                                    self.config_drafts.remove(&next_key).unwrap_or_default();
+                            }
+                            self.config.accept(
+                                items,
+                                profile,
+                                &self.output,
+                                self.prefs.default_download_rate_mib,
+                                refresh,
+                            );
+                            self.config.exclude_admitted(
+                                self.snapshot
+                                    .jobs
+                                    .iter()
+                                    .filter_map(|j| j.plan.as_ref().map(|p| p.part.clone()))
+                                    .collect(),
+                            );
+                            self.config.open = open;
+                        }
+                        Ok(Outcome::OutputInfo(info)) => self.queue.accept_info(info),
+                        Ok(Outcome::Removed(report)) => {
+                            self.inform(format!(
+                                "已移除 {} 条记录，回收 {} 个文件。",
+                                report.removed.len(),
+                                report.recycled.len()
+                            ));
+                            if let Some(error) = report.errors.first() {
+                                self.raise(control_banner(error));
+                            }
+                        }
+                        Ok(Outcome::Retargeted(id)) => {
+                            self.auth_target = None;
+                            if let Some(bridge) = &self.bridge {
+                                match bridge.send(Command::Control(id, bili_core::JobAction::Retry))
+                                {
+                                    Ok(()) => {
+                                        self.controls.insert(id);
+                                    }
+                                    Err(error) => self.raise(error),
+                                }
+                            }
+                            self.account_manager = false;
+                            self.inform("已更换此任务的凭据并重试，其他任务保持原账号。");
+                        }
+                        Ok(Outcome::Revealed) => {}
+                        Ok(Outcome::BrowseConditions(conditions)) => {
+                            let operation = self.search.accept_conditions(conditions);
+                            self.send(operation);
+                        }
+                        Ok(Outcome::Verification(challenge)) => {
+                            self.verification = Some(challenge);
+                            self.verification_started = Some(Instant::now());
+                        }
+                        Ok(Outcome::Verified) => self.inform("安全验证完成，可重试原操作。"),
+                        Ok(Outcome::ProfileAdded { auth, profile_id }) => {
+                            self.login.open = false;
+                            self.login.adding = false;
+                            self.auth = Some(auth);
+                            self.account_manager = false;
+                            if let Some(id) = self.auth_target {
+                                self.send(Operation::RetargetProfile {
+                                    id,
+                                    profile: Some(profile_id),
+                                });
+                            } else {
+                                self.inform("账号凭据已添加，当前使用的账号保持不变。");
                             }
                         }
                         Ok(Outcome::Auth(snapshot)) => {
+                            let old_profile = self.config.effective_profile(self.auth.as_ref());
                             if was_login && snapshot.logged_in {
+                                self.login.open = false;
+                                self.login.adding = false;
+                                if self.auth_target.is_none() {
+                                    self.account_manager = false;
+                                }
                                 self.prefs.remember_login = self.login_remember;
                                 self.touch_prefs();
                                 self.inform(if self.login_remember {
@@ -534,9 +815,21 @@ impl App {
                             } else if was_logout {
                                 self.prefs.remember_login = false;
                                 self.touch_prefs();
-                                self.inform("已退出登录，并清除保存的登录凭据。");
+                                self.inform("当前已切换为访客。已有任务保留原账号。");
                             }
                             self.auth = Some(snapshot);
+                            if switched_account {
+                                self.account_manager = false;
+                                self.inform("账号已切换，已有任务保留原账号。");
+                            }
+                            let new_profile = self.config.effective_profile(self.auth.as_ref());
+                            if self.config.open && old_profile != new_profile {
+                                self.send(Operation::Prepare {
+                                    inputs: self.config.inputs(),
+                                    profile: new_profile,
+                                    refresh: true,
+                                });
+                            }
                         }
                         Ok(Outcome::Output(path)) => {
                             self.output_input = path.display().to_string();
@@ -554,18 +847,22 @@ impl App {
                                 self.inform(message);
                             } else {
                                 let mut banner = Banner::from(message);
+                                banner.verification = error.verification.clone();
                                 banner.code = Some(backend::error_code(&error));
-                                banner.hint = if retry_query.as_ref().is_some_and(|query| {
+                                banner.hint = backend::error_hint(&error);
+                                if retry_query.as_ref().is_some_and(|query| {
                                     query.category == bili_core::SearchCategory::All
                                 }) {
-                                    Some("「全部」会同时查询视频、番剧与影视，任一分区失败时整次搜索会失败；可切换到「视频」后重试。".into())
-                                } else {
-                                    None
-                                };
-                                banner.retry = if let Some(query) = retry_query {
-                                    Some(Retry::Search(query))
+                                    let hint = banner.hint.get_or_insert_default();
+                                    if !hint.is_empty() {
+                                        hint.push('\n');
+                                    }
+                                    hint.push_str("「全部」会同时查询视频、番剧与影视，任一分区失败时整次搜索会失败；可切换到「视频」后重试。");
+                                }
+                                banner.retry = if was_search {
+                                    retry_discovery.or_else(|| retry_query.map(Retry::Search))
                                 } else if was_resolve {
-                                    self.retry_resolve.clone().map(Retry::Resolve)
+                                    self.retry_resolve.clone()
                                 } else if was_output {
                                     self.retry_output.clone().map(Retry::Output)
                                 } else if was_login {
@@ -584,6 +881,8 @@ impl App {
                     self.stopped = true;
                     self.ready = false;
                     self.busy = None;
+                    self.busy_started = None;
+                    self.busy_description = None;
                     self.controls.clear();
                     self.login.clear_challenge();
                     match result {
@@ -602,6 +901,9 @@ impl App {
     }
 
     fn begin_close(&mut self, ctx: &egui::Context) {
+        self.verification_view = None;
+        self.verification = None;
+        self.verification_started = None;
         if self.stopped {
             self.allow_close = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -624,136 +926,360 @@ impl App {
         }
     }
 
-    fn sidebar(&mut self, ctx: &egui::Context) {
-        let fill = self.surface(self.background.visible_for(&self.prefs, true));
-        egui::SidePanel::left("navigation")
-            .exact_width(SIDEBAR_WIDTH)
-            .resizable(false)
-            .frame(egui::Frame::none().fill(fill).inner_margin(18.0))
+    fn navigate(&mut self, page: Page) {
+        self.navigation = self.navigation.wrapping_add(1);
+        self.page = page;
+        self.config.open = false;
+    }
+    fn configuration(&mut self, ctx: &egui::Context) {
+        let was_open = self.config.open;
+        if let Some(action) = self.config.show(ctx, self.available(), self.auth.as_ref()) {
+            self.send(action);
+        }
+        if was_open && !self.config.open {
+            // Closing a dialog is also an explicit navigation decision. A
+            // pending account/catalog refresh must not reopen it on completion.
+            self.operation_navigation = None;
+        }
+        if self.config.history_requested {
+            self.config.history_requested = false;
+            self.navigate(Page::Queue);
+        }
+    }
+    fn home(&mut self) {
+        if let Some(detail) = self.detail.take() {
+            self.detail_drafts
+                .insert(detail_draft_key(&detail.item), detail);
+        }
+        self.navigate(Page::Discover);
+    }
+    fn header(&mut self, ctx: &egui::Context) {
+        if self.config.open {
+            self.account_menu = false;
+        }
+        let available = self.available();
+        let mut action = None;
+        let mut avatar_rect = egui::Rect::NOTHING;
+        egui::TopBottomPanel::top("browse-header")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::card())
+                    .inner_margin(egui::vec2(18.0, 10.0)),
+            )
             .show(ctx, |ui| {
-                ui.add_space(24.0);
-                ui.label(
-                    RichText::new("你的工作空间")
-                        .size(11.0)
-                        .color(theme::muted_color()),
-                );
-                ui.add_space(6.0);
-                for (page, name, icon) in [
-                    (Page::Discover, "搜索发现", Icon::Search),
-                    (Page::Queue, "下载队列", Icon::Download),
-                    (Page::Completed, "已完成", Icon::Check),
-                    (Page::Settings, "设置", Icon::Settings),
-                    (Page::About, "应用", Icon::Info),
-                ] {
-                    let width = ui.available_width();
-                    if theme::button_width(
-                        ui,
-                        name,
-                        icon,
-                        if self.page == page {
-                            ButtonKind::Soft
-                        } else {
-                            ButtonKind::Quiet
-                        },
-                        width,
-                        self.reduced,
-                    )
-                    .clicked()
+                if self.config.open {
+                    ui.disable();
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("BiliDL").size(25.0).strong())
+                                .frame(false),
+                        )
+                        .on_hover_text("返回首页")
+                        .clicked()
                     {
-                        if self.page != page {
-                            self.error = None;
-                            if self
-                                .notice
-                                .as_ref()
-                                .is_some_and(|notice| !notice.open_about)
-                            {
-                                self.notice = None;
+                        self.home();
+                    }
+                    if let Some(next) = self.search.header(ui, available) {
+                        self.home();
+                        action = Some(next);
+                    }
+                    if self.search.home_requested {
+                        self.home();
+                        self.search.home_requested = false;
+                    }
+                    ui.add_space(24.0);
+                    let width = (ui.available_width() - 180.0).clamp(90.0, 470.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width + 70.0, 36.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            if let Some(next) = self.search.input(ui, available, width) {
+                                self.home();
+                                action = Some(next);
+                            }
+                        },
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if circle_action(ui, Icon::Download, "下载历史").clicked() {
+                            self.navigate(Page::Queue);
+                        }
+                        let response = circle_action(ui, Icon::User, "账号菜单");
+                        if let Some(face) = self
+                            .auth
+                            .as_ref()
+                            .and_then(|a| a.account.as_ref())
+                            .and_then(|a| a.face.as_deref())
+                            .map(normalize_face)
+                        {
+                            self.covers.ensure(self.bridge.as_ref(), &face);
+                            if let Some(id) = self.covers.texture(&face) {
+                                ui.put(
+                                    response.rect.shrink(1.0),
+                                    egui::Image::new((id, response.rect.shrink(1.0).size()))
+                                        .rounding(18.0),
+                                );
                             }
                         }
-                        self.page = page;
-                    }
-                    ui.add_space(2.0);
-                }
-                let card_height = 78.0;
-                ui.add_space((ui.available_height() - card_height - 40.0).max(0.0));
-                self.sidebar_account(ui);
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("NATIVE DESKTOP  /  0.1")
-                        .size(10.0)
-                        .color(theme::muted_color()),
-                );
-            });
-    }
-
-    fn sidebar_account(&mut self, ui: &mut Ui) {
-        let logged_in = self.auth.as_ref().is_some_and(|a| a.logged_in);
-        let name = self
-            .auth
-            .as_ref()
-            .and_then(|a| a.account.as_ref())
-            .map(|a| a.name.clone())
-            .unwrap_or_else(|| "访客模式".into());
-        let face = self
-            .auth
-            .as_ref()
-            .and_then(|a| a.account.as_ref())
-            .and_then(|a| a.face.as_deref())
-            .map(normalize_face);
-        let card = theme::inset(theme::card()).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let size = egui::vec2(40.0, 40.0);
-                if !self
-                    .covers
-                    .show(ui, self.bridge.as_ref(), face.as_deref(), size, 20.0)
-                {
-                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(rect.center(), 20.0, theme::soft());
-                    theme::icon(
-                        ui.painter(),
-                        egui::Rect::from_center_size(rect.center(), egui::vec2(20.0, 20.0)),
-                        Icon::User,
-                        theme::primary(),
-                    );
-                }
-                ui.vertical(|ui| {
-                    ui.add(egui::Label::new(RichText::new(&name).strong()).truncate())
-                        .on_hover_text(&name);
-                    theme::muted(
-                        ui,
-                        if logged_in {
-                            if self.prefs.remember_login {
-                                "保持登录"
-                            } else {
-                                "本次会话已登录"
-                            }
-                        } else {
-                            "尚未登录，使用访客画质"
-                        },
-                    );
+                        avatar_rect = response.rect;
+                        if response.clicked() {
+                            self.account_menu = !self.account_menu;
+                        }
+                    });
                 });
             });
-        });
-        let response = card
-            .response
-            .interact(egui::Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(if logged_in {
-                "查看当前账号信息"
-            } else {
-                "点击登录"
-            });
-        if response.hovered() {
-            ui.painter().rect_stroke(
-                response.rect,
-                16.0,
-                egui::Stroke::new(1.0_f32, theme::alpha(theme::primary(), 0.35)),
-            );
+        if let Some(action) = action {
+            self.send(action);
         }
-        if response.clicked() {
-            self.login.open = true;
+        if self.account_menu {
+            let shown = egui::Area::new(egui::Id::new("account-menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(
+                    (avatar_rect.right() - 235.0).max(12.0),
+                    avatar_rect.bottom() + 8.0,
+                ))
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_width(235.0);
+                        let name = self
+                            .auth
+                            .as_ref()
+                            .and_then(|a| a.account.as_ref())
+                            .map_or("访客", |a| a.name.as_str());
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(RichText::new(name).strong());
+                        ui.add_space(6.0);
+                        ui.separator();
+                        if account_menu_item(ui, "切换账号", self.available()).clicked() {
+                            self.account_manager = true;
+                            self.account_menu = false;
+                            self.send(Operation::Profiles);
+                        }
+                        if account_menu_item(ui, "添加账号", self.available()).clicked() {
+                            self.login.begin_add();
+                            self.account_menu = false;
+                        }
+                        if self.auth.as_ref().is_some_and(|a| a.logged_in)
+                            && account_menu_item(ui, "退出登录", self.available()).clicked()
+                        {
+                            self.send(Operation::Logout);
+                            self.account_menu = false;
+                        }
+                        ui.separator();
+                        if account_menu_item(ui, "设置", true).clicked() {
+                            self.navigate(Page::Settings);
+                            self.account_menu = false;
+                        }
+                        if account_menu_item(ui, "版本与更新", true).clicked() {
+                            self.navigate(Page::About);
+                            self.account_menu = false;
+                        }
+                    });
+                });
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                || ctx.input(|i| {
+                    i.pointer.any_pressed()
+                        && i.pointer.interact_pos().is_some_and(|p| {
+                            !shown.response.rect.contains(p) && !avatar_rect.contains(p)
+                        })
+                })
+            {
+                self.account_menu = false;
+            }
+        }
+    }
+
+    fn verification_dialog(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(challenge) = &self.verification else {
+            return;
+        };
+        if self
+            .verification_started
+            .is_some_and(|start| start.elapsed() >= Duration::from_secs(challenge.expires_in_secs))
+        {
+            self.verification_view = None;
+            self.verification = None;
+            self.verification_started = None;
+            self.raise("安全验证已超时，请重试原操作获取新验证。");
+            return;
+        }
+        if self.verification_view.is_none() {
+            match crate::verification::View::new(frame, challenge, ctx.clone()) {
+                Ok(view) => self.verification_view = Some(view),
+                Err(error) => {
+                    self.verification = None;
+                    self.verification_started = None;
+                    self.raise(error);
+                    return;
+                }
+            }
+        }
+        let mut open = true;
+        let mut cancelled = false;
+        let mut bounds = egui::Rect::NOTHING;
+        egui::Window::new("安全验证")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(640.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("完成验证后，可返回重试原操作。");
+                bounds = ui
+                    .allocate_exact_size(
+                        egui::vec2(ui.available_width().min(640.0), 360.0),
+                        egui::Sense::hover(),
+                    )
+                    .0;
+                cancelled = ui.button("取消验证").clicked();
+            });
+        if !open || cancelled || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.verification_view = None;
+            self.verification = None;
+            self.verification_started = None;
+            self.inform("已取消验证，原任务保持失败状态。");
+            return;
+        }
+        if let Some(view) = &mut self.verification_view {
+            if let Err(error) = view.set_bounds(bounds, ctx.pixels_per_point()) {
+                self.verification_view = None;
+                self.verification = None;
+                self.verification_started = None;
+                self.raise(error);
+                return;
+            }
+            if let Some(result) = view.poll() {
+                self.verification_view = None;
+                self.verification_started = None;
+                let challenge = self
+                    .verification
+                    .take()
+                    .expect("owned verification challenge");
+                match result {
+                    Ok(proof) => self.send(Operation::CompleteVerification { challenge, proof }),
+                    Err(error) => self.raise(error),
+                }
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    fn accounts(&mut self, ctx: &egui::Context) {
+        if !self.account_manager || self.config.open {
+            return;
+        }
+        let mut open = self.account_manager;
+        let mut action = None;
+        egui::Window::new(if self.auth_target.is_some() {
+            "选择此任务的账号"
+        } else {
+            "切换账号"
+        })
+        .open(&mut open)
+        .collapsible(false)
+        .default_width(460.0)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            if let Some(auth) = &self.auth {
+                for profile in &auth.profiles {
+                    ui.group(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(&profile.account.name);
+                            theme::muted(
+                                ui,
+                                match profile.account.vip {
+                                    Some(true) => "大会员",
+                                    Some(false) => "普通账号",
+                                    None => "会员状态未知",
+                                },
+                            );
+                            let selected = auth.selected_profile.as_ref() == Some(&profile.id);
+                            if ui
+                                .add_enabled(
+                                    self.available(),
+                                    egui::Button::new(if self.auth_target.is_some() {
+                                        "使用并重试"
+                                    } else if selected {
+                                        "当前账号"
+                                    } else {
+                                        "使用"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                action = Some(if let Some(id) = self.auth_target {
+                                    Operation::RetargetProfile {
+                                        id,
+                                        profile: Some(profile.id.clone()),
+                                    }
+                                } else {
+                                    Operation::SelectProfile(profile.id.clone())
+                                });
+                            }
+                            if self.auth_target.is_none()
+                                && ui
+                                    .add_enabled(self.available(), egui::Button::new("移除凭据"))
+                                    .clicked()
+                            {
+                                action = Some(Operation::ForgetProfile(profile.id.clone()));
+                            }
+                        });
+                        theme::muted(
+                            ui,
+                            format!(
+                                "凭据状态：{} · {}",
+                                match profile.validity {
+                                    bili_core::auth::ProfileValidity::Valid => "有效",
+                                    bili_core::auth::ProfileValidity::Expired => "已过期",
+                                    bili_core::auth::ProfileValidity::Unknown => "未验证",
+                                },
+                                if profile.remembered {
+                                    "已记住"
+                                } else {
+                                    "仅本次会话"
+                                }
+                            ),
+                        );
+                        theme::muted(
+                            ui,
+                            profile.expires_at.map_or_else(
+                                || "登录有效期：站点未提供".into(),
+                                |time| {
+                                    if time / 1000 <= now_epoch() {
+                                        "登录凭据已过期".into()
+                                    } else {
+                                        format!(
+                                            "距登录凭据到期还有 {} 小时",
+                                            (time / 1000 - now_epoch()).div_ceil(3600)
+                                        )
+                                    }
+                                },
+                            ),
+                        );
+                    });
+                }
+                if auth.profiles.is_empty() {
+                    theme::muted(ui, "没有可选的登录凭据。");
+                }
+            }
+            if ui
+                .add_enabled(self.available(), egui::Button::new("添加账号"))
+                .clicked()
+            {
+                self.login.begin_add();
+            }
+            if self.auth_target.is_none()
+                && ui
+                    .add_enabled(self.available(), egui::Button::new("使用访客"))
+                    .clicked()
+            {
+                action = Some(Operation::Anonymous);
+            }
+        });
+        self.account_manager = open;
+        if let Some(action) = action {
+            self.send(action);
         }
     }
 
@@ -768,7 +1294,10 @@ impl App {
         }
         if let Some(error) = self.init_error.clone() {
             theme::inset(theme::rose()).show(ui, |ui| {
-                ui.colored_label(theme::ERROR, "下载核心暂不可用，仍可浏览界面和调整设置。");
+                ui.colored_label(
+                    theme::error_color(),
+                    "下载核心暂不可用，仍可浏览界面和调整设置。",
+                );
                 ui.label(error);
                 ui.add_enabled_ui(
                     self.bridge.is_some() && !self.initializing && !self.closing,
@@ -797,14 +1326,11 @@ impl App {
     }
 
     fn busy_label(&self, busy: Busy) -> String {
-        if busy == Busy::Search {
-            self.search.waited().map_or_else(
-                || busy.label().to_owned(),
-                |waited| format!("正在搜索，已等待 {} 秒…", waited.as_secs()),
-            )
-        } else {
-            busy.label().to_owned()
-        }
+        let description = self.busy_description.as_deref().unwrap_or(busy.label());
+        self.busy_started.map_or_else(
+            || description.to_owned(),
+            |started| format!("{description}，已等待 {} 秒…", started.elapsed().as_secs()),
+        )
     }
 
     fn busy_toast(&mut self, ui: &mut Ui, busy: Busy) {
@@ -868,6 +1394,9 @@ impl App {
                 }
                 if let Some(banner) = self.error.clone() {
                     theme::inset(theme::rose()).show(ui, |ui| {
+                        if self.config.open {
+                            ui.disable();
+                        }
                         ui.set_width(ui.available_width());
                         ui.horizontal_top(|ui| {
                             let width = (ui.available_width() - 30.0).max(120.0);
@@ -909,6 +1438,20 @@ impl App {
                                 self.run_retry(retry);
                             }
                         }
+                        if let Some(request) = banner.verification.clone() {
+                            if ui
+                                .add_enabled(self.available(), egui::Button::new("安全验证"))
+                                .clicked()
+                            {
+                                self.send(Operation::BeginVerification {
+                                    request,
+                                    profile: self
+                                        .auth
+                                        .as_ref()
+                                        .and_then(|a| a.selected_profile.clone()),
+                                });
+                            }
+                        }
                     });
                     ui.add_space(8.0);
                 }
@@ -916,6 +1459,9 @@ impl App {
                     !(notice.open_about && (self.error.is_some() || self.page == Page::About))
                 }) {
                     theme::inset(theme::soft()).show(ui, |ui| {
+                        if self.config.open {
+                            ui.disable();
+                        }
                         ui.set_width(ui.available_width());
                         ui.horizontal_top(|ui| {
                             let width = (ui.available_width() - 30.0).max(120.0);
@@ -942,10 +1488,15 @@ impl App {
                             )
                             .clicked()
                             {
-                                self.page = Page::About;
+                                self.navigate(Page::About);
                                 self.notice = None;
                                 self.notice_at = None;
                             }
+                        }
+                        if notice.open_downloads && ui.button("查看下载").clicked() {
+                            self.navigate(Page::Queue);
+                            self.notice = None;
+                            self.notice_at = None;
                         }
                     });
                 }
@@ -971,11 +1522,27 @@ impl App {
     }
 
     fn settings(&mut self, ui: &mut Ui) {
+        if ui.button("恢复默认外观").clicked() {
+            self.reset_appearance();
+        }
         jump_to(ui, 0, &mut self.settings_jump);
         theme::card_frame().show(ui, |ui| {
             theme::inset(theme::card()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                theme::section(ui, "主题", "内置 5 套配色，切换后立即生效并记住选择。");
+                ui.label(RichText::new("外观模式").strong());
+                ui.horizontal_wrapped(|ui| {
+                    for (mode, label) in [
+                        (AppearanceMode::System, "跟随系统"),
+                        (AppearanceMode::Light, "浅色"),
+                        (AppearanceMode::Dark, "深色"),
+                    ] {
+                        if ui.selectable_value(&mut self.prefs.appearance, mode, label).changed() {
+                            self.touch_prefs();
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+                ui.label(RichText::new("主题色").strong());
                 ui.horizontal_wrapped(|ui| {
                     for (index, preset) in THEMES.iter().enumerate() {
                         let selected = self.prefs.theme_index() == index;
@@ -1055,14 +1622,14 @@ impl App {
                     });
                 });
                 if let Some(error) = self.background.error() {
-                    ui.colored_label(theme::ERROR, error);
+                    ui.colored_label(theme::error_color(), error);
                 }
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
                     theme::muted(ui, "铺放范围");
                     for (scope, name) in [
                         (BackgroundScope::Full, "整个窗口"),
-                        (BackgroundScope::WithoutSidebar, "不含左侧边"),
+                        (BackgroundScope::WithoutSidebar, "仅内容区"),
                     ] {
                         let selected = self.prefs.background_scope == scope;
                         let response = theme::button(
@@ -1094,6 +1661,16 @@ impl App {
                     self.touch_prefs();
                 }
                 ui.add_space(4.0);
+                let mut brightness = self.prefs.background_brightness;
+                if ui.add(
+                    egui::Slider::new(&mut brightness, 20.0..=100.0)
+                        .text("背景亮度")
+                        .suffix("%"),
+                ).changed() {
+                    self.prefs.background_brightness = brightness;
+                    self.touch_prefs();
+                }
+                ui.add_space(4.0);
                 let mut blur = self.prefs.blur;
                 let blur_response = ui.add(
                     egui::Slider::new(&mut blur, 0.0..=100.0)
@@ -1114,7 +1691,7 @@ impl App {
                     "只影响后续新任务；已有任务保持原路径。请填写或选择绝对目录。",
                 );
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.output_input)
+                    theme::singleline_input(ui,&mut self.output_input,"",ui.spacing().interact_size.y)
                         .desired_width(f32::INFINITY)
                         .margin(egui::vec2(12.0, 12.0)),
                 );
@@ -1122,7 +1699,7 @@ impl App {
                 let valid = !self.output_input.trim().is_empty() && path.is_absolute();
                 if !valid {
                     ui.colored_label(
-                        theme::ERROR,
+                        theme::error_color(),
                         "请输入绝对路径，例如 C:\\Users\\你的用户名\\Downloads 或 /home/user/Downloads。",
                     );
                 }
@@ -1159,6 +1736,26 @@ impl App {
                 });
                 ui.add_space(6.0);
                 theme::hint(ui, format!("当前生效：{}", self.output.display()));
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("默认下载限速");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.prefs.default_download_rate_mib)
+                                .range(0.0..=crate::prefs::MAX_DOWNLOAD_RATE_MIB)
+                                .speed(0.1)
+                                .suffix(" MiB/s"),
+                        )
+                        .changed()
+                    {
+                        self.prefs.default_download_rate_mib = crate::prefs::sanitize_download_rate(
+                            self.prefs.default_download_rate_mib,
+                        );
+                        self.touch_prefs();
+                    }
+                    theme::muted(ui, "0 不限速");
+                });
+                theme::hint(ui, "新下载使用此默认值，可在下载时展开高级设置单独修改。");
                 ui.add_space(18.0);
                 ui.separator();
                 ui.add_space(14.0);
@@ -1348,14 +1945,14 @@ impl App {
                         UpdateStatus::Ready { version } => {
                             ui.label(
                                 RichText::new(format!("v{version} 已安装，重启后生效"))
-                                    .color(theme::GREEN),
+                                    .color(theme::success_color()),
                             );
                         }
                         UpdateStatus::Error(message) => {
-                            ui.colored_label(theme::ERROR, message);
+                            ui.colored_label(theme::error_color(), message);
                         }
                         UpdateStatus::UpToDate => {
-                            ui.label(RichText::new("已是最新版本").color(theme::GREEN));
+                            ui.label(RichText::new("已是最新版本").color(theme::success_color()));
                         }
                         UpdateStatus::NoCompatibleRelease => {
                             theme::muted(ui, "更高版本暂无适用于当前平台的 GUI 包");
@@ -1565,142 +2162,114 @@ impl App {
 
     fn central(&mut self, ctx: &egui::Context) {
         self.expire_toasts();
-        let central_fill = self.surface(true);
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(central_fill).inner_margin(28.0))
+            .frame(
+                egui::Frame::none()
+                    .fill(self.surface(true))
+                    .inner_margin(18.0),
+            )
             .show(ctx, |ui| {
-                ui.add_enabled_ui(!self.closing, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            let (title, subtitle) = match self.page {
-                                Page::Discover if self.detail.is_some() => {
-                                    ("准备下载", "选择分集、字幕与保存位置。")
-                                }
-                                Page::Discover => {
-                                    ("发现喜欢的每一帧", "搜索视频与番剧，开启你的本地收藏。")
-                                }
-                                Page::Queue => ("下载队列", "每一份喜欢，都在有序抵达。"),
-                                Page::Completed => ("已完成", "下载已就绪，文件保存在你的设备上。"),
-                                Page::Settings if self.background.crop_open => {
-                                    ("裁剪背景", "选中你想留下的画面，应用后立即生效。")
-                                }
-                                Page::Settings => ("偏好设置", "简单一点，刚刚好。"),
-                                Page::About => ("应用", "版本、更新与项目信息。"),
-                            };
-                            ui.label(RichText::new(title).size(28.0).strong());
-                            theme::muted(ui, subtitle);
+                if self.config.open {
+                    ui.disable();
+                }
+                self.banners(ui);
+                if self.page == Page::Discover {
+                    if let Some(busy @ (Busy::Search | Busy::Resolve)) = self.busy {
+                        let label = if self.cancelling {
+                            "正在取消，请稍候…".to_owned()
+                        } else {
+                            self.busy_label(busy)
+                        };
+                        theme::inset(theme::soft()).show(ui, |ui| {
+                            theme::loading(ui, self.reduced, &label);
                         });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if self.page == Page::Settings
-                                && !self.background.crop_open
-                                && theme::button(
+                        ui.add_space(8.0);
+                    }
+                }
+                if self.page == Page::Settings && !self.background.crop_open {
+                    self.settings_nav(ui);
+                }
+                let mut scroll = egui::ScrollArea::vertical()
+                    .id_salt(match self.page {
+                        Page::Discover if self.detail.is_some() => "main-scroll-detail",
+                        Page::Discover => "main-scroll-discover",
+                        Page::Queue => "main-scroll-queue",
+                        Page::Settings => "main-scroll-settings",
+                        Page::About => "main-scroll-about",
+                    })
+                    .auto_shrink([false, false]);
+                if self.background.crop_open
+                    || (self.page == Page::Discover
+                        && self.detail.is_none()
+                        && std::mem::take(&mut self.search.reset_scroll))
+                {
+                    scroll = scroll.vertical_scroll_offset(0.0);
+                }
+                scroll.show(ui, |ui| {
+                    let available = self.available();
+                    match self.page {
+                        Page::Discover => {
+                            let action = if let Some(detail) = &mut self.detail {
+                                let (back, action) = detail.show(
                                     ui,
-                                    "恢复默认外观",
-                                    Icon::Refresh,
-                                    ButtonKind::Quiet,
+                                    available,
                                     self.reduced,
-                                )
-                                .clicked()
-                            {
-                                self.reset_appearance();
-                            }
-                            let active = self
-                                .snapshot
-                                .jobs
-                                .iter()
-                                .filter(|j| j.phase.is_active())
-                                .count();
-                            if active > 0 {
-                                if theme::button(
-                                    ui,
-                                    &format!("{active} 项进行中"),
-                                    Icon::Download,
-                                    ButtonKind::Soft,
-                                    self.reduced,
-                                )
-                                .clicked()
-                                {
-                                    self.page = Page::Queue;
-                                }
-                            } else {
-                                ui.label(
-                                    RichText::new(if self.ready {
-                                        "本地就绪"
-                                    } else {
-                                        "原生桌面"
-                                    })
-                                    .size(12.0)
-                                    .color(theme::muted_color()),
+                                    &self.output,
+                                    &mut self.covers,
+                                    self.bridge.as_ref(),
                                 );
-                            }
-                        });
-                    });
-                    ui.add_space(14.0);
-                    self.banners(ui);
-                    if self.page == Page::Settings && !self.background.crop_open {
-                        self.settings_nav(ui);
-                    }
-                    ui.add_space(10.0);
-                    let mut scroll = egui::ScrollArea::vertical()
-                        .id_salt(match self.page {
-                            Page::Discover if self.detail.is_some() => "main-scroll-detail",
-                            Page::Discover => "main-scroll-discover",
-                            Page::Queue => "main-scroll-queue",
-                            Page::Completed => "main-scroll-completed",
-                            Page::Settings => "main-scroll-settings",
-                            Page::About => "main-scroll-about",
-                        })
-                        .auto_shrink([false, false]);
-                    if self.background.crop_open {
-                        scroll = scroll.vertical_scroll_offset(0.0);
-                    }
-                    scroll.show(ui, |ui| {
-                        content_column(ui, |ui| {
-                            let available = self.available();
-                            match self.page {
-                                Page::Discover => {
-                                    let action = if let Some(detail) = &mut self.detail {
-                                        let (back, action) = detail.show(
-                                            ui,
-                                            available,
-                                            self.reduced,
-                                            &self.output,
-                                            &mut self.covers,
-                                            self.bridge.as_ref(),
-                                        );
-                                        if back {
-                                            self.detail = None;
-                                        }
-                                        action
-                                    } else {
-                                        self.search.show(
-                                            ui,
-                                            available,
-                                            self.reduced,
-                                            &mut self.covers,
-                                            self.bridge.as_ref(),
-                                        )
-                                    };
-                                    if let Some(action) = action {
-                                        self.send(action);
-                                    }
+                                if back {
+                                    self.home();
                                 }
-                                Page::Queue | Page::Completed => {
-                                    let control_available =
-                                        self.ready && !self.closing && !self.stopped;
-                                    if let Some((id, action)) = self.queue.show(
+                                action
+                            } else {
+                                self.search.show(
+                                    ui,
+                                    available,
+                                    self.reduced,
+                                    &mut self.covers,
+                                    self.bridge.as_ref(),
+                                )
+                            };
+                            if let Some(mut action) = action {
+                                if let Operation::Prepare { profile, .. } = &mut action {
+                                    *profile =
+                                        self.auth.as_ref().and_then(|a| a.selected_profile.clone());
+                                }
+                                self.send(action);
+                            }
+                        }
+                        Page::Queue => {
+                            let action = theme::inset(theme::card())
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    self.queue.show(
                                         ui,
                                         crate::download_panel::QueueView {
                                             snapshot: &self.snapshot,
-                                            completed: self.page == Page::Completed,
                                             pending: &self.controls,
-                                            available: control_available,
+                                            available: self.ready && !self.closing && !self.stopped,
+                                            operations_available: available,
                                             reduced: self.reduced,
-                                            cover_index: &self.cover_index,
+                                            current_account: self
+                                                .auth
+                                                .as_ref()
+                                                .filter(|auth| auth.logged_in)
+                                                .and_then(|auth| {
+                                                    auth.profiles.iter().find(|profile| {
+                                                        Some(&profile.id)
+                                                            == auth.selected_profile.as_ref()
+                                                    })
+                                                }),
                                         },
                                         &mut self.covers,
                                         self.bridge.as_ref(),
-                                    ) {
+                                    )
+                                })
+                                .inner;
+                            if let Some(action) = action {
+                                match action {
+                                    crate::download_panel::QueueAction::Control(id, action) => {
                                         if let Some(bridge) = &self.bridge {
                                             match bridge.send(Command::Control(id, action)) {
                                                 Ok(()) => {
@@ -1710,52 +2279,32 @@ impl App {
                                             }
                                         }
                                     }
-                                }
-                                Page::Settings => {
-                                    if self.background.crop_open {
-                                        if self.background.show_crop(ui, &self.prefs)
-                                            == CropEvent::Applied
-                                        {
-                                            self.prefs.crop = self.background.draft();
-                                            self.touch_prefs();
-                                        }
-                                    } else {
-                                        self.settings(ui);
+                                    crate::download_panel::QueueAction::Operation(op) => {
+                                        self.send(op)
+                                    }
+                                    crate::download_panel::QueueAction::Account(id) => {
+                                        self.auth_target = Some(id);
+                                        self.account_manager = true;
+                                        self.send(Operation::Profiles);
                                     }
                                 }
-                                Page::About => self.about(ui),
                             }
-                            ui.add_space(18.0);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    RichText::new("仅下载你有权保存的内容")
-                                        .size(11.0)
-                                        .color(theme::muted_color()),
-                                );
-                                ui.label(
-                                    RichText::new("·  Ctrl+K 快速输入")
-                                        .size(11.0)
-                                        .color(theme::muted_color()),
-                                );
-                                let completed = self
-                                    .snapshot
-                                    .jobs
-                                    .iter()
-                                    .filter(|j| j.phase == JobPhase::Completed)
-                                    .count();
-                                if completed > 0 {
-                                    ui.label(
-                                        RichText::new(format!("·  {completed} 项已完成"))
-                                            .size(11.0)
-                                            .color(theme::muted_color()),
-                                    );
+                        }
+                        Page::Settings => {
+                            if self.background.crop_open {
+                                if self.background.show_crop(ui, &self.prefs) == CropEvent::Applied
+                                {
+                                    self.prefs.crop = self.background.draft();
+                                    self.touch_prefs();
                                 }
-                            });
-                        });
-                    });
+                            } else {
+                                self.settings(ui);
+                            }
+                        }
+                        Page::About => self.about(ui),
+                    }
                 });
             });
-        self.toasts(ctx);
     }
 }
 
@@ -1767,6 +2316,32 @@ fn normalize_face(url: &str) -> String {
     } else {
         url.to_owned()
     }
+}
+
+fn circle_action(ui: &mut Ui, icon: Icon, label: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::click());
+    ui.painter().circle_filled(
+        rect.center(),
+        18.0,
+        if response.hovered() {
+            theme::soft()
+        } else {
+            theme::card()
+        },
+    );
+    ui.painter().circle_stroke(
+        rect.center(),
+        18.0,
+        egui::Stroke::new(1.0_f32, theme::border()),
+    );
+    theme::icon(
+        ui.painter(),
+        egui::Rect::from_center_size(rect.center(), egui::vec2(19.0, 19.0)),
+        icon,
+        theme::ink(),
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    response.on_hover_text(label)
 }
 
 fn toast_close(ui: &mut Ui) -> bool {
@@ -1796,31 +2371,35 @@ fn jump_to(ui: &mut Ui, section: usize, pending: &mut Option<usize>) {
     }
 }
 
+fn account_menu_item(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        });
+        let visuals = ui.style().interact(&response);
+        if response.hovered() || response.has_focus() {
+            ui.painter()
+                .rect(rect, 6.0, visuals.weak_bg_fill, visuals.bg_stroke);
+        }
+        ui.painter().text(
+            egui::pos2(rect.left() + 12.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::TextStyle::Body.resolve(ui.style()),
+            visuals.text_color(),
+        );
+        response
+    })
+    .inner
+}
+
 fn control_banner(error: &bili_core::CoreError) -> Banner {
     let mut banner = Banner::from(backend::error_message(error));
     banner.code = Some(backend::error_code(error));
+    banner.verification = error.verification.clone();
     banner
-}
-
-/// Keeps reading width comfortable on wide screens while staying full-width
-/// on small ones; scroll position and hit testing remain inside the column.
-fn content_column<R>(ui: &mut Ui, body: impl FnOnce(&mut Ui) -> R) -> R {
-    let available = ui.available_width();
-    let width = available.min(CONTENT_MAX_WIDTH);
-    if available - width < 1.0 {
-        return body(ui);
-    }
-    let pad = (available - width) * 0.5;
-    ui.horizontal_top(|ui| {
-        ui.add_space(pad);
-        ui.allocate_ui_with_layout(
-            egui::vec2(width, 0.0),
-            egui::Layout::top_down(egui::Align::Min),
-            body,
-        )
-        .inner
-    })
-    .inner
 }
 
 fn now_epoch() -> u64 {
@@ -1847,10 +2426,11 @@ fn checked_ago(epoch: u64) -> String {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.scroll_timings.observe(ctx, frame);
         self.collect(ctx);
         self.sync_appearance(ctx);
-        if self.busy == Some(Busy::Search) {
+        if self.busy.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
         if self.updates.status().is_checking() {
@@ -1870,6 +2450,7 @@ impl eframe::App for App {
                         self.inform(Notice {
                             text: format!("发现新版本 {}", release.tag),
                             open_about: true,
+                            open_downloads: false,
                         });
                     }
                 }
@@ -1881,6 +2462,7 @@ impl eframe::App for App {
                     self.inform(Notice {
                         text: format!("新版本 {version} 已安装，重启后生效。"),
                         open_about: true,
+                        open_downloads: false,
                     });
                 }
                 UpdateStatus::Error(message) => self.raise(message),
@@ -1901,7 +2483,9 @@ impl eframe::App for App {
                 self.begin_close(ctx);
             }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) && !self.closing
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K))
+            && !self.closing
+            && !self.config.open
         {
             if self.page != Page::Discover {
                 self.error = None;
@@ -1913,21 +2497,17 @@ impl eframe::App for App {
                     self.notice = None;
                 }
             }
-            self.page = Page::Discover;
-            self.detail = None;
+            self.home();
             self.search.request_focus = true;
         }
         let screen = ctx.screen_rect();
         let clip = if self.prefs.background_scope == BackgroundScope::Full {
             screen
         } else {
-            egui::Rect::from_min_max(
-                egui::pos2(screen.left() + SIDEBAR_WIDTH, screen.top()),
-                screen.max,
-            )
+            egui::Rect::from_min_max(egui::pos2(screen.left(), screen.top() + 92.0), screen.max)
         };
         self.background.paint(ctx, clip, &self.prefs);
-        let bar_fill = self.surface(self.prefs.background_scope == BackgroundScope::Full);
+        let bar_fill = theme::card();
         if let Some(action) = window::title_bar(ctx, bar_fill, maximized) {
             match action {
                 WindowAction::Minimize => {
@@ -1939,26 +2519,34 @@ impl eframe::App for App {
                 WindowAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
-        self.sidebar(ctx);
+        self.header(ctx);
         self.central(ctx);
+        self.configuration(ctx);
+        self.accounts(ctx);
+        self.verification_dialog(ctx, frame);
         self.toasts(ctx);
         let available = self.available();
         let login_running = self.busy == Some(Busy::Login);
-        if let Some(action) = self.login.show(
-            ctx,
-            crate::login::LoginView {
-                auth: self.auth.as_ref(),
-                remembered: self.prefs.remember_login,
-                available,
-                running: login_running,
-                cancelling: self.cancelling,
-                reduced: self.reduced,
-            },
-        ) {
-            match action {
-                LoginAction::Start { remember } => self.send(Operation::Login { remember }),
-                LoginAction::Cancel => self.cancel(),
-                LoginAction::Logout => self.send(Operation::Logout),
+        if !self.config.open {
+            if let Some(action) = self.login.show(
+                ctx,
+                crate::login::LoginView {
+                    auth: self.auth.as_ref(),
+                    remembered: self.prefs.remember_login,
+                    available,
+                    running: login_running,
+                    cancelling: self.cancelling,
+                    reduced: self.reduced,
+                },
+            ) {
+                match action {
+                    LoginAction::Start { remember } => self.send(Operation::Login {
+                        remember,
+                        activate: self.auth_target.is_none(),
+                    }),
+                    LoginAction::Cancel => self.cancel(),
+                    LoginAction::Logout => self.send(Operation::Logout),
+                }
             }
         }
         if self.confirming_close {
@@ -2009,7 +2597,7 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     theme::inset(theme::card()).show(ui, |ui| {
                         if let Some(error) = &self.close_error {
-                            ui.colored_label(theme::ERROR, error);
+                            ui.colored_label(theme::error_color(), error);
                             theme::muted(
                                 ui,
                                 "后台已停止，但未能确认所有状态已保存。请保留状态目录以便恢复。",
@@ -2048,8 +2636,8 @@ impl eframe::App for App {
 mod layout_tests {
     use super::*;
     use bili_core::{
-        Aid, Bvid, Candidate, CandidatePage, CategoryPage, Cid, ContentRef, JobId, JobSnapshot,
-        MediaItem, Part, PartRef, SearchCategory,
+        Aid, Bvid, Candidate, CandidatePage, CategoryPage, Cid, ContentRef, JobId, JobPhase,
+        JobSnapshot, MediaItem, Part, PartRef, SearchCategory, SearchSort,
     };
     use egui::{Pos2, Rect, Vec2};
 
@@ -2068,6 +2656,95 @@ mod layout_tests {
         app
     }
 
+    #[test]
+    fn discovery_wait_is_visible_in_content_until_a_terminal_result() {
+        let size = Vec2::new(1180.0, 800.0);
+        let mut ctx = egui::Context::default();
+        let mut app = test_app();
+        app.busy = Some(Busy::Search);
+        app.busy_started = Some(Instant::now() - Duration::from_secs(5));
+        app.busy_description = Some("正在加载第 2 页".into());
+        app.search.start_wait();
+        frame(&mut ctx, &mut app, size, Vec::new());
+        let output = frame(&mut ctx, &mut app, size, Vec::new());
+        let labels = texts(&output);
+        assert!(labels.iter().any(
+            |(text, rect, _)| text.contains("正在加载第 2 页，已等待 5 秒")
+                && rect.left() < size.x / 2.0
+        ));
+        assert!(app.search.pending());
+        assert!(app.error.is_none());
+        assert!(!app.available());
+        assert!(!labels.iter().any(|(text, _, _)| text.contains("没有找到")));
+    }
+
+    #[test]
+    fn resetting_appearance_keeps_the_download_rate_default() {
+        let mut app = test_app();
+        app.prefs.default_download_rate_mib = 10.0;
+        app.prefs.theme = "matcha".into();
+        app.reset_appearance();
+        assert_eq!(app.prefs.default_download_rate_mib, 10.0);
+        assert_eq!(app.prefs.theme, GuiPrefs::default().theme);
+    }
+
+    #[test]
+    fn resetting_appearance_preserves_the_isolated_preference_store() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("preferences.json");
+        let mut app = test_app();
+        app.prefs = GuiPrefs::load_isolated(file.clone(), root.path().join("output"));
+        app.prefs.appearance = AppearanceMode::Light;
+        app.reset_appearance();
+        assert_eq!(app.prefs.storage_path.as_ref(), Some(&file));
+        assert!(!app.prefs.remember_login);
+        assert!(!app.prefs.update.check_updates);
+        assert!(!app.prefs.update.auto_update);
+        app.prefs.save();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(saved["appearance"], "system");
+        assert_eq!(saved["remember_login"], false);
+        assert_eq!(saved["update"]["check_updates"], false);
+    }
+
+    #[test]
+    fn download_dialog_blocks_background_clicks_and_prior_keyboard_focus() {
+        let size = Vec2::new(1180.0, 800.0);
+        let mut ctx = egui::Context::default();
+        let mut app = test_app();
+        app.page = Page::Queue;
+        app.search.input = "unchanged search".into();
+        click_text(&mut ctx, &mut app, size, "unchanged search");
+        app.config.open = true;
+        frame(&mut ctx, &mut app, size, vec![]);
+        frame(
+            &mut ctx,
+            &mut app,
+            size,
+            vec![egui::Event::Text("blocked".into())],
+        );
+        assert_eq!(app.search.input, "unchanged search");
+        click_text(&mut ctx, &mut app, size, "BiliDL");
+        assert_eq!(app.page, Page::Queue);
+        assert!(app.config.open);
+        frame(
+            &mut ctx,
+            &mut app,
+            size,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(!app.config.open);
+        click_text(&mut ctx, &mut app, size, "BiliDL");
+        assert_eq!(app.page, Page::Discover);
+    }
+
     fn frame(
         ctx: &mut egui::Context,
         app: &mut App,
@@ -2080,8 +2757,11 @@ mod layout_tests {
             ..Default::default()
         };
         ctx.run(raw, |ctx| {
-            app.sidebar(ctx);
+            app.header(ctx);
             app.central(ctx);
+            app.configuration(ctx);
+            app.accounts(ctx);
+            app.toasts(ctx);
         })
     }
 
@@ -2124,6 +2804,207 @@ mod layout_tests {
             );
         }
     }
+    fn click_text(ctx: &mut egui::Context, app: &mut App, size: Vec2, needle: &str) {
+        frame(ctx, app, size, vec![]);
+        let output = frame(ctx, app, size, vec![]);
+        let pos = texts(&output)
+            .into_iter()
+            .find(|(text, _, _)| text == needle)
+            .unwrap_or_else(|| panic!("missing control {needle}"))
+            .1
+            .center();
+        frame(
+            ctx,
+            app,
+            size,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        frame(
+            ctx,
+            app,
+            size,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+    }
+
+    #[test]
+    fn search_detail_shared_configuration_admission_and_history_form_one_flow() {
+        use bili_core::{Availability, QualityCatalog, QualityEntry, RepresentationKey};
+        let size = Vec2::new(1180.0, 800.0);
+        let mut ctx = egui::Context::default();
+        let mut app = test_app();
+        app.prefs.default_download_rate_mib = 10.0;
+        let (bridge, events, mut commands) = Bridge::test_channel();
+        app.bridge = Some(bridge);
+        let item = media_item();
+        let part = item.parts[0].reference.clone();
+        app.search.set_requested(SearchQuery {
+            keyword: "视频".into(),
+            category: SearchCategory::Video,
+            page: 1,
+            sort: bili_core::SearchSort::Relevance,
+            filter: Default::default(),
+        });
+        app.search.accept_results(CandidatePage {
+            pages: vec![CategoryPage {
+                category: SearchCategory::Video,
+                page: 1,
+                total: Some(1),
+                has_more: false,
+                page_size: Some(20),
+                total_pages: Some(1),
+                items: vec![Candidate {
+                    reference: item.reference.clone(),
+                    category: SearchCategory::Video,
+                    title: item.title.clone(),
+                    cover: None,
+                    duration_ms: item.duration_ms,
+                    author: None,
+                    published_at: None,
+                    plays: None,
+                    danmaku: None,
+                }],
+            }],
+        });
+        click_text(&mut ctx, &mut app, size, &item.title);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Run(Operation::Resolve(_)))
+        ));
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Detail(item.clone()))))
+            .is_ok());
+        app.collect(&ctx);
+        assert!(app.detail.is_some());
+        click_text(&mut ctx, &mut app, size, "下载");
+        let Ok(Command::Run(Operation::Prepare { inputs, .. })) = commands.try_recv() else {
+            panic!("detail must use shared preparation")
+        };
+        assert_eq!(inputs[0].parts.as_ref().unwrap(), &vec![part.clone()]);
+        let video = RepresentationKey {
+            part: part.clone(),
+            id: 64,
+            quality: 64,
+            codec: "avc1".into(),
+            width: Some(1280),
+            height: Some(720),
+            fps: None,
+            dynamic_range: None,
+            color: None,
+            bandwidth: 1000,
+            audio: false,
+            sample_rate: None,
+            channels: None,
+            language: None,
+        };
+        let catalog = QualityCatalog {
+            part: part.clone(),
+            advertised: vec![QualityEntry {
+                id: 64,
+                label: "720P".into(),
+                rank: 64,
+                availability: Availability::Obtainable,
+                requires_login: None,
+                requires_vip: None,
+                has_video_url: true,
+                advertised_codecs: vec!["avc1".into()],
+            }],
+            representations: vec![video.clone()],
+            revision: 1,
+            preview: false,
+        };
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Prepared {
+                refresh: false,
+                items: vec![crate::backend::PreparedItem {
+                    item,
+                    category: SearchCategory::Video,
+                    selected: vec![part.clone()],
+                    catalogs: vec![(part.clone(), Ok(catalog))]
+                }],
+                profile: None
+            })))
+            .is_ok());
+        app.collect(&ctx);
+        assert!(app.config.open);
+        click_text(&mut ctx, &mut app, size, "开始下载 · 1 项");
+        let Ok(Command::Run(Operation::Enqueue {
+            selections,
+            output_dir,
+        })) = commands.try_recv()
+        else {
+            panic!("configured admission")
+        };
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].selection.part, part);
+        assert_eq!(
+            selections[0].context.batch.as_ref().unwrap().rate_limit,
+            Some(10 * 1_048_576),
+            "new download preparation inherits the persisted GUI default"
+        );
+        let request = &selections[0];
+        let plan = bili_core::StreamPlan {
+            schema_version: 1,
+            fingerprint: "synthetic-native-flow".into(),
+            part: part.clone(),
+            title: request.selection.title.clone(),
+            video,
+            audio: None,
+            topology: bili_core::StreamTopology::Dash,
+            segments: vec![],
+            destination: output_dir.join("native-flow.mp4"),
+            merge: bili_core::MergePolicy::Automatic,
+            sidecars: request.selection.sidecars.clone(),
+            keep_temp: false,
+            catalog_revision: 1,
+            context: Some(request.context.clone()),
+        };
+        let id = JobId::new();
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Enqueued {
+                receipts: vec![crate::backend::AdmissionReceipt {
+                    id,
+                    plan: plan.clone()
+                }],
+                cancelled: false,
+                error: None
+            })))
+            .is_ok());
+        app.collect(&ctx);
+        assert_eq!(app.page, Page::Discover);
+        assert!(app.config.open);
+        assert_eq!(app.config.receipts[0].id, id);
+        app.config.open = false;
+        app.navigate(Page::Queue);
+        let mut completed = job(JobPhase::Completed, Some("C:/synthetic/native-flow.mp4"));
+        completed.id = id;
+        completed.plan = Some(Arc::new(plan));
+        app.snapshot = Arc::new(QueueSnapshot {
+            schema_version: 1,
+            revision: 1,
+            jobs: vec![Arc::new(completed)],
+        });
+        click_text(&mut ctx, &mut app, size, "已完成 1");
+        let output = frame(&mut ctx, &mut app, size, vec![]);
+        assert_visible(
+            &output,
+            "打开文件所在位置",
+            Rect::from_min_size(Pos2::ZERO, size),
+        );
+    }
 
     fn results(count: usize) -> CandidatePage {
         CandidatePage {
@@ -2132,6 +3013,8 @@ mod layout_tests {
                 page: 1,
                 total: Some(count as u64),
                 has_more: false,
+                page_size: Some(count as u32),
+                total_pages: Some(1),
                 items: (0..count)
                     .map(|index| Candidate {
                         reference: ContentRef::Video(Aid::new(1_000 + index as u64).unwrap()),
@@ -2139,6 +3022,10 @@ mod layout_tests {
                         title: format!("测试视频 {index}"),
                         cover: None,
                         duration_ms: Some(61_000),
+                        author: None,
+                        published_at: None,
+                        plays: None,
+                        danmaku: None,
                     })
                     .collect(),
             }],
@@ -2154,6 +3041,9 @@ mod layout_tests {
             title: "【官方 MV】Never Gonna Give You Up - Rick Astley".into(),
             cover: None,
             duration_ms: Some(213_000),
+            source: None,
+            description: None,
+            author: None,
             parts: vec![Part {
                 reference: PartRef {
                     content: ContentRef::Video(aid),
@@ -2181,6 +3071,7 @@ mod layout_tests {
             skipped: false,
             error: None,
             components: Vec::new(),
+            created_at: None,
         }
     }
 
@@ -2201,24 +3092,32 @@ mod layout_tests {
         let screen = Rect::from_min_size(Pos2::ZERO, size);
         let mut ctx = egui::Context::default();
         let mut app = test_app();
-        app.search.results = Some(results(12));
+        // The grid fits twelve short cards almost entirely in this viewport.
+        // Use six rows so the wheel exercise measures scrolling rather than
+        // clamping against a few pixels of overflow.
+        app.search.results = Some(results(24));
 
         let output = frame(&mut ctx, &mut app, size, Vec::new());
         let before = texts(&output)
             .into_iter()
-            .find(|(text, _, _)| text.contains("搜索结果"))
+            .find(|(text, _, _)| text == "测试视频 0")
             .map(|(_, rect, _)| rect)
-            .expect("search header");
+            .expect("first result card title");
 
         let mut events = Vec::new();
         wheel(&mut events, egui::pos2(600.0, 500.0), 3);
         frame(&mut ctx, &mut app, size, events);
-        let output = frame(&mut ctx, &mut app, size, Vec::new());
+        // egui spreads wheel input across animation frames. Let that input
+        // finish before comparing offsets across separate workspaces.
+        let mut output = frame(&mut ctx, &mut app, size, Vec::new());
+        for _ in 0..30 {
+            output = frame(&mut ctx, &mut app, size, Vec::new());
+        }
         let after = texts(&output)
             .into_iter()
-            .find(|(text, _, _)| text.contains("搜索结果"))
+            .find(|(text, _, _)| text == "测试视频 0")
             .map(|(_, rect, _)| rect)
-            .expect("search header after scrolling");
+            .expect("first result title after scrolling");
         assert!(
             after.top() < before.top() - 50.0,
             "search results did not scroll: before {before:?} after {after:?}"
@@ -2228,15 +3127,16 @@ mod layout_tests {
         let output = frame(&mut ctx, &mut app, size, Vec::new());
         assert_visible(&output, "返回搜索", screen);
 
-        app.detail = None;
+        click_text(&mut ctx, &mut app, size, "返回搜索");
+        assert!(app.detail.is_none());
         let output = frame(&mut ctx, &mut app, size, Vec::new());
         let restored = texts(&output)
             .into_iter()
-            .find(|(text, _, _)| text.contains("搜索结果"))
+            .find(|(text, _, _)| text == "测试视频 0")
             .map(|(_, rect, _)| rect)
-            .expect("search header after going back");
+            .expect("first result title after going back");
         assert!(
-            (restored.top() - after.top()).abs() < 40.0,
+            (restored.top() - after.top()).abs() < 1.0,
             "search scroll was not preserved: before {after:?} restored {restored:?}"
         );
     }
@@ -2319,7 +3219,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn busy_status_floats_top_right_instead_of_inline() {
+    fn busy_status_keeps_a_floating_cancel_action_alongside_inline_waiting() {
         let size = Vec2::new(1180.0, 800.0);
         let screen = Rect::from_min_size(Pos2::ZERO, size);
         let mut ctx = egui::Context::default();
@@ -2332,7 +3232,7 @@ mod layout_tests {
         assert_visible(&output, "正在解析内容与分集…", screen);
         let status = texts(&output)
             .into_iter()
-            .find(|(text, _, _)| text == "正在解析内容与分集…")
+            .find(|(text, rect, _)| text == "正在解析内容与分集…" && rect.left() > size.x * 0.6)
             .map(|(_, rect, _)| rect)
             .unwrap();
         assert!(
@@ -2388,7 +3288,9 @@ mod layout_tests {
 
         let mut ctx = egui::Context::default();
         let mut app = test_app();
-        app.page = Page::Completed;
+        app.page = Page::Queue;
+        app.queue
+            .select_filter(crate::download_panel::Filter::Completed);
         app.snapshot = Arc::new(QueueSnapshot {
             schema_version: 1,
             revision: 1,
@@ -2398,7 +3300,7 @@ mod layout_tests {
             ))],
         });
         let output = frame(&mut ctx, &mut app, size, Vec::new());
-        assert_visible(&output, "复制文件路径", screen);
+        assert_visible(&output, "打开文件所在位置", screen);
 
         let mut ctx = egui::Context::default();
         let mut app = test_app();
@@ -2412,126 +3314,90 @@ mod layout_tests {
         assert_visible(&output, "暂停", screen);
     }
 
-    #[test]
-    fn sidebar_account_card_keeps_name_status_and_action_order() {
-        let size = Vec2::new(1180.0, 800.0);
-        let screen = Rect::from_min_size(Pos2::ZERO, size);
-        let mut ctx = egui::Context::default();
-        let mut app = test_app();
-        let output = frame(&mut ctx, &mut app, size, Vec::new());
-        let find = |needle: &str| {
-            texts(&output)
-                .into_iter()
-                .find(|(text, _, _)| text.contains(needle))
-                .map(|(_, rect, _)| rect)
-                .unwrap_or_else(|| panic!("missing text: {needle}"))
-        };
-        let name = find("访客模式");
-        let status = find("尚未登录，使用访客画质");
-        assert!(name.top() < status.top(), "name must sit above status");
-        assert!(
-            !texts(&output)
-                .iter()
-                .any(|(text, _, _)| text.contains("扫码登录")),
-            "the account card must not repeat a login button"
-        );
-        let native = find("NATIVE DESKTOP");
-        assert!(
-            native.top() - status.bottom() < 80.0,
-            "account card is stretched: status {status:?} native {native:?}"
-        );
-        for rect in [name, status] {
-            assert!(
-                screen.contains_rect(rect),
-                "account card item is clipped: {rect:?}"
-            );
+    fn header_circles(output: &egui::FullOutput) -> Vec<egui::Rect> {
+        fn visit(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Circle(circle) if circle.radius >= 17.0 && circle.radius <= 18.5 => {
+                    out.push(egui::Rect::from_center_size(
+                        circle.center,
+                        Vec2::splat(circle.radius * 2.0),
+                    ))
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, out);
+                    }
+                }
+                _ => {}
+            }
         }
+        let mut result = Vec::new();
+        for shape in &output.shapes {
+            visit(&shape.shape, &mut result);
+        }
+        result.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        result.dedup();
+        result
     }
-
     #[test]
-    fn signed_in_account_card_fits_small_windows() {
-        let mut ctx = egui::Context::default();
-        let mut app = test_app();
-        app.auth = Some(bili_core::AuthSnapshot {
-            logged_in: true,
-            account: Some(bili_core::auth::AuthAccount {
-                mid: 1,
-                name: "测试账号".into(),
-                face: None,
-            }),
-            notice: None,
-            qr: None,
-            qr_status: None,
-        });
-        app.prefs.remember_login = true;
+    fn header_has_logo_and_right_edge_circular_actions() {
         for size in [
             Vec2::new(900.0, 640.0),
             Vec2::new(1180.0, 800.0),
             Vec2::new(1706.0, 960.0),
         ] {
-            let screen = Rect::from_min_size(Pos2::ZERO, size);
-            frame(&mut ctx, &mut app, size, Vec::new());
-            let output = frame(&mut ctx, &mut app, size, Vec::new());
-            let all = texts(&output);
-            let rect = |needle: &str| {
-                all.iter()
-                    .find(|(text, _, _)| text.contains(needle))
-                    .map(|(_, rect, _)| *rect)
-                    .unwrap_or_else(|| panic!("missing {needle} at {size:?}"))
-            };
-            let status = rect("保持登录");
-            let native = rect("NATIVE DESKTOP");
-            assert!(
-                native.top() - status.bottom() < 80.0,
-                "card is stretched at {size:?}: {status:?} {native:?}"
-            );
-            for rect in [status, native] {
-                assert!(screen.contains_rect(rect), "clipped at {size:?}: {rect:?}");
-            }
+            let mut ctx = egui::Context::default();
+            let mut app = test_app();
+            let output = frame(&mut ctx, &mut app, size, vec![]);
+            assert_visible(&output, "BiliDL", Rect::from_min_size(Pos2::ZERO, size));
+            let circles = header_circles(&output);
+            assert_eq!(circles.len(), 2);
+            assert!((size.x - circles[1].right() - 18.0).abs() < 2.0);
+            assert!((circles[0].width() - circles[1].width()).abs() < 0.1);
+            assert!(!texts(&output).iter().any(
+                |(text, _, _)| text.contains("你的工作空间") || text.contains("NATIVE DESKTOP")
+            ));
         }
     }
-
     #[test]
-    fn clicking_the_account_card_opens_the_login_dialog() {
+    fn header_avatar_opens_menu_and_history_changes_workspace() {
         let size = Vec2::new(1180.0, 800.0);
         let mut ctx = egui::Context::default();
         let mut app = test_app();
-        let output = frame(&mut ctx, &mut app, size, Vec::new());
-        let name = texts(&output)
-            .into_iter()
-            .find(|(text, _, _)| text.contains("访客模式"))
-            .map(|(_, rect, _)| rect)
-            .expect("account name");
-        let pos = name.center();
-        frame(
-            &mut ctx,
-            &mut app,
-            size,
-            vec![
-                egui::Event::PointerMoved(pos),
-                egui::Event::PointerButton {
+        let output = frame(&mut ctx, &mut app, size, vec![]);
+        let circles = header_circles(&output);
+        for (pos, avatar) in [(circles[0].center(), true), (circles[1].center(), false)] {
+            frame(
+                &mut ctx,
+                &mut app,
+                size,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            frame(
+                &mut ctx,
+                &mut app,
+                size,
+                vec![egui::Event::PointerButton {
                     pos,
                     button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ],
-        );
-        frame(
-            &mut ctx,
-            &mut app,
-            size,
-            vec![egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            }],
-        );
-        assert!(
-            app.login.open,
-            "clicking the account card must open the login dialog"
-        );
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+            );
+            if avatar {
+                assert!(app.account_menu);
+            } else {
+                assert_eq!(app.page, Page::Queue);
+            }
+        }
     }
 
     #[test]
@@ -2552,6 +3418,548 @@ mod layout_tests {
     }
 
     #[test]
+    fn retryable_error_remains_visible_after_the_notice_timeout() {
+        let mut app = test_app();
+        let mut banner: Banner = "搜索没有完成".into();
+        banner.retry = Some(Retry::Login);
+        app.raise(banner);
+        app.error_at = Some(Instant::now() - Duration::from_secs(30));
+        app.inform("旧通知");
+        app.notice_at = Some(Instant::now() - Duration::from_secs(30));
+        app.expire_toasts();
+        assert!(app.error.as_ref().unwrap().retry.is_some());
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn appearance_sync_tracks_system_changes_and_manual_override() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        for (mode, system, expected_dark) in [
+            (AppearanceMode::System, egui::Theme::Light, false),
+            (AppearanceMode::System, egui::Theme::Dark, true),
+            (AppearanceMode::Light, egui::Theme::Dark, false),
+            (AppearanceMode::Dark, egui::Theme::Light, true),
+        ] {
+            app.prefs.appearance = mode;
+            let _ = ctx.run(
+                egui::RawInput {
+                    system_theme: Some(system),
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.sync_appearance(ctx);
+                    assert_eq!(ctx.style().visuals.dark_mode, expected_dark);
+                    assert_eq!(theme::palette().dark_mode, expected_dark);
+                },
+            );
+        }
+    }
+
+    fn multipart_detail_item() -> MediaItem {
+        let mut item = media_item();
+        item.title = "Multipart detail state".into();
+        item.parts[0].title = "First original part".into();
+        let mut second = item.parts[0].clone();
+        second.reference.cid = Cid::new(137_649_200).unwrap();
+        second.ordinal = 2;
+        second.title = "Second original part".into();
+        item.parts.push(second);
+        item
+    }
+
+    fn explicit_detail_part(item: &MediaItem, index: usize) -> MediaItem {
+        let mut explicit = item.clone();
+        explicit.parts = vec![item.parts[index].clone()];
+        explicit
+    }
+
+    fn receive_detail(
+        app: &mut App,
+        events: &tokio::sync::mpsc::Sender<Event>,
+        commands: &mut tokio::sync::mpsc::Receiver<Command>,
+        ctx: &egui::Context,
+        input: &str,
+        item: MediaItem,
+    ) {
+        app.send(Operation::Resolve(input.into()));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::Run(Operation::Resolve(_))
+        ));
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Detail(item))))
+            .is_ok());
+        app.collect(ctx);
+    }
+
+    #[test]
+    fn whole_and_explicit_part_details_keep_independent_drafts() {
+        let mut app = test_app();
+        let (bridge, events, mut commands) = Bridge::test_channel();
+        app.bridge = Some(bridge);
+        let ctx = egui::Context::default();
+        let whole = multipart_detail_item();
+        let second = explicit_detail_part(&whole, 1);
+        let whole_key = detail_draft_key(&whole);
+        let second_key = detail_draft_key(&second);
+
+        receive_detail(
+            &mut app,
+            &events,
+            &mut commands,
+            &ctx,
+            "av80433022",
+            whole.clone(),
+        );
+        app.detail.as_mut().unwrap().item.description = Some("whole draft marker".into());
+        app.home();
+        receive_detail(
+            &mut app,
+            &events,
+            &mut commands,
+            &ctx,
+            "https://www.bilibili.com/video/av80433022?p=2",
+            second.clone(),
+        );
+        let active = app.detail.as_ref().unwrap();
+        assert_eq!(active.item.parts.len(), 1);
+        assert_eq!(active.item.parts[0].ordinal, 2);
+        assert_eq!(active.item.parts[0].reference, second.parts[0].reference);
+        assert_eq!(
+            app.detail_drafts[&whole_key].item.description.as_deref(),
+            Some("whole draft marker")
+        );
+
+        app.detail.as_mut().unwrap().item.description = Some("second part draft marker".into());
+        app.home();
+        receive_detail(&mut app, &events, &mut commands, &ctx, "av80433022", whole);
+        let active = app.detail.as_ref().unwrap();
+        assert_eq!(active.item.parts.len(), 2);
+        assert_eq!(
+            active.item.description.as_deref(),
+            Some("whole draft marker")
+        );
+        assert_eq!(
+            app.detail_drafts[&second_key].item.description.as_deref(),
+            Some("second part draft marker")
+        );
+    }
+
+    #[test]
+    fn explicit_part_details_do_not_restore_another_original_part_draft() {
+        let mut app = test_app();
+        let (bridge, events, mut commands) = Bridge::test_channel();
+        app.bridge = Some(bridge);
+        let ctx = egui::Context::default();
+        let whole = multipart_detail_item();
+        let first = explicit_detail_part(&whole, 0);
+        let second = explicit_detail_part(&whole, 1);
+        let first_key = detail_draft_key(&first);
+        let second_key = detail_draft_key(&second);
+
+        receive_detail(
+            &mut app,
+            &events,
+            &mut commands,
+            &ctx,
+            "https://www.bilibili.com/video/av80433022?p=1",
+            first.clone(),
+        );
+        app.detail.as_mut().unwrap().item.description = Some("first part draft marker".into());
+        app.home();
+        receive_detail(
+            &mut app,
+            &events,
+            &mut commands,
+            &ctx,
+            "https://www.bilibili.com/video/av80433022?p=2",
+            second.clone(),
+        );
+        let active = app.detail.as_ref().unwrap();
+        assert_eq!(active.item.parts.len(), 1);
+        assert_eq!(active.item.parts[0].ordinal, 2);
+        assert_eq!(active.item.parts[0].reference, second.parts[0].reference);
+        assert_eq!(
+            app.detail_drafts[&first_key].item.description.as_deref(),
+            Some("first part draft marker")
+        );
+        app.home();
+        receive_detail(
+            &mut app,
+            &events,
+            &mut commands,
+            &ctx,
+            "https://www.bilibili.com/video/av80433022?p=1",
+            first,
+        );
+        let active = app.detail.as_ref().unwrap();
+        assert_eq!(active.item.parts[0].ordinal, 1);
+        assert_eq!(
+            active.item.description.as_deref(),
+            Some("first part draft marker")
+        );
+        assert_eq!(app.detail_drafts[&second_key].item.parts[0].ordinal, 2);
+    }
+
+    #[test]
+    fn late_explicit_part_detail_preserves_the_cached_whole_draft() {
+        let mut app = test_app();
+        let (bridge, events, mut commands) = Bridge::test_channel();
+        app.bridge = Some(bridge);
+        let ctx = egui::Context::default();
+        let whole = multipart_detail_item();
+        let second = explicit_detail_part(&whole, 1);
+        let whole_key = detail_draft_key(&whole);
+        let second_key = detail_draft_key(&second);
+        receive_detail(&mut app, &events, &mut commands, &ctx, "av80433022", whole);
+        app.detail.as_mut().unwrap().item.description = Some("whole draft marker".into());
+        app.home();
+
+        app.send(Operation::Resolve(
+            "https://www.bilibili.com/video/av80433022?p=2".into(),
+        ));
+        assert!(commands.try_recv().is_ok());
+        app.home();
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Detail(second.clone()))))
+            .is_ok());
+        app.collect(&ctx);
+        assert!(app.detail.is_none());
+        assert_eq!(
+            app.detail_drafts[&whole_key].item.description.as_deref(),
+            Some("whole draft marker")
+        );
+        assert_eq!(app.detail_drafts[&second_key].item.parts.len(), 1);
+        assert_eq!(
+            app.detail_drafts[&second_key].item.parts[0].reference,
+            second.parts[0].reference
+        );
+    }
+
+    #[test]
+    fn explicit_home_invalidates_pending_detail_and_preparation_navigation() {
+        let mut app = test_app();
+        let (bridge, events, mut commands) = Bridge::test_channel();
+        app.bridge = Some(bridge);
+        let ctx = egui::Context::default();
+        let item = media_item();
+        let draft_key = detail_draft_key(&item);
+        app.send(Operation::Resolve("av80433022".into()));
+        assert!(commands.try_recv().is_ok());
+        app.home();
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Detail(item.clone()))))
+            .is_ok());
+        app.collect(&ctx);
+        assert_eq!(app.page, Page::Discover);
+        assert!(app.detail.is_none());
+        assert!(app.detail_drafts.contains_key(&draft_key));
+        let selected = item.parts.iter().map(|p| p.reference.clone()).collect();
+        let prepared = crate::backend::PreparedItem {
+            item,
+            category: SearchCategory::Video,
+            selected,
+            catalogs: vec![],
+        };
+        app.send(Operation::Prepare {
+            refresh: false,
+            inputs: vec![],
+            profile: None,
+        });
+        assert!(commands.try_recv().is_ok());
+        app.home();
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Prepared {
+                refresh: false,
+                items: vec![prepared.clone()],
+                profile: None
+            })))
+            .is_ok());
+        app.collect(&ctx);
+        assert!(
+            !app.config.open,
+            "a late response must not reopen a dismissed workflow"
+        );
+        let temporary = std::env::temp_dir().join("bili-native-cancelled-draft");
+        app.config.directory = temporary.display().to_string();
+        app.send(Operation::Prepare {
+            refresh: false,
+            inputs: vec![],
+            profile: None,
+        });
+        assert!(commands.try_recv().is_ok());
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Prepared {
+                refresh: false,
+                items: vec![prepared],
+                profile: None
+            })))
+            .is_ok());
+        app.collect(&ctx);
+        assert!(app.config.open);
+        assert_eq!(PathBuf::from(&app.config.directory), temporary);
+    }
+
+    #[test]
+    fn cancelled_read_success_does_not_open_a_flow_or_replace_committed_results() {
+        let mut app = test_app();
+        let (bridge, events, mut commands) = Bridge::test_channel();
+        app.bridge = Some(bridge);
+        let ctx = egui::Context::default();
+        app.send(Operation::Resolve("av80433022".into()));
+        let _ = commands.try_recv().unwrap();
+        app.cancel();
+        assert!(matches!(commands.try_recv().unwrap(), Command::Cancel));
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Detail(media_item()))))
+            .is_ok());
+        app.collect(&ctx);
+        assert!(app.detail.is_none());
+
+        let old = SearchQuery {
+            keyword: "committed".into(),
+            category: SearchCategory::Video,
+            page: 1,
+            sort: SearchSort::Relevance,
+            filter: Default::default(),
+        };
+        app.search.set_requested(old);
+        app.search.accept_results(results(2));
+        let next = SearchQuery {
+            keyword: "cancelled".into(),
+            category: SearchCategory::Video,
+            page: 1,
+            sort: SearchSort::Relevance,
+            filter: Default::default(),
+        };
+        app.search.set_requested(next.clone());
+        app.send(Operation::Search(next));
+        let _ = commands.try_recv().unwrap();
+        app.cancel();
+        let _ = commands.try_recv().unwrap();
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Search(results(0)))))
+            .is_ok());
+        app.collect(&ctx);
+        assert_eq!(app.search.results.as_ref().unwrap().pages[0].items.len(), 2);
+        assert!(app.search.stale);
+        assert!(app.search.requested_query().is_none());
+    }
+
+    #[test]
+    fn closing_configuration_during_refresh_keeps_it_closed_after_success() {
+        let mut app = test_app();
+        let (bridge, events, mut commands) = Bridge::test_channel();
+        app.bridge = Some(bridge);
+        let mut ctx = egui::Context::default();
+        let item = media_item();
+        let prepared = crate::backend::PreparedItem {
+            selected: item.parts.iter().map(|p| p.reference.clone()).collect(),
+            item,
+            category: SearchCategory::Video,
+            catalogs: vec![],
+        };
+        app.config.accept(
+            vec![prepared.clone()],
+            None,
+            &app.output,
+            app.prefs.default_download_rate_mib,
+            false,
+        );
+        app.config.directory = std::env::temp_dir()
+            .join("preserved-refresh-draft")
+            .display()
+            .to_string();
+        app.send(Operation::Prepare {
+            inputs: vec![],
+            profile: None,
+            refresh: true,
+        });
+        let _ = commands.try_recv().unwrap();
+        frame(
+            &mut ctx,
+            &mut app,
+            Vec2::new(1180.0, 800.0),
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!app.config.open);
+        assert!(events
+            .try_send(Event::Finished(Ok(Outcome::Prepared {
+                items: vec![prepared],
+                profile: None,
+                refresh: true
+            })))
+            .is_ok());
+        app.collect(&ctx);
+        assert!(
+            !app.config.open,
+            "late catalog refresh must respect dialog dismissal"
+        );
+        assert_eq!(
+            PathBuf::from(&app.config.directory),
+            std::env::temp_dir().join("preserved-refresh-draft")
+        );
+    }
+
+    #[test]
+    fn failed_category_and_preparation_retry_the_same_typed_intent() {
+        let mut app = test_app();
+        let (bridge, events, mut commands) = Bridge::test_channel();
+        app.bridge = Some(bridge);
+        let ctx = egui::Context::default();
+        let section = bili_core::PgcSection::Film;
+        let operation = app.search.choose_category(SearchCategory::Film).unwrap();
+        app.send(operation);
+        let _ = commands.try_recv().unwrap();
+        assert!(events
+            .try_send(Event::Finished(Err(bili_core::CoreError::new(
+                ErrorCode::Transport,
+                "test category failure"
+            ))))
+            .is_ok());
+        app.collect(&ctx);
+        let retry = app.error.as_ref().unwrap().retry.clone().unwrap();
+        assert!(matches!(
+            retry,
+            Retry::BrowseConditions(bili_core::PgcSection::Film)
+        ));
+        app.run_retry(retry);
+        assert!(
+            matches!(commands.try_recv().unwrap(),Command::Run(Operation::BrowseConditions(actual)) if actual==section)
+        );
+        // Finish the retry before testing an independent prepared-batch failure.
+        assert!(events
+            .try_send(Event::Finished(Err(bili_core::CoreError::new(
+                ErrorCode::Transport,
+                "test category failure"
+            ))))
+            .is_ok());
+        app.collect(&ctx);
+        let item = media_item();
+        let expected = item.parts[0].reference.clone();
+        app.send(Operation::Prepare {
+            inputs: vec![backend::PrepareInput {
+                input: "av80433022".into(),
+                parts: Some(vec![expected.clone()]),
+                category: SearchCategory::Video,
+            }],
+            profile: Some("batch-profile".into()),
+            refresh: true,
+        });
+        let _ = commands.try_recv().unwrap();
+        assert!(events
+            .try_send(Event::Finished(Err(bili_core::CoreError::new(
+                ErrorCode::Transport,
+                "test preparation failure"
+            ))))
+            .is_ok());
+        app.collect(&ctx);
+        app.run_retry(app.error.as_ref().unwrap().retry.clone().unwrap());
+        let Command::Run(Operation::Prepare {
+            inputs,
+            profile,
+            refresh,
+        }) = commands.try_recv().unwrap()
+        else {
+            panic!("retry must preserve preparation rather than resolve a prior detail")
+        };
+        assert_eq!(profile.as_deref(), Some("batch-profile"));
+        assert!(refresh);
+        assert_eq!(
+            inputs[0].parts.as_deref(),
+            Some(std::slice::from_ref(&expected))
+        );
+    }
+
+    #[test]
+    fn adding_a_task_account_preserves_global_selection_and_retargets_only_that_task() {
+        use bili_core::auth::{AuthAccount, AuthProfile, ProfileValidity};
+        for global in [None, Some("global-profile")] {
+            let mut app = test_app();
+            let (bridge, events, mut commands) = Bridge::test_channel();
+            app.bridge = Some(bridge);
+            let ctx = egui::Context::default();
+            let target = JobId::new();
+            let added = AuthProfile {
+                id: "new-task-profile".into(),
+                account: AuthAccount {
+                    mid: 22,
+                    name: "task account".into(),
+                    face: None,
+                    vip: None,
+                },
+                remembered: false,
+                validity: ProfileValidity::Valid,
+                checked_at: None,
+                expires_at: None,
+            };
+            let auth = AuthSnapshot {
+                logged_in: global.is_some(),
+                account: global.map(|_| AuthAccount {
+                    mid: 11,
+                    name: "global account".into(),
+                    face: None,
+                    vip: None,
+                }),
+                notice: None,
+                qr: None,
+                qr_status: None,
+                profiles: vec![added],
+                selected_profile: global.map(str::to_owned),
+                login_profile: None,
+            };
+            app.auth = Some(auth.clone());
+            app.auth_target = Some(target);
+            app.account_manager = true;
+            app.login.open = true;
+            app.login.adding = true;
+            let original_remember = app.prefs.remember_login;
+            app.send(Operation::Login {
+                remember: true,
+                activate: false,
+            });
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                Command::Run(Operation::Login {
+                    activate: false,
+                    ..
+                })
+            ));
+            assert!(events
+                .try_send(Event::Finished(Ok(Outcome::ProfileAdded {
+                    auth,
+                    profile_id: "new-task-profile".into()
+                })))
+                .is_ok());
+            app.collect(&ctx);
+            assert_eq!(
+                app.auth.as_ref().unwrap().selected_profile.as_deref(),
+                global
+            );
+            assert_eq!(
+                app.prefs.remember_login, original_remember,
+                "task credentials must not change global auto-login preference"
+            );
+            assert!(!app.login.open);
+            assert!(!app.account_manager);
+            let Command::Run(Operation::RetargetProfile { id, profile }) =
+                commands.try_recv().unwrap()
+            else {
+                panic!("added task account must retarget its original job")
+            };
+            assert_eq!(id, target);
+            assert_eq!(profile.as_deref(), Some("new-task-profile"));
+        }
+    }
+
+    #[test]
     fn error_banner_offers_retry_and_keeps_the_code_out_of_the_message() {
         let size = Vec2::new(1180.0, 800.0);
         let screen = Rect::from_min_size(Pos2::ZERO, size);
@@ -2562,6 +3970,7 @@ mod layout_tests {
             hint: Some("可切换到「视频」后重试。".into()),
             code: Some("错误码 Transport".into()),
             retry: Some(Retry::Login),
+            verification: None,
         });
         frame(&mut ctx, &mut app, size, Vec::new());
         let output = frame(&mut ctx, &mut app, size, Vec::new());
@@ -2591,6 +4000,7 @@ mod layout_tests {
         app.notice = Some(Notice {
             text: "发现新版本 v9.9.9".into(),
             open_about: true,
+            open_downloads: false,
         });
         frame(&mut ctx, &mut app, size, Vec::new());
         let output = frame(&mut ctx, &mut app, size, Vec::new());

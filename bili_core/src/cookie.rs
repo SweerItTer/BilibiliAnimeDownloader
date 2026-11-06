@@ -21,6 +21,20 @@ const IMPORT_HOSTS: &[&str] = &[
 pub struct CredentialJar(Vec<CredentialCookie>);
 pub type SharedCredentialJar = Arc<RwLock<CredentialJar>>;
 
+impl CredentialJar {
+    /// Request Cookie headers carry no expiry attributes. Only a known expiry
+    /// of the actual session cookie can provide a deadline.
+    pub(crate) fn session_expiry_unix_ms(&self) -> Option<u64> {
+        self.0
+            .iter()
+            .filter(|c| c.name == "SESSDATA")
+            .filter_map(|c| c.expires)
+            .min()
+            .and_then(|v| v.duration_since(UNIX_EPOCH).ok())
+            .map(|v| v.as_millis().min(u128::from(u64::MAX)) as u64)
+    }
+}
+
 impl std::fmt::Debug for CredentialJar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CredentialJar")
@@ -349,6 +363,13 @@ impl CredentialJar {
         (!out.is_empty()).then_some(out)
     }
 
+    pub(crate) fn cookie_value_for(&self, name: &str, url: &Url) -> Option<String> {
+        self.header_for(url)?.split(';').find_map(|pair| {
+            let (key, value) = pair.trim().split_once('=')?;
+            (key == name).then(|| value.to_owned())
+        })
+    }
+
     pub(crate) fn to_private_json(&self) -> Result<String> {
         if self.0.len() > 512 {
             return Err(CoreError::new(
@@ -356,7 +377,12 @@ impl CredentialJar {
                 "credential storage limit",
             ));
         }
-        let cookies: Vec<StoredCookie> = self.0.iter().map(StoredCookie::from).collect();
+        let cookies: Vec<StoredCookie> = self
+            .0
+            .iter()
+            .filter(|cookie| cookie.name != "x-bili-gaia-vtoken")
+            .map(StoredCookie::from)
+            .collect();
         let value = serde_json::to_string(&cookies).map_err(|_| {
             CoreError::new(ErrorCode::CredentialStore, "credential storage encoding")
         })?;

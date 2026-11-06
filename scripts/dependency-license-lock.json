@@ -2,6 +2,33 @@
   "format": 1,
   "sources": [
     {
+      "package": "webview2-com-sys",
+      "version": "0.39.1",
+      "spdx": "MIT",
+      "url": "https://raw.githubusercontent.com/wravery/webview2-rs/edc2caf886175ccaebe86078c9cfe1ae2a187328/LICENSE",
+      "sha256": "0dcf41516e608bbcb6cdc5229feb7b86fe4a643b85e7df251133c93408fdac73",
+      "filename": "LICENSE.txt",
+      "provenance": "Full upstream webview2-rs MIT license with its copyright attribution at the exact crate source commit. Microsoft SDK loader terms are supplied separately from verified SDK inputs."
+    },
+    {
+      "package": "webview2-com",
+      "version": "0.39.1",
+      "spdx": "MIT",
+      "url": "https://raw.githubusercontent.com/wravery/webview2-rs/edc2caf886175ccaebe86078c9cfe1ae2a187328/LICENSE",
+      "sha256": "0dcf41516e608bbcb6cdc5229feb7b86fe4a643b85e7df251133c93408fdac73",
+      "filename": "LICENSE.txt",
+      "provenance": "Full upstream webview2-rs MIT license with its copyright attribution at the matching crate source commit."
+    },
+    {
+      "package": "webview2-com-macros",
+      "version": "0.8.1",
+      "spdx": "MIT",
+      "url": "https://raw.githubusercontent.com/wravery/webview2-rs/edc2caf886175ccaebe86078c9cfe1ae2a187328/LICENSE",
+      "sha256": "0dcf41516e608bbcb6cdc5229feb7b86fe4a643b85e7df251133c93408fdac73",
+      "filename": "LICENSE.txt",
+      "provenance": "Full upstream webview2-rs MIT license with its copyright attribution, matching the workspace source release."
+    },
+    {
       "package": "ffmpeg-sys-next",
       "version": "8.1.0",
       "spdx": "WTFPL",

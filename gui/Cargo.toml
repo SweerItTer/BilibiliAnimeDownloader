@@ -18,6 +18,8 @@ tokio = { version = "1.46", features = ["fs", "macros", "rt-multi-thread", "sync
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
+trash = "=5.2.9"
+wry = { version = "=0.57.1", default-features = false, features = ["os-webview"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
@@ -28,3 +30,6 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+winit = "0.30"

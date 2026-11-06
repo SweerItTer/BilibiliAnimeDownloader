@@ -339,6 +339,7 @@ pub(crate) async fn download(
     client: &Client,
     jar: &Arc<RwLock<CredentialJar>>,
     cancel: &CancellationToken,
+    state_dir: &Path,
 ) -> Vec<ComponentResult> {
     let mut result = Vec::new();
     if cancel.is_cancelled() {
@@ -351,11 +352,20 @@ pub(crate) async fn download(
     }
     if !matches!(policy.subtitles, SubtitleSelection::None) {
         result.extend(
-            download_subtitles(part, &policy.subtitles, basename, client, jar, cancel).await,
+            download_subtitles(
+                part,
+                &policy.subtitles,
+                basename,
+                client,
+                jar,
+                cancel,
+                state_dir,
+            )
+            .await,
         );
     }
     if policy.danmaku {
-        result.extend(download_danmaku(part, basename, client, jar, cancel).await);
+        result.extend(download_danmaku(part, basename, client, jar, cancel, state_dir).await);
     }
     result
 }
@@ -367,6 +377,7 @@ async fn download_subtitles(
     client: &Client,
     jar: &Arc<RwLock<CredentialJar>>,
     cancel: &CancellationToken,
+    state_dir: &Path,
 ) -> Vec<ComponentResult> {
     let new_tracks = match subtitle_view(client, jar, subtitle_api_url(part), cancel).await {
         Ok(tracks) => tracks,
@@ -463,7 +474,7 @@ async fn download_subtitles(
                 continue;
             };
             let identity = subtitle_identity(part, &track, &identity_id, "ass");
-            match existing_component(&path, &identity, cancel).await {
+            match existing_component(&path, &identity, cancel, state_dir).await {
                 Ok(true) => {
                     results.push(component(format!("subtitle-{id}-ass"), path, 0));
                     continue;
@@ -480,16 +491,19 @@ async fn download_subtitles(
                 Ok(false) => {}
             }
             match bytes(client, jar, url, cancel).await {
-                Ok(data) => match write_owned_component(path.clone(), data, identity, cancel).await
-                {
-                    Ok(()) => results.push(component(format!("subtitle-{id}-ass"), path, 0)),
-                    Err(error) => results.push(ComponentResult {
-                        name: format!("subtitle-{id}-ass"),
-                        path: None,
-                        error: Some(error),
-                        omissions: 0,
-                    }),
-                },
+                Ok(data) => {
+                    match write_owned_component(path.clone(), data, identity, cancel, state_dir)
+                        .await
+                    {
+                        Ok(()) => results.push(component(format!("subtitle-{id}-ass"), path, 0)),
+                        Err(error) => results.push(ComponentResult {
+                            name: format!("subtitle-{id}-ass"),
+                            path: None,
+                            error: Some(error),
+                            omissions: 0,
+                        }),
+                    }
+                }
                 Err(error) => results.push(ComponentResult {
                     name: format!("subtitle-{id}-ass"),
                     path: None,
@@ -522,8 +536,8 @@ async fn download_subtitles(
         };
         let raw_identity = subtitle_identity(part, &track, &identity_id, "raw-json");
         let srt_identity = subtitle_identity(part, &track, &identity_id, "srt");
-        let raw_exists = existing_component(&raw_path, &raw_identity, cancel).await;
-        let srt_exists = existing_component(&srt_path, &srt_identity, cancel).await;
+        let raw_exists = existing_component(&raw_path, &raw_identity, cancel, state_dir).await;
+        let srt_exists = existing_component(&srt_path, &srt_identity, cancel, state_dir).await;
         if let Err(error) = &raw_exists {
             results.push(ComponentResult {
                 name: format!("subtitle-{id}-raw"),
@@ -577,6 +591,7 @@ async fn download_subtitles(
                                 data,
                                 raw_identity,
                                 cancel,
+                                state_dir,
                             )
                             .await
                             {
@@ -594,8 +609,14 @@ async fn download_subtitles(
                     }
                     if srt_missing {
                         results.push(
-                            match write_owned_component(srt_path.clone(), srt, srt_identity, cancel)
-                                .await
+                            match write_owned_component(
+                                srt_path.clone(),
+                                srt,
+                                srt_identity,
+                                cancel,
+                                state_dir,
+                            )
+                            .await
                             {
                                 Ok(()) => {
                                     component(format!("subtitle-{id}-srt"), srt_path, omitted)
@@ -758,28 +779,34 @@ async fn existing_component(
     path: &Path,
     identity: &str,
     cancel: &CancellationToken,
+    state_dir: &Path,
 ) -> Result<bool, CoreError> {
     let path = path.to_owned();
     let identity = identity.to_owned();
     let cancel = cancel.clone();
-    tokio::task::spawn_blocking(move || crate::state::component_exists(&path, &identity, &cancel))
-        .await
-        .map_err(|_| {
-            CoreError::new(
-                ErrorCode::Filesystem,
-                "component verification worker failed",
-            )
-        })?
+    let state_dir = state_dir.to_owned();
+    tokio::task::spawn_blocking(move || {
+        crate::state::component_exists(&path, &identity, &cancel, &state_dir)
+    })
+    .await
+    .map_err(|_| {
+        CoreError::new(
+            ErrorCode::Filesystem,
+            "component verification worker failed",
+        )
+    })?
 }
 async fn write_owned_component(
     path: PathBuf,
     data: Vec<u8>,
     identity: String,
     cancel: &CancellationToken,
+    state_dir: &Path,
 ) -> Result<(), CoreError> {
     let cancel = cancel.clone();
+    let state_dir = state_dir.to_owned();
     tokio::task::spawn_blocking(move || {
-        crate::state::write_component(&path, &data, &identity, &cancel)
+        crate::state::write_component(&path, &data, &identity, &cancel, &state_dir)
     })
     .await
     .map_err(|_| CoreError::new(ErrorCode::Filesystem, "component writer failed"))?
@@ -835,6 +862,7 @@ async fn download_danmaku(
     client: &Client,
     jar: &Arc<RwLock<CredentialJar>>,
     cancel: &CancellationToken,
+    state_dir: &Path,
 ) -> Vec<ComponentResult> {
     let (Some(raw_path), Some(xml_path), Some(ass_path)) = (
         sidecar_path(basename, ".danmaku.jsonl"),
@@ -857,7 +885,7 @@ async fn download_danmaku(
     ];
     let mut already_owned = [false; 3];
     for index in 0..3 {
-        match existing_component(&paths[index], &identities[index], cancel).await {
+        match existing_component(&paths[index], &identities[index], cancel, state_dir).await {
             Ok(exists) => already_owned[index] = exists,
             Err(error) => {
                 return vec![ComponentResult {
@@ -989,6 +1017,7 @@ async fn download_danmaku(
             bytes,
             identities[index].clone(),
             cancel,
+            state_dir,
         )
         .await
         {

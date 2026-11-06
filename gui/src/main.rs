@@ -5,12 +5,16 @@ mod backend;
 mod background;
 mod covers;
 mod detail;
+mod download_config;
 mod download_panel;
+mod isolation;
 mod login;
 mod prefs;
+mod render_diagnostics;
 mod search;
 mod theme;
 mod update;
+mod verification;
 mod window;
 
 use bili_core::{CoreConfig, CoreError, ErrorCode};
@@ -20,7 +24,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Launch {
-    Window { state_dir: Option<PathBuf> },
+    Window {
+        state_dir: Option<PathBuf>,
+        profile_dir: Option<PathBuf>,
+    },
     Version,
     Help,
     Doctor,
@@ -32,10 +39,11 @@ fn launch_request(arguments: &[OsString]) -> bili_core::Result<Launch> {
     let invalid = || {
         CoreError::new(
             ErrorCode::InvalidInput,
-            "supported GUI options: --state-dir PATH, --version, --help, --json doctor",
+            "supported GUI options: --state-dir PATH, --profile-dir PATH, --version, --help, --json doctor",
         )
     };
     let mut state_dir = None;
+    let mut profile_dir = None;
     let mut json = false;
     let mut doctor = false;
     let mut version = false;
@@ -44,6 +52,8 @@ fn launch_request(arguments: &[OsString]) -> bili_core::Result<Launch> {
     while let Some(argument) = args.next() {
         if argument == "--state-dir" {
             state_dir = Some(PathBuf::from(args.next().ok_or_else(invalid)?));
+        } else if argument == "--profile-dir" && profile_dir.is_none() {
+            profile_dir = Some(PathBuf::from(args.next().ok_or_else(invalid)?));
         } else if argument == "--json" && !json {
             json = true;
         } else if argument == "doctor" && !doctor {
@@ -56,6 +66,9 @@ fn launch_request(arguments: &[OsString]) -> bili_core::Result<Launch> {
             return Err(invalid());
         }
     }
+    if state_dir.is_some() && profile_dir.is_some() {
+        return Err(invalid());
+    }
     if u8::from(doctor) + u8::from(version) + u8::from(help) > 1 || json != doctor {
         return Err(invalid());
     }
@@ -66,28 +79,46 @@ fn launch_request(arguments: &[OsString]) -> bili_core::Result<Launch> {
     } else if help {
         Launch::Help
     } else {
-        Launch::Window { state_dir }
+        Launch::Window {
+            state_dir,
+            profile_dir,
+        }
     })
 }
 
-fn configuration(prefs: &GuiPrefs, state_dir: Option<PathBuf>) -> bili_core::Result<CoreConfig> {
-    let project = directories::ProjectDirs::from("", "", "bili").ok_or_else(|| {
-        CoreError::new(ErrorCode::Filesystem, "locate private platform directories")
-    })?;
-    let state = state_dir.unwrap_or_else(|| project.data_local_dir().join("state"));
-    let state = std::path::absolute(state).map_err(CoreError::io)?;
-    let output = prefs
-        .output
-        .clone()
-        .unwrap_or_else(|| project.data_local_dir().join("downloads"));
-    let output = std::path::absolute(output).map_err(CoreError::io)?;
+fn configuration(
+    prefs: &GuiPrefs,
+    state_dir: Option<PathBuf>,
+    profile_dir: Option<&std::path::Path>,
+) -> bili_core::Result<CoreConfig> {
+    let (state, output, auth) = if let Some(root) = profile_dir {
+        (root.join("state"), root.join("output"), root.join("auth"))
+    } else {
+        let project = directories::ProjectDirs::from("", "", "bili").ok_or_else(|| {
+            CoreError::new(ErrorCode::Filesystem, "locate private platform directories")
+        })?;
+        (
+            project.data_local_dir().join("state"),
+            project.data_local_dir().join("downloads"),
+            project.config_dir().join("auth-gui"),
+        )
+    };
+    let state = std::path::absolute(state_dir.unwrap_or(state)).map_err(CoreError::io)?;
+    let output =
+        std::path::absolute(prefs.output.clone().unwrap_or(output)).map_err(CoreError::io)?;
     let mut config = CoreConfig::new(state, output);
+    #[cfg(windows)]
+    {
+        config.recycle = Some(bili_core::RecycleBin {
+            move_files: backend::recycle_files,
+        });
+    }
     // A store policy alone persists nothing: core writes only when the user
     // asks to keep the login. Nothing is loaded until the GUI explicitly sends
     // LoadStored on startup (only when the preference is enabled).
     config.credential_store = bili_core::cookie::StorePolicy::Remember {
         // A GUI-specific store keeps "keep login" independent of the CLI account.
-        directory: project.config_dir().join("auth-gui"),
+        directory: auth,
         allow_plaintext_fallback: false,
     };
     Ok(config)
@@ -107,8 +138,11 @@ fn window_icon() -> Option<egui::IconData> {
 
 fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
-    let state_dir = match launch_request(&arguments) {
-        Ok(Launch::Window { state_dir }) => state_dir,
+    let (state_dir, profile_dir) = match launch_request(&arguments) {
+        Ok(Launch::Window {
+            state_dir,
+            profile_dir,
+        }) => (state_dir, profile_dir),
         Ok(Launch::Doctor) => {
             match update::doctor() {
                 Ok(report) => println!("{report}"),
@@ -127,7 +161,7 @@ fn main() {
             return;
         }
         Ok(Launch::Help) => {
-            println!("Bili native desktop\nUsage: bili [--state-dir PATH] [--version] [--json doctor]\nThe state directory defaults to the platform bili data directory. Login is session-only unless you choose to keep it in the OS credential store.");
+            println!("Bili native desktop\nUsage: bili [--state-dir PATH | --profile-dir PATH] [--version] [--json doctor]\nThe state directory defaults to the platform bili data directory. Login is session-only unless you choose to keep it in the OS credential store.");
             return;
         }
         Err(error) => {
@@ -135,8 +169,45 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let prefs = GuiPrefs::load();
-    let config = configuration(&prefs, state_dir);
+    let profile_dir = profile_dir
+        .map(|path| std::path::absolute(path).map_err(CoreError::io))
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(2)
+        });
+    if profile_dir.is_some()
+        && [
+            "BILI_GUI_ISOLATED_DEBUG_DIR",
+            "BILI_GUI_ANONYMOUS_LIVE_DIR",
+            "BILI_GUI_OFFLINE_REPLAY",
+        ]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+    {
+        eprintln!("--profile-dir cannot be combined with debug isolation or replay");
+        std::process::exit(2);
+    }
+    let isolation = match isolation::DebugIsolation::from_environment(state_dir.as_deref()) {
+        Ok(isolation) => isolation,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    let (prefs, config) = match &isolation {
+        Some(isolation) => (isolation.preferences(), Ok(isolation.configuration())),
+        None => {
+            let prefs = profile_dir.as_ref().map_or_else(GuiPrefs::load, |root| {
+                GuiPrefs::load_profile(
+                    root.join("preferences/gui-preferences.json"),
+                    root.join("output"),
+                )
+            });
+            let config = configuration(&prefs, state_dir, profile_dir.as_deref());
+            (prefs, config)
+        }
+    };
     let output = config
         .as_ref()
         .map(|c| c.output_dir.clone())
@@ -158,12 +229,12 @@ fn main() {
         ),
     };
     let handle = runtime.as_ref().map(|r| r.handle().clone());
-    let (updates, update_owner) = match &handle {
-        Some(handle) => {
+    let (updates, update_owner) = match (&handle, isolation.is_none() && profile_dir.is_none()) {
+        (Some(handle), true) => {
             let (updates, owner) = update::UpdateState::connected(handle);
             (updates, Some(owner))
         }
-        None => (update::UpdateState::default(), None),
+        _ => (update::UpdateState::default(), None),
     };
     let (restart_tx, restart_rx) = std::sync::mpsc::channel();
     // The single-slot handoff keeps ownership in main, including native window
@@ -185,6 +256,7 @@ fn main() {
         "Bili",
         options,
         Box::new(move |cc| {
+            render_diagnostics::report_renderer(cc);
             theme::install(&cc.egui_ctx, fonts);
             prefs.apply(&cc.egui_ctx);
             let bridge = handle.map(|handle| {
@@ -250,11 +322,18 @@ mod tests {
             assert_eq!(
                 parse(&["--state-dir", value]).unwrap(),
                 Launch::Window {
-                    state_dir: Some(PathBuf::from(value))
+                    state_dir: Some(PathBuf::from(value)),
+                    profile_dir: None
                 }
             );
         }
-        assert_eq!(parse(&[]).unwrap(), Launch::Window { state_dir: None });
+        assert_eq!(
+            parse(&[]).unwrap(),
+            Launch::Window {
+                state_dir: None,
+                profile_dir: None
+            }
+        );
     }
 
     #[test]
@@ -275,6 +354,36 @@ mod tests {
         ] {
             assert!(parse(&arguments).is_err(), "accepted {arguments:?}");
         }
+    }
+
+    #[test]
+    fn explicit_profile_has_real_network_and_a_distinct_secure_store() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let prefs = GuiPrefs::load_profile(
+            root.join("preferences/gui-preferences.json"),
+            root.join("output"),
+        );
+        let config = configuration(&prefs, None, Some(root)).unwrap();
+        assert!(config.api_replay.is_none());
+        assert_eq!(config.state_dir, root.join("state"));
+        assert_eq!(config.output_dir, root.join("output"));
+        assert!(
+            matches!(config.credential_store, bili_core::cookie::StorePolicy::Remember {directory, allow_plaintext_fallback: false} if directory == root.join("auth"))
+        );
+        assert!(
+            !root.join("auth").exists(),
+            "configuration must not access the OS credential store"
+        );
+        assert_eq!(
+            parse(&["--profile-dir", "profile"]).unwrap(),
+            Launch::Window {
+                state_dir: None,
+                profile_dir: Some("profile".into())
+            }
+        );
+        assert!(parse(&["--state-dir", "state", "--profile-dir", "profile"]).is_err());
+        assert!(parse(&["--profile-dir"]).is_err());
     }
 
     #[test]

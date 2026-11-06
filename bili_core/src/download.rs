@@ -20,6 +20,55 @@ use crate::{
 pub(crate) struct TransferOptions<'a> {
     pub cancel: &'a CancellationToken,
     pub rate_limit: Option<u64>,
+    pub budget: Option<&'a RateBudget>,
+}
+
+/// Shared across all current and resumed jobs bearing one immutable batch ID.
+pub(crate) struct RateBudget {
+    rate: u64,
+    next: tokio::sync::Mutex<tokio::time::Instant>,
+}
+impl RateBudget {
+    pub(crate) fn new(rate: u64) -> Self {
+        Self {
+            rate: rate.max(1),
+            next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        }
+    }
+    async fn ready(&self, cancel: &CancellationToken) -> Result<()> {
+        loop {
+            let target = {
+                let next = tokio::select! {
+                    _ = cancel.cancelled() => return Err(cancelled()),
+                    next = self.next.lock() => next,
+                };
+                *next
+            };
+            if target <= tokio::time::Instant::now() {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(cancelled()),
+                _ = tokio::time::sleep_until(target) => {}
+            }
+            // Other in-flight resources can extend the batch debt while waiting.
+        }
+    }
+    async fn wait(&self, bytes: u64, cancel: &CancellationToken) -> Result<()> {
+        // These bytes have already arrived. Charge them even when cancellation
+        // was requested by the progress callback, and retain the debt on pause.
+        let mut next = self.next.lock().await;
+        let duration = Duration::from_secs(bytes / self.rate).saturating_add(Duration::from_nanos(
+            (u128::from(bytes % self.rate) * 1_000_000_000 / u128::from(self.rate)) as u64,
+        ));
+        let target = (*next).max(tokio::time::Instant::now()) + duration;
+        *next = target;
+        drop(next);
+        tokio::select! {
+            _=cancel.cancelled()=>Err(cancelled()),
+            _=tokio::time::sleep_until(target)=>Ok(())
+        }
+    }
 }
 
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
@@ -28,18 +77,21 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_REDIRECTS: usize = 5;
 const BUFFER_SIZE: usize = 128 * 1024;
 
-/// Stream one representation to its owned path; the adjacent sidecar is the
-/// only durable authority for bytes that can be resumed after a crash.
-pub(crate) async fn transfer(
-    client: &reqwest::Client,
+/// A resource whose retained bytes have been reconciled with its owned file.
+/// Holding the checkpoint borrow prevents it being changed before transfer.
+pub(crate) struct PreparedResource<'a> {
+    path: &'a Path,
+    checkpoint: &'a mut ResourceCheckpoint,
+}
+
+/// Validate all retained resources before a worker projects aggregate progress.
+/// The adjacent sidecar remains the only durable byte-offset authority.
+pub(crate) async fn prepare_resource<'a>(
     locator: &ResolvedLocator,
-    path: &Path,
-    checkpoint: &mut ResourceCheckpoint,
-    options: TransferOptions<'_>,
-    policy: &RetryPolicy,
-    progress: impl Fn(u64) + Send + Sync,
-) -> Result<()> {
-    let cancel = options.cancel;
+    path: &'a Path,
+    checkpoint: &'a mut ResourceCheckpoint,
+    cancel: &CancellationToken,
+) -> Result<PreparedResource<'a>> {
     if cancel.is_cancelled() {
         return Err(cancelled());
     }
@@ -60,10 +112,8 @@ pub(crate) async fn transfer(
     crate::state::reject_symlink(&sidecar)?;
 
     reconcile(path, &sidecar, checkpoint, cancel).await?;
-    if checkpoint.complete {
-        return Ok(());
-    }
-    if checkpoint.durable_bytes > 0
+    if !checkpoint.complete
+        && checkpoint.durable_bytes > 0
         && !checkpoint
             .strong_etag
             .as_deref()
@@ -72,47 +122,99 @@ pub(crate) async fn transfer(
         reset_resource(path, checkpoint).await?;
         persist(&sidecar, checkpoint).await?;
     }
-
-    let attempts = policy.attempts.max(1);
-    for attempt in 0..attempts {
-        if cancel.is_cancelled() {
-            checkpoint_resource(path, &sidecar, checkpoint).await?;
-            return Err(cancelled());
-        }
-        match stream_once(
-            client, locator, path, &sidecar, checkpoint, &options, &progress,
-        )
-        .await
-        {
-            Ok(()) => return Ok(()),
-            Err(failure) if failure.retryable && attempt + 1 < attempts => {
-                checkpoint_resource(path, &sidecar, checkpoint).await?;
-                let delay = retry_delay(policy, attempt, failure.retry_after);
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(cancelled()),
-                    _ = tokio::time::sleep(delay) => {}
-                }
-            }
-            Err(failure) => {
-                checkpoint_resource(path, &sidecar, checkpoint).await?;
-                if failure.retryable {
-                    return Err(CoreError::new(
-                        ErrorCode::RetryExhausted,
-                        "resource transfer retries exhausted",
-                    ));
-                }
-                return Err(failure.error);
-            }
-        }
-    }
-    Err(CoreError::new(
-        ErrorCode::RetryExhausted,
-        "resource transfer retries exhausted",
-    ))
+    Ok(PreparedResource { path, checkpoint })
 }
 
-/// Load the bounded resource sidecar. `transfer` reconciles it with the owned
-/// file before trusting any byte offset.
+impl PreparedResource<'_> {
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        self.checkpoint.durable_bytes
+    }
+
+    pub(crate) async fn transfer(
+        &mut self,
+        client: &reqwest::Client,
+        locator: &ResolvedLocator,
+        options: TransferOptions<'_>,
+        policy: &RetryPolicy,
+        progress: impl Fn(u64) + Send + Sync,
+    ) -> Result<()> {
+        let cancel = options.cancel;
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        if !allowed_redirect(locator, &locator.url) {
+            return Err(CoreError::new(
+                ErrorCode::Transport,
+                "resource URL origin rejected",
+            ));
+        }
+        if self.checkpoint.complete {
+            return Ok(());
+        }
+        let sidecar = checkpoint_path(self.path);
+        let attempts = policy.attempts.max(1);
+        for attempt in 0..attempts {
+            if cancel.is_cancelled() {
+                checkpoint_resource(self.path, &sidecar, self.checkpoint).await?;
+                return Err(cancelled());
+            }
+            match stream_once(
+                client,
+                locator,
+                self.path,
+                &sidecar,
+                self.checkpoint,
+                &options,
+                &progress,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(failure) if failure.retryable && attempt + 1 < attempts => {
+                    checkpoint_resource(self.path, &sidecar, self.checkpoint).await?;
+                    let delay = retry_delay(policy, attempt, failure.retry_after);
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(cancelled()),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                Err(failure) => {
+                    checkpoint_resource(self.path, &sidecar, self.checkpoint).await?;
+                    if failure.retryable {
+                        return Err(CoreError::new(
+                            ErrorCode::RetryExhausted,
+                            "resource transfer retries exhausted",
+                        ));
+                    }
+                    return Err(failure.error);
+                }
+            }
+        }
+        Err(CoreError::new(
+            ErrorCode::RetryExhausted,
+            "resource transfer retries exhausted",
+        ))
+    }
+}
+
+#[cfg(test)]
+async fn transfer(
+    client: &reqwest::Client,
+    locator: &ResolvedLocator,
+    path: &Path,
+    checkpoint: &mut ResourceCheckpoint,
+    options: TransferOptions<'_>,
+    policy: &RetryPolicy,
+    progress: impl Fn(u64) + Send + Sync,
+) -> Result<()> {
+    prepare_resource(locator, path, checkpoint, options.cancel)
+        .await?
+        .transfer(client, locator, options, policy, progress)
+        .await
+}
+
+/// Load the bounded resource sidecar. `prepare_resource` reconciles it with the
+/// owned file before trusting any byte offset.
 pub(crate) fn load_checkpoint(path: &Path) -> Result<ResourceCheckpoint> {
     let sidecar = checkpoint_path(path);
     match std::fs::symlink_metadata(&sidecar) {
@@ -133,6 +235,31 @@ pub(crate) fn load_checkpoint(path: &Path) -> Result<ResourceCheckpoint> {
         Ok(_) => serde_json::from_slice(&std::fs::read(sidecar).map_err(CoreError::io)?)
             .map_err(|_| CoreError::new(ErrorCode::Corruption, "checkpoint sidecar is invalid")),
     }
+}
+
+/// Reuse only complete, digest-proven inputs without reacquiring a remote URL.
+/// This read-only check never repairs or truncates retained recovery data.
+pub(crate) async fn completed_resource(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Result<Option<u64>> {
+    let checkpoint = load_checkpoint(path)?;
+    if !checkpoint.complete {
+        return Ok(None);
+    }
+    crate::state::reject_symlink(path)?;
+    let (size, digest) = digest_file(path, cancel).await?;
+    if size == 0
+        || size != checkpoint.durable_bytes
+        || checkpoint.expected_total != Some(size)
+        || checkpoint.sha256.as_deref() != Some(digest.as_str())
+    {
+        return Err(CoreError::new(
+            ErrorCode::Corruption,
+            "completed resource verification failed",
+        ));
+    }
+    Ok(Some(size))
 }
 
 async fn reconcile(
@@ -217,6 +344,7 @@ async fn stream_once(
     let mut url = locator.url.clone();
     let mut redirects = 0;
     let mut restarted = false;
+    let retained_before_request = checkpoint.durable_bytes;
     loop {
         if cancel.is_cancelled() {
             return Err(TransferFailure::fatal(cancelled()));
@@ -501,6 +629,11 @@ async fn stream_once(
                 .await
                 .map_err(|error| TransferFailure::fatal(CoreError::io(error)))?;
         }
+        // A full response can invalidate retained bytes even after preparation.
+        // Publish the actual starting offset before any replacement body arrives.
+        if start_at != retained_before_request {
+            progress(start_at);
+        }
         let mut received = 0u64;
         let mut last_reported = None;
         let mut last_progress_at: Option<Instant> = None;
@@ -514,6 +647,18 @@ async fn stream_once(
         };
         let mut stream = response.bytes_stream();
         loop {
+            if let Some(budget) = options.budget {
+                if let Err(error) = budget.ready(cancel).await {
+                    flush_stream_progress(&file, sidecar, checkpoint, start_at, received, &hasher)
+                        .await
+                        .map_err(TransferFailure::fatal)?;
+                    let current = start_at + received;
+                    if last_reported != Some(current) {
+                        progress(current);
+                    }
+                    return Err(TransferFailure::fatal(error));
+                }
+            }
             let next = tokio::select! {
                 _ = cancel.cancelled() => {
                     flush_stream_progress(&file, sidecar, checkpoint, start_at, received, &hasher).await.map_err(TransferFailure::fatal)?;
@@ -554,6 +699,17 @@ async fn stream_once(
                 progress(current);
                 last_reported = Some(current);
                 last_progress_at = Some(Instant::now());
+            }
+            if let Some(budget) = options.budget {
+                if let Err(error) = budget.wait(bytes.len() as u64, cancel).await {
+                    flush_stream_progress(&file, sidecar, checkpoint, start_at, received, &hasher)
+                        .await
+                        .map_err(TransferFailure::fatal)?;
+                    if last_reported != Some(current) {
+                        progress(current);
+                    }
+                    return Err(TransferFailure::fatal(error));
+                }
             }
             if let Some(limit) = rate_limit.filter(|limit| *limit > 0) {
                 let fractional_nanos =
@@ -844,5 +1000,8 @@ impl TransferFailure {
     }
 }
 
+#[cfg(test)]
+#[path = "download/process_recovery.rs"]
+mod process_recovery;
 #[cfg(test)]
 mod transfer_recovery;

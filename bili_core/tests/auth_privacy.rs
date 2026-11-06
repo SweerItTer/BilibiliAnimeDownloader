@@ -73,6 +73,9 @@ fn qr_transient_payload_is_redacted_and_never_serialized() {
         expires_in_secs: 180,
     };
     let snapshot = AuthSnapshot {
+        profiles: Vec::new(),
+        selected_profile: None,
+        login_profile: None,
         logged_in: false,
         account: None,
         notice: None,
