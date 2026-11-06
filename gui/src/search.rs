@@ -89,6 +89,7 @@ pub struct SearchState {
     submitted: Option<SearchQuery>,
     requested: Option<SearchQuery>,
     pub request_focus: bool,
+    pub reset_scroll: bool,
     pub stale: bool,
     started: Option<Instant>,
     pub bulk: bool,
@@ -112,6 +113,7 @@ impl Default for SearchState {
             submitted: None,
             requested: None,
             request_focus: false,
+            reset_scroll: false,
             stale: false,
             started: None,
             bulk: false,
@@ -129,6 +131,7 @@ impl Default for SearchState {
 }
 impl SearchState {
     pub fn accept_results(&mut self, results: CandidatePage) {
+        self.reset_scroll = true;
         self.browse = self.requested_browse.take();
         self.results = Some(results);
         self.submitted = self.requested.take();
@@ -426,7 +429,9 @@ impl SearchState {
                         if ui
                             .add_enabled(
                                 available,
-                                egui::Button::new(sort_name(sort)).selected(self.sort == sort),
+                                egui::Button::new(sort_name(sort))
+                                    .selected(self.sort == sort)
+                                    .rounding(6.0),
                             )
                             .clicked()
                         {
@@ -482,20 +487,26 @@ impl SearchState {
                 ui.colored_label(theme::error_color(), "本次搜索未更新，以下保留上次结果。");
             });
         }
-        let items: Vec<Candidate> = self
+        let items: Vec<&Candidate> = self
             .results
             .as_ref()
-            .map(|r| {
-                r.pages
-                    .iter()
-                    .flat_map(|p| p.items.iter().cloned())
-                    .collect()
-            })
+            .map(|r| r.pages.iter().flat_map(|p| p.items.iter()).collect())
             .unwrap_or_default();
         if self.results.is_none() && !self.pending() {
-            readable_frame().show(ui, |ui| {
-                theme::muted(ui, "搜索关键词，或粘贴视频、番剧与影视链接。");
-            });
+            // ScrollArea offers infinite content height; center within its
+            // visible viewport instead of extending the scrollable document.
+            let height = (ui.clip_rect().bottom() - ui.cursor().top()).max(80.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), height),
+                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                |ui| {
+                    ui.label(
+                        egui::RichText::new("搜索以获取结果")
+                            .size(24.0)
+                            .color(theme::muted_color()),
+                    );
+                },
+            );
         } else if self.results.is_some() && items.is_empty() && !self.pending() {
             readable_frame().show(ui, |ui| {
                 theme::muted(ui, "没有找到相关内容。");
@@ -569,7 +580,7 @@ impl SearchState {
                                     if selected {
                                         self.selected.retain(|c| c.reference != item.reference);
                                     } else {
-                                        self.selected.push(item.clone());
+                                        self.selected.push((**item).clone());
                                     }
                                 }
                             } else if available && (response.clicked() || title.clicked()) {
@@ -692,6 +703,7 @@ impl SearchState {
 }
 fn readable_frame() -> egui::Frame {
     egui::Frame::none()
+        .rounding(6.0)
         .fill(theme::card())
         .inner_margin(egui::Margin::symmetric(8.0, 6.0))
 }

@@ -22,7 +22,6 @@ struct Row {
     prepared: PreparedItem,
     selected: Vec<PartRef>,
     choice: QualityChoice,
-    skip: bool,
     fulfilled: bool,
 }
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -152,7 +151,6 @@ impl ConfigState {
                     selected: prepared.selected.clone(),
                     prepared,
                     choice: QualityChoice::Unavailable,
-                    skip: false,
                     fulfilled: false,
                 })
                 .collect();
@@ -269,7 +267,7 @@ impl ConfigState {
     }
     fn usable_union(&self) -> Vec<(u32, String)> {
         let mut choices = Vec::new();
-        for row in self.rows.iter().filter(|r| !r.skip) {
+        for row in &self.rows {
             for choice in self.usable_qualities(row) {
                 if !choices.iter().any(|(id, _)| *id == choice.0) {
                     choices.push(choice);
@@ -327,17 +325,14 @@ impl ConfigState {
     fn apply_common_quality(&mut self, quality: u32) {
         self.quality = Some(quality);
         for row in &mut self.rows {
-            if !row.skip && !row.selected.is_empty() {
+            if !row.selected.is_empty() {
                 row.choice = QualityChoice::Common;
             }
         }
     }
     fn row_error(&self, row: &Row) -> Option<String> {
-        if row.skip || (row.fulfilled && row.selected.is_empty()) {
-            return None;
-        }
         if row.selected.is_empty() {
-            return Some("请选择分集，或跳过此内容。".into());
+            return None;
         }
         let mut parts = Vec::new();
         for reference in &row.selected {
@@ -362,7 +357,7 @@ impl ConfigState {
         for (part, catalog) in parts {
             if catalog.select(&self.selection(row, part)).is_err() {
                 return Some(format!(
-                    "第 {} 项没有可获取的 {}；请选择其他画质或跳过。",
+                    "第 {} 项没有可获取的 {}；请选择其他画质或取消勾选此项。",
                     part.ordinal,
                     quality_label(quality, &self.rows)
                 ));
@@ -381,10 +376,7 @@ impl ConfigState {
         }
     }
     fn can_submit(&self, auth: Option<&AuthSnapshot>) -> bool {
-        self.rows
-            .iter()
-            .filter(|r| !r.skip)
-            .any(|r| !r.selected.is_empty())
+        self.rows.iter().any(|r| !r.selected.is_empty())
             && self.rows.iter().all(|r| self.row_error(r).is_none())
             && self.account_error(auth).is_none()
             && self.effective_profile(auth) == self.catalog_profile
@@ -445,7 +437,7 @@ impl ConfigState {
         let bounds = dialog_bounds(ctx.screen_rect());
         let inner = (bounds.size() - egui::Vec2::splat(32.0)).max(egui::Vec2::splat(1.0));
         let stacked_footer = inner.x < 500.0 && !self.receipts.is_empty();
-        let footer_rows = if stacked_footer { 3.0 } else { 1.0 };
+        let footer_rows = if stacked_footer { 2.0 } else { 1.0 };
         let mut action = None;
         egui::Window::new("下载配置")
             .id(egui::Id::new("download-config"))
@@ -465,15 +457,58 @@ impl ConfigState {
                     .ceil()
                     + 2.0 * ui.spacing().button_padding.y;
                 let row_height = button_height.max(ui.spacing().interact_size.y);
-                let header = ui.allocate_ui_with_layout(
-                    egui::vec2(inner.x, row_height),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui.small_button("关闭").clicked() {
-                            self.open = false;
-                        }
-                    },
-                );
+                let header = ui.vertical(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(inner.x, 28.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if theme::close_button(ui).clicked() {
+                                self.open = false;
+                            }
+                        },
+                    );
+                    ui.add_enabled_ui(available, |ui| {
+                        ui.label("保存目录（可直接编辑或选择文件夹）");
+                        ui.horizontal(|ui| {
+                            let picker = egui::WidgetText::from("选择目录").into_galley(
+                                ui,
+                                Some(egui::TextWrapMode::Extend),
+                                f32::INFINITY,
+                                egui::TextStyle::Button,
+                            );
+                            let picker_width = (picker.size().x
+                                + 2.0 * ui.spacing().button_padding.x)
+                                .max(ui.spacing().interact_size.x);
+                            let height = ui.spacing().interact_size.y;
+                            let width =
+                                (ui.available_width() - picker_width - ui.spacing().item_spacing.x)
+                                    .max(0.0);
+                            ui.add_sized(
+                                [width, height],
+                                theme::singleline_input(
+                                    ui,
+                                    &mut self.directory,
+                                    "输入绝对路径",
+                                    height,
+                                ),
+                            );
+                            if ui.button(picker).clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_directory(&self.directory)
+                                    .pick_folder()
+                                {
+                                    self.directory = path.display().to_string();
+                                }
+                            }
+                        });
+                        ui.checkbox(&mut self.make_default, "将此目录设为默认保存位置");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut self.subtitles, "字幕");
+                            ui.checkbox(&mut self.danmaku, "弹幕");
+                        });
+                    });
+                    ui.separator();
+                });
                 // A Window can offer an unbounded available height while measuring its
                 // contents. Budget the scroll body from the finite viewport instead so
                 // the close row and admission controls always remain inside the frame.
@@ -511,41 +546,14 @@ impl ConfigState {
                             ui.colored_label(theme::error_color(), error);
                         }
                         ui.add_enabled_ui(available, |ui| {
-                            ui.label("保存目录");
-                            ui.horizontal(|ui| {
-                                let picker = egui::WidgetText::from("选择目录").into_galley(
-                                    ui,
-                                    Some(egui::TextWrapMode::Extend),
-                                    f32::INFINITY,
-                                    egui::TextStyle::Button,
-                                );
-                                let picker_width = (picker.size().x
-                                    + 2.0 * ui.spacing().button_padding.x)
-                                    .max(ui.spacing().interact_size.x);
-                                let height = ui.spacing().interact_size.y;
-                                let width = (ui.available_width()
-                                    - picker_width
-                                    - ui.spacing().item_spacing.x)
-                                    .max(0.0);
-                                ui.add_sized(
-                                    [width, height],
-                                    theme::singleline_input(ui, &mut self.directory, "", height),
-                                );
-                                if ui.button(picker).clicked() {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .set_directory(&self.directory)
-                                        .pick_folder()
-                                    {
-                                        self.directory = path.display().to_string();
-                                    }
-                                }
-                            });
                             if self.rows.len() > 1 {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label("批量画质");
                                     let choices = self.usable_union();
                                     let mut selected = None;
                                     egui::ComboBox::from_id_salt("common-quality")
+                                        .width(170.0)
+                                        .height(320.0)
                                         .selected_text(self.quality.map_or_else(
                                             || "选择画质".into(),
                                             |id| quality_label(id, &self.rows),
@@ -568,10 +576,6 @@ impl ConfigState {
                                     }
                                 });
                             }
-                            ui.horizontal_wrapped(|ui| {
-                                ui.checkbox(&mut self.subtitles, "字幕");
-                                ui.checkbox(&mut self.danmaku, "弹幕");
-                            });
                         });
                         let profile = self.effective_profile(auth);
                         let profile_stale = profile != self.catalog_profile;
@@ -604,14 +608,13 @@ impl ConfigState {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label(RichText::new(&row.prepared.item.title).strong());
-                                    ui.add_enabled_ui(available, |ui| {
-                                        ui.checkbox(&mut row.skip, "跳过");
-                                    });
                                 });
-                                ui.add_enabled_ui(available && !row.skip, |ui| {
+                                ui.add_enabled_ui(available, |ui| {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label("源画质");
                                         egui::ComboBox::from_id_salt(("row-quality", index))
+                                            .width(170.0)
+                                            .height(320.0)
                                             .selected_text(selected_text)
                                             .show_ui(ui, |ui| {
                                                 for (id, label) in choices {
@@ -705,12 +708,7 @@ impl ConfigState {
                             }
                         }
                     });
-                let count = self
-                    .rows
-                    .iter()
-                    .filter(|r| !r.skip)
-                    .map(|r| r.selected.len())
-                    .sum::<usize>();
+                let count = self.rows.iter().map(|r| r.selected.len()).sum::<usize>();
                 let blocked = !self.can_submit(auth);
                 ui.allocate_ui_with_layout(
                     egui::vec2(inner.x, footer_height),
@@ -738,10 +736,6 @@ impl ConfigState {
                                 selections,
                                 output_dir: PathBuf::from(&self.directory),
                             });
-                        }
-                        if !self.receipts.is_empty() && ui.button("继续添加其他内容").clicked()
-                        {
-                            self.open = false;
                         }
                     },
                 );
@@ -800,7 +794,6 @@ impl ConfigState {
                     }
                     theme::muted(ui, "0 不限速");
                 });
-                ui.checkbox(&mut self.make_default, "添加成功后设为默认目录");
                 let previous = self.account.clone();
                 egui::ComboBox::from_id_salt("batch-account")
                     .selected_text(match &self.account {
@@ -871,7 +864,6 @@ impl ConfigState {
         let limit = (self.rate_mib > 0.0).then_some((self.rate_mib * 1048576.0) as u64);
         self.rows
             .iter()
-            .filter(|r| !r.skip)
             .flat_map(|row| {
                 row.prepared
                     .item
@@ -1109,7 +1101,7 @@ mod tests {
         assert_eq!(requests[0].context.project.as_ref().unwrap().ordinal, 3);
         config.rows[0].choice = QualityChoice::Exact(80);
         assert!(!config.can_submit(None));
-        config.rows[0].skip = true;
+        config.rows[0].selected.clear();
         assert!(config.can_submit(None));
         assert_eq!(config.requests(None).len(), 1);
     }
@@ -1736,7 +1728,8 @@ mod tests {
                 "{size:?}: {bounds:?}"
             );
             let labels = texts(&output);
-            for label in ["关闭", "开始下载 · 1 项"] {
+            {
+                let label = "开始下载 · 1 项";
                 let rect = labels
                     .iter()
                     .find(|(text, _)| text == label)
@@ -1753,7 +1746,13 @@ mod tests {
                     | "添加成功后设为默认目录"
             )));
             if size.x >= 900.0 {
-                for label in ["保存目录", "字幕", "弹幕", "视频 1", "1080P"] {
+                for label in [
+                    "保存目录（可直接编辑或选择文件夹）",
+                    "字幕",
+                    "弹幕",
+                    "视频 1",
+                    "1080P",
+                ] {
                     let rect = labels
                         .iter()
                         .find(|(text, _)| text == label)

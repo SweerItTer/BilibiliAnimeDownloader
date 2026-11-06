@@ -199,6 +199,7 @@ pub struct App {
     updates: UpdateState,
     restart: Option<std::sync::mpsc::Sender<PathBuf>>,
     app_icon: Option<egui::TextureHandle>,
+    scroll_timings: crate::render_diagnostics::ScrollTimings,
     font_missing: bool,
     closing: bool,
     stopped: bool,
@@ -276,6 +277,7 @@ impl App {
             updates: UpdateState::default(),
             restart: None,
             app_icon: None,
+            scroll_timings: crate::render_diagnostics::ScrollTimings::from_environment(),
             font_missing,
             closing: false,
             stopped: false,
@@ -332,10 +334,14 @@ impl App {
         let output = self.prefs.output.clone();
         let default_download_rate_mib = self.prefs.default_download_rate_mib;
         let storage_path = self.prefs.storage_path.clone();
+        let persistent_login = self.prefs.persistent_login;
+        let remember_login = self.prefs.remember_login;
         self.prefs = GuiPrefs {
             output,
             default_download_rate_mib,
             storage_path,
+            persistent_login,
+            remember_login,
             ..GuiPrefs::default()
         };
         self.prefs.enforce_isolation();
@@ -983,6 +989,18 @@ impl App {
                         self.home();
                         self.search.home_requested = false;
                     }
+                    ui.add_space(24.0);
+                    let width = (ui.available_width() - 180.0).clamp(90.0, 470.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width + 70.0, 36.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            if let Some(next) = self.search.input(ui, available, width) {
+                                self.home();
+                                action = Some(next);
+                            }
+                        },
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if circle_action(ui, Icon::Download, "下载历史").clicked() {
                             self.navigate(Page::Queue);
@@ -1008,18 +1026,6 @@ impl App {
                         if response.clicked() {
                             self.account_menu = !self.account_menu;
                         }
-                        ui.add_space(24.0);
-                        let width = (ui.available_width() - 70.0).clamp(90.0, 470.0);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(width + 65.0, 36.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if let Some(next) = self.search.input(ui, available, width) {
-                                    self.home();
-                                    action = Some(next);
-                                }
-                            },
-                        );
                     });
                 });
             });
@@ -1041,33 +1047,31 @@ impl App {
                             .as_ref()
                             .and_then(|a| a.account.as_ref())
                             .map_or("访客", |a| a.name.as_str());
+                        ui.spacing_mut().item_spacing.y = 2.0;
                         ui.label(RichText::new(name).strong());
-                        if ui.button("切换账号").clicked() {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        if account_menu_item(ui, "切换账号", self.available()).clicked() {
                             self.account_manager = true;
                             self.account_menu = false;
                             self.send(Operation::Profiles);
                         }
-                        if ui
-                            .add_enabled(self.available(), egui::Button::new("添加账号"))
-                            .clicked()
-                        {
+                        if account_menu_item(ui, "添加账号", self.available()).clicked() {
                             self.login.begin_add();
                             self.account_menu = false;
                         }
                         if self.auth.as_ref().is_some_and(|a| a.logged_in)
-                            && ui
-                                .add_enabled(self.available(), egui::Button::new("退出登录"))
-                                .clicked()
+                            && account_menu_item(ui, "退出登录", self.available()).clicked()
                         {
                             self.send(Operation::Logout);
                             self.account_menu = false;
                         }
                         ui.separator();
-                        if ui.button("设置").clicked() {
+                        if account_menu_item(ui, "设置", true).clicked() {
                             self.navigate(Page::Settings);
                             self.account_menu = false;
                         }
-                        if ui.button("版本与更新").clicked() {
+                        if account_menu_item(ui, "版本与更新", true).clicked() {
                             self.navigate(Page::About);
                             self.account_menu = false;
                         }
@@ -2194,7 +2198,11 @@ impl App {
                         Page::About => "main-scroll-about",
                     })
                     .auto_shrink([false, false]);
-                if self.background.crop_open {
+                if self.background.crop_open
+                    || (self.page == Page::Discover
+                        && self.detail.is_none()
+                        && std::mem::take(&mut self.search.reset_scroll))
+                {
                     scroll = scroll.vertical_scroll_offset(0.0);
                 }
                 scroll.show(ui, |ui| {
@@ -2243,6 +2251,16 @@ impl App {
                                             available: self.ready && !self.closing && !self.stopped,
                                             operations_available: available,
                                             reduced: self.reduced,
+                                            current_account: self
+                                                .auth
+                                                .as_ref()
+                                                .filter(|auth| auth.logged_in)
+                                                .and_then(|auth| {
+                                                    auth.profiles.iter().find(|profile| {
+                                                        Some(&profile.id)
+                                                            == auth.selected_profile.as_ref()
+                                                    })
+                                                }),
                                         },
                                         &mut self.covers,
                                         self.bridge.as_ref(),
@@ -2353,6 +2371,30 @@ fn jump_to(ui: &mut Ui, section: usize, pending: &mut Option<usize>) {
     }
 }
 
+fn account_menu_item(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        });
+        let visuals = ui.style().interact(&response);
+        if response.hovered() || response.has_focus() {
+            ui.painter()
+                .rect(rect, 6.0, visuals.weak_bg_fill, visuals.bg_stroke);
+        }
+        ui.painter().text(
+            egui::pos2(rect.left() + 12.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::TextStyle::Body.resolve(ui.style()),
+            visuals.text_color(),
+        );
+        response
+    })
+    .inner
+}
+
 fn control_banner(error: &bili_core::CoreError) -> Banner {
     let mut banner = Banner::from(backend::error_message(error));
     banner.code = Some(backend::error_code(error));
@@ -2385,6 +2427,7 @@ fn checked_ago(epoch: u64) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.scroll_timings.observe(ctx, frame);
         self.collect(ctx);
         self.sync_appearance(ctx);
         if self.busy.is_some() {

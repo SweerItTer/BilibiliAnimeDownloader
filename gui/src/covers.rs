@@ -18,9 +18,18 @@ fn contained_rect(slot: egui::Rect, source: egui::Vec2) -> egui::Rect {
 
 #[derive(Default)]
 pub struct CoverCache {
-    textures: HashMap<String, egui::TextureHandle>,
+    textures: HashMap<String, CachedCover>,
+    bytes: usize,
+    clock: u64,
     requested: HashSet<String>,
     failed: HashSet<String>,
+}
+const MAX_TEXTURES: usize = 64;
+const MAX_TEXTURE_BYTES: usize = 32 * 1024 * 1024;
+struct CachedCover {
+    texture: egui::TextureHandle,
+    bytes: usize,
+    used: u64,
 }
 
 impl CoverCache {
@@ -49,9 +58,45 @@ impl CoverCache {
         self.requested.remove(&url);
         match image {
             Some(image) => {
+                let bytes = image
+                    .pixels
+                    .len()
+                    .saturating_mul(std::mem::size_of::<egui::Color32>());
+                if bytes > MAX_TEXTURE_BYTES {
+                    self.failed.insert(url);
+                    return;
+                }
+                if let Some(previous) = self.textures.remove(&url) {
+                    self.bytes -= previous.bytes;
+                }
+                while self.textures.len() >= MAX_TEXTURES
+                    || self.bytes.saturating_add(bytes) > MAX_TEXTURE_BYTES
+                {
+                    let Some(oldest) = self
+                        .textures
+                        .iter()
+                        .min_by_key(|(_, cover)| cover.used)
+                        .map(|(url, _)| url.clone())
+                    else {
+                        break;
+                    };
+                    if let Some(cover) = self.textures.remove(&oldest) {
+                        self.bytes -= cover.bytes;
+                    }
+                }
                 let texture =
                     ctx.load_texture(format!("cover:{url}"), image, egui::TextureOptions::LINEAR);
-                self.textures.insert(url, texture);
+                self.clock = self.clock.saturating_add(1);
+                self.bytes += bytes;
+                self.failed.remove(&url);
+                self.textures.insert(
+                    url,
+                    CachedCover {
+                        texture,
+                        bytes,
+                        used: self.clock,
+                    },
+                );
             }
             None => {
                 self.failed.insert(url);
@@ -59,8 +104,12 @@ impl CoverCache {
         }
     }
 
-    pub fn texture(&self, url: &str) -> Option<egui::TextureId> {
-        self.textures.get(url).map(|texture| texture.id())
+    pub fn texture(&mut self, url: &str) -> Option<egui::TextureId> {
+        self.clock = self.clock.saturating_add(1);
+        self.textures.get_mut(url).map(|cover| {
+            cover.used = self.clock;
+            cover.texture.id()
+        })
     }
 
     /// Draws the thumbnail when available and starts a fetch otherwise.
@@ -75,10 +124,19 @@ impl CoverCache {
         let Some(url) = url.filter(|url| !url.is_empty()) else {
             return false;
         };
+        // Offscreen covers keep their layout slot without fetching or painting.
+        let predicted = egui::Rect::from_min_size(ui.next_widget_position(), size);
+        if !ui.is_rect_visible(predicted) {
+            ui.allocate_exact_size(size, egui::Sense::hover());
+            return true;
+        }
         self.ensure(bridge, url);
-        let Some(texture) = self.textures.get(url) else {
+        self.clock = self.clock.saturating_add(1);
+        let Some(cover) = self.textures.get_mut(url) else {
             return false;
         };
+        cover.used = self.clock;
+        let texture = &cover.texture;
         let (slot, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         let source = texture.size_vec2();
         let rect = contained_rect(slot, source);
@@ -92,6 +150,40 @@ impl CoverCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cover_cache_bounds_texture_count_and_bytes_without_evicting_recently_used_images() {
+        let ctx = egui::Context::default();
+        let mut cache = CoverCache::default();
+        for n in 0..MAX_TEXTURES {
+            cache.insert(
+                &ctx,
+                n.to_string(),
+                Some(egui::ColorImage::new([1, 1], egui::Color32::WHITE)),
+            );
+        }
+        let retained = cache.texture("0").unwrap();
+        cache.insert(
+            &ctx,
+            "next".into(),
+            Some(egui::ColorImage::new([1, 1], egui::Color32::WHITE)),
+        );
+        assert_eq!(cache.textures.len(), MAX_TEXTURES);
+        assert_eq!(cache.texture("0"), Some(retained));
+        assert!(cache.texture("1").is_none());
+        for n in 0..9 {
+            cache.insert(
+                &ctx,
+                format!("large-{n}"),
+                Some(egui::ColorImage::new([1024, 1024], egui::Color32::WHITE)),
+            );
+        }
+        assert!(cache.bytes <= MAX_TEXTURE_BYTES);
+        assert!(cache.texture("large-0").is_none());
+        assert!(cache.texture("large-8").is_some());
+        cache.ensure(None, "large-0");
+        assert!(!cache.failed.contains("large-0"));
+    }
 
     #[test]
     fn preempted_covers_are_not_terminal_failures_or_evicted_textures() {

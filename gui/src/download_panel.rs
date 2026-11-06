@@ -71,6 +71,7 @@ pub struct QueueView<'a> {
     pub available: bool,
     pub operations_available: bool,
     pub reduced: bool,
+    pub current_account: Option<&'a bili_core::auth::AuthProfile>,
 }
 pub enum QueueAction {
     Control(JobId, JobAction),
@@ -148,6 +149,7 @@ impl QueueState {
             available,
             operations_available,
             reduced,
+            current_account,
         } = view;
         let mut action = None;
         ui.horizontal_wrapped(|ui| {
@@ -260,6 +262,7 @@ impl QueueState {
                             available && !pending.contains(&job.id),
                             operations_available,
                             reduced,
+                            current_account,
                         ) {
                             action = Some(next);
                         }
@@ -289,6 +292,7 @@ impl QueueState {
                             available && !pending.contains(&job.id),
                             operations_available,
                             reduced,
+                            current_account,
                         ) {
                             action = Some(next);
                         }
@@ -399,6 +403,7 @@ impl QueueState {
         available: bool,
         operations_available: bool,
         reduced: bool,
+        current_account: Option<&bili_core::auth::AuthProfile>,
     ) -> Option<QueueAction> {
         let mut action = None;
         egui::Frame::group(ui.style())
@@ -458,6 +463,22 @@ impl QueueState {
                         } else if status(job) == Filter::Failed {
                             match error.map(|e| e.code) {
                                 Some(ErrorCode::LoginRequired | ErrorCode::EntitlementRequired) => {
+                                    if let Some(profile) = current_account {
+                                        if ui
+                                            .button(format!(
+                                                "使用当前账号重试（{}）",
+                                                profile.account.name
+                                            ))
+                                            .clicked()
+                                        {
+                                            action = Some(QueueAction::Operation(
+                                                Operation::RetargetProfile {
+                                                    id: job.id,
+                                                    profile: Some(profile.id.clone()),
+                                                },
+                                            ));
+                                        }
+                                    }
                                     if ui.button("选择账号").clicked() {
                                         action = Some(QueueAction::Account(job.id));
                                     }
@@ -486,6 +507,16 @@ impl QueueState {
                                         }
                                     }
                                     if ui.button("重试").clicked() {
+                                        action =
+                                            Some(QueueAction::Control(job.id, JobAction::Retry));
+                                    }
+                                }
+                                Some(ErrorCode::RepresentationChanged)
+                                    if error.is_some_and(|e| {
+                                        e.operation == "selected representation verification"
+                                    }) =>
+                                {
+                                    if ui.button("重新校验与封装").clicked() {
                                         action =
                                             Some(QueueAction::Control(job.id, JobAction::Retry));
                                     }

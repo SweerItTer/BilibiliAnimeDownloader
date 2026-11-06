@@ -826,7 +826,15 @@ fn reveal(path: PathBuf, select: bool) -> Result<()> {
 }
 
 pub fn error_message(error: &CoreError) -> String {
+    if error.http_status == Some(429) {
+        return "请求过于频繁（HTTP 429），已暂停向站点发送 API 请求。请稍后再试。".into();
+    }
+    if error.http_status == Some(412) {
+        return "站点暂时拒绝了此请求（HTTP 412），请稍后重试。".into();
+    }
     let specific=match (error.code,error.operation.as_str()){
+        (ErrorCode::LoginRequired,"selected credential profile unavailable")=>Some("此任务原先使用的账号已不可用。请选择当前已登录的账号后重试。"),
+        (ErrorCode::RepresentationChanged,"selected representation verification")=>Some("已下载文件未通过所选规格校验，恢复数据已保留。可重试校验；若规格仍不符，请重新选择。"),
         (ErrorCode::Conflict,"completed output ownership or content changed"|"refusing unowned or modified output removal"|"refusing unowned component removal"|"owned component content changed")=>Some("文件已被修改，或不属于这条下载记录，已保留文件。可以仅移除记录。"),
         (ErrorCode::Conflict,"output already exists"|"output already exists without matching completion"|"manual output already exists"|"unowned component output exists")=>Some("保存位置已有不匹配的文件，已保留原文件。请选择其他目录后重试。"),
         (ErrorCode::Conflict,"completed job retains its original admission settings; choose another output directory")=>Some("已有完成记录会保留原来的账号与设置。若需要新设置，请选择其他保存目录。"),

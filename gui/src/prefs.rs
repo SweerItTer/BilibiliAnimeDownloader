@@ -156,6 +156,9 @@ pub struct GuiPrefs {
     /// Process-local destination for an explicitly isolated debugging session.
     #[serde(skip)]
     pub(crate) storage_path: Option<PathBuf>,
+    /// Explicit private user profiles may opt into the system credential store.
+    #[serde(skip)]
+    pub(crate) persistent_login: bool,
 }
 
 impl Default for GuiPrefs {
@@ -180,6 +183,7 @@ impl Default for GuiPrefs {
             update: bili_core::update::UpdateSettings::default(),
             last_check: 0,
             storage_path: None,
+            persistent_login: false,
         }
     }
 }
@@ -242,9 +246,22 @@ impl GuiPrefs {
         prefs
     }
 
+    pub fn load_profile(path: PathBuf, output: PathBuf) -> Self {
+        let mut prefs = Self::load_file(Some(path.clone()));
+        prefs.storage_path = Some(path);
+        prefs.persistent_login = true;
+        if prefs.output.is_none() {
+            prefs.output = Some(output);
+        }
+        prefs.enforce_isolation();
+        prefs
+    }
+
     pub(crate) fn enforce_isolation(&mut self) {
         if self.storage_path.is_some() {
-            self.remember_login = false;
+            if !self.persistent_login {
+                self.remember_login = false;
+            }
             self.update.check_updates = false;
             self.update.auto_update = false;
         }
@@ -343,6 +360,27 @@ mod tests {
         assert_eq!(restored.output, Some(output));
         assert!(!restored.remember_login);
         assert_eq!(std::fs::read(other_file).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn private_profile_retains_opt_in_login_and_custom_output_across_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("profile/preferences.json");
+        let output = root.path().join("output");
+        let mut prefs = GuiPrefs::load_profile(file.clone(), output.clone());
+        assert!(!prefs.remember_login);
+        prefs.remember_login = true;
+        prefs.output = Some(root.path().join("chosen-output"));
+        prefs.save();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(saved["remember_login"], true);
+        assert!(saved.get("persistent_login").is_none());
+        assert!(saved.get("storage_path").is_none());
+        let restored = GuiPrefs::load_profile(file, output);
+        assert!(restored.remember_login);
+        assert_eq!(restored.output, prefs.output);
+        assert!(!restored.update.check_updates);
     }
 
     #[test]

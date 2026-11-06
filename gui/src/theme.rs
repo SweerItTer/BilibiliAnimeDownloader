@@ -281,13 +281,33 @@ pub fn singleline_input<'a>(
     // height in symmetric margins so painting and pointer coordinates agree.
     egui::TextEdit::singleline(text)
         .font(font)
-        .margin(vec2(4.0, (height - row_height) * 0.5))
+        .margin(vec2(12.0, (height - row_height) * 0.5))
         .hint_text_font(egui::TextStyle::Body)
         .hint_text(
             egui::RichText::new(hint)
                 .text_style(egui::TextStyle::Body)
                 .color(muted_color()),
         )
+}
+
+/// Scalable native-vector close control, with a text label for accessibility.
+pub fn close_button(ui: &mut Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "关闭")
+    });
+    let visuals = ui.style().interact(&response);
+    if response.hovered() || response.has_focus() {
+        ui.painter()
+            .rect(rect, 6.0, visuals.weak_bg_fill, visuals.bg_stroke);
+    }
+    icon(
+        ui.painter(),
+        rect.shrink(6.0),
+        Icon::Close,
+        visuals.text_color(),
+    );
+    response.on_hover_text("关闭")
 }
 
 pub fn section(ui: &mut Ui, title: &str, description: &str) {

@@ -5,6 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 const ROOT_ENV: &str = "BILI_GUI_ISOLATED_DEBUG_DIR";
+const LIVE_ENV: &str = "BILI_GUI_ANONYMOUS_LIVE_DIR";
 const REPLAY_ENV: &str = "BILI_GUI_OFFLINE_REPLAY";
 const DEAD_PROXY: &str = "http://127.0.0.1:0";
 
@@ -22,6 +23,16 @@ impl DebugIsolation {
         state_dir: Option<&Path>,
         environment: impl Fn(&str) -> Option<OsString>,
     ) -> Result<Option<Self>> {
+        if let Some(root) = environment(LIVE_ENV) {
+            if environment(ROOT_ENV).is_some() || environment(REPLAY_ENV).is_some() {
+                return Err(invalid(
+                    "anonymous live GUI cannot use offline isolation or replay",
+                ));
+            }
+            let root = PathBuf::from(root);
+            Self::validate_root(&root, state_dir)?;
+            return Self::create(root, None).map(Some);
+        }
         let Some(root) = environment(ROOT_ENV) else {
             if environment(REPLAY_ENV).is_some() {
                 return Err(invalid(
@@ -38,12 +49,7 @@ impl DebugIsolation {
         state_dir: Option<&Path>,
         environment: impl Fn(&str) -> Option<OsString>,
     ) -> Result<Self> {
-        if !root.is_absolute() {
-            return Err(invalid("isolated GUI debug directory must be absolute"));
-        }
-        if state_dir.is_some() {
-            return Err(invalid("isolated GUI debugging cannot use --state-dir"));
-        }
+        Self::validate_root(&root, state_dir)?;
         for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
             if environment(key).as_deref() != Some(OsStr::new(DEAD_PROXY)) {
                 return Err(invalid(
@@ -75,6 +81,20 @@ impl DebugIsolation {
             })
             .transpose()?;
 
+        Self::create(root, api_replay)
+    }
+
+    fn validate_root(root: &Path, state_dir: Option<&Path>) -> Result<()> {
+        if !root.is_absolute() {
+            return Err(invalid("isolated GUI debug directory must be absolute"));
+        }
+        if state_dir.is_some() {
+            return Err(invalid("isolated GUI debugging cannot use --state-dir"));
+        }
+        Ok(())
+    }
+
+    fn create(root: PathBuf, api_replay: Option<OfflineApiReplay>) -> Result<Self> {
         // An atomic create rejects existing tasks, accounts, preferences and
         // symlinks at the chosen root instead of silently reusing their data.
         std::fs::create_dir(&root).map_err(CoreError::io)?;
@@ -205,6 +225,51 @@ mod tests {
                 .is_none()
         );
         values.insert(REPLAY_ENV, OsString::from("replay.json"));
+        assert!(DebugIsolation::from_values(None, |key| values.get(key).cloned()).is_err());
+    }
+
+    #[test]
+    fn anonymous_live_uses_real_transport_without_saved_accounts_or_updates() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("live");
+        let values = HashMap::from([(LIVE_ENV, root.as_os_str().to_owned())]);
+        let isolation = DebugIsolation::from_values(None, |key| values.get(key).cloned())
+            .unwrap()
+            .unwrap();
+        let config = isolation.configuration();
+        assert!(config.api_replay.is_none());
+        assert!(matches!(
+            config.credential_store,
+            bili_core::cookie::StorePolicy::MemoryOnly
+        ));
+        assert_eq!(config.state_dir, root.join("state"));
+        let prefs = isolation.preferences();
+        assert!(!prefs.remember_login);
+        assert!(!prefs.update.check_updates);
+        assert!(!prefs.update.auto_update);
+        assert!(DebugIsolation::from_values(None, |key| values.get(key).cloned()).is_err());
+    }
+
+    #[test]
+    fn anonymous_live_rejects_replay_and_conflicting_paths_before_creating_state() {
+        let parent = tempfile::tempdir().unwrap();
+        for conflict in [ROOT_ENV, REPLAY_ENV] {
+            let root = parent.path().join(conflict);
+            let values = HashMap::from([
+                (LIVE_ENV, root.as_os_str().to_owned()),
+                (conflict, "other".into()),
+            ]);
+            assert!(DebugIsolation::from_values(None, |key| values.get(key).cloned()).is_err());
+            assert!(!root.exists());
+        }
+        let root = parent.path().join("override");
+        let values = HashMap::from([(LIVE_ENV, root.as_os_str().to_owned())]);
+        assert!(
+            DebugIsolation::from_values(Some(parent.path()), |key| values.get(key).cloned())
+                .is_err()
+        );
+        assert!(!root.exists());
+        let values = HashMap::from([(LIVE_ENV, "relative".into())]);
         assert!(DebugIsolation::from_values(None, |key| values.get(key).cloned()).is_err());
     }
 
